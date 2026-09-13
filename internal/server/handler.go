@@ -634,6 +634,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+	case upstream.ErrAccountFault:
+		// 账号级授权/配额故障（11140 request illegal auth 风控 / 14017 trial not
+		// activated register 未完成）：与 429 同路径软冷却，坏号在冷却期内不被选中
+		// （同一请求轮换出池、后续请求直接跳过），避免无限重试反复刷上游风控。
+		// 不用硬冷却到次日 04:00：账号可能在冷却期内被重新 OAuth 登录恢复（登录后
+		// 状态由容器重启刷新，新凭证的请求不依赖旧的 until 过期），软冷却基数足够。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (11140/14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
