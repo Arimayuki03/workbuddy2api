@@ -1,13 +1,15 @@
-// login.go — WorkBuddy CN OAuth 登录（设备授权流程，CN realm only）。
+// login.go — WorkBuddy OAuth 登录（设备授权流程，CN realm；--realm=global 供国际版）。
 //
 // 两个子命令，由 login.sh 顺序驱动：
 //
-//	login url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
-//	              state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
-//	login poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
-//	              成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
-//	              stdout 打印完整 token+account JSON
+//	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
+//	                                  state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
+//	login [--realm=cn|global] poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
+//	                                  成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
+//	                                  stdout 打印完整 token+account JSON（含 realm 键）
 //
+// --realm 默认 cn；仅影响输出 JSON 的 realm 键（login.sh 据此落盘 auth.realm），
+// 授权/token 端点当前仍为 CN 端点（global 上游端点待实测，启用 global 登录后再切换）。
 // 无 PKCE（workbuddy 设备流由服务端签发 state）。
 package main
 
@@ -19,6 +21,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -92,15 +95,55 @@ type loginState struct {
 	State string `json:"state"`
 }
 
+// realm 取值枚举（与 internal/auth 的 Realm() 归一化输出一致）。
+const (
+	realmCN     = "cn"
+	realmGlobal = "global"
+)
+
+// parseRealmArgs 解析开头的 --realm=cn|global（或分离式 --realm <v>）flag，缺省 cn。
+// 大小写不敏感归一化；非法值/缺值报错。桌椅剩余参数（子命令）顺序不变。
+func parseRealmArgs(args []string) (realm string, rest []string, err error) {
+	realm = realmCN
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--realm":
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("--realm requires a value")
+			}
+			v := strings.ToLower(strings.TrimSpace(args[i+1]))
+			if v != realmCN && v != realmGlobal {
+				return "", nil, fmt.Errorf("invalid --realm %q (want cn|global)", args[i+1])
+			}
+			realm = v
+			i++
+		case strings.HasPrefix(a, "--realm="):
+			v := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(a, "--realm=")))
+			if v != realmCN && v != realmGlobal {
+				return "", nil, fmt.Errorf("invalid --realm %q (want cn|global)", v)
+			}
+			realm = v
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return realm, rest, nil
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		fatal("usage: login <url|poll>")
+	realm, rest, err := parseRealmArgs(os.Args[1:])
+	if err != nil {
+		fatal("%v (usage: login [--realm=cn|global] <url|poll>)", err)
+	}
+	if len(rest) < 1 {
+		fatal("usage: login [--realm=cn|global] <url|poll>")
 	}
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
 
-	switch os.Args[1] {
+	switch rest[0] {
 	case "url":
 		// handleStartLogin (oauth.go:68-87)
 		data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
@@ -165,6 +208,7 @@ func main() {
 			"refresh_token": tok.RefreshToken,
 			"expires_in":    tok.ExpiresIn,
 			"domain":        tok.Domain,
+			"realm":         realm,
 			"uid":           acct.UID,
 			"enterprise_id": acct.EnterpriseID,
 			"nickname":      acct.Nickname,
@@ -174,6 +218,6 @@ func main() {
 		os.Remove(stateFile)
 
 	default:
-		fatal("unknown subcommand %q (want url|poll)", os.Args[1])
+		fatal("unknown subcommand %q (want url|poll)", rest[0])
 	}
 }

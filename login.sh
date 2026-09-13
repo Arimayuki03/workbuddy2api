@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# login.sh — WorkBuddy CN OAuth 登录 → 落盘 auth 文件
+# login.sh — WorkBuddy OAuth 登录 → 落盘 auth 文件
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh                 # CN realm（默认）
+#   ./login.sh --realm=global  # 国际版 WorkBuddy
 #
 # 流程:
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
 #   2. 你在浏览器打开 URL 完成登录
-#   3. 回到这里按 y → poll 拿 token+uid+nickname → 签到 → 落盘 auths/workbuddy-<uid>.json
+#   3. 回到这里按 y → poll 拿 token+uid+nickname → （仅 CN）签到 → 落盘 auths/workbuddy-<uid>.json
 #   4. 重启 workbuddy2api 容器加载新账号
 set -euo pipefail
 
@@ -16,6 +17,10 @@ AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
 mkdir -p "$AUTH_DIR"
+
+# realm 参数透传（缺省 cn）；global 时跳过 CN 签到、auth 文件写 realm=global
+REALM="${1:-cn}"
+REALM="${REALM#--realm=}"
 
 # login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
 LOGIN_BIN="./login"
@@ -28,7 +33,7 @@ echo "  WorkBuddy OAuth 登录"
 echo "============================================================"
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" url)
+AUTH_URL=$("$LOGIN_BIN" "--realm=$REALM" url)
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -51,7 +56,7 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" poll) || {
+RESULT=$("$LOGIN_BIN" "--realm=$REALM" poll) || {
     echo ""
     echo "获取 token 失败。可能原因："
     echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
@@ -74,7 +79,11 @@ fi
 
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
-# ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
+# ─── 签到（仅 CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞。
+#      global realm 跳过——国际版计费端点与签到端点未实测，避免误打 CN 端点）───
+if [[ "$REALM" == "global" ]]; then
+    echo "签到: global realm 跳过（国际版签到端点未实测）"
+else
 python3 - <<PYEOF
 import json, urllib.request, urllib.error
 
@@ -107,6 +116,7 @@ except urllib.error.HTTPError as e:
 except Exception as e:
     print(f"签到: {e}")
 PYEOF
+fi
 
 # ─── 落盘 auth 文件（与 internal/auth 读取格式一致）─────────────────
 AUTH_FILE="$AUTH_DIR/workbuddy-${USER_ID}.json"
@@ -130,7 +140,8 @@ auth = {
         "accessToken": "$TOKEN",
         "refreshToken": "$REFRESH",
         "expiresAt": $EXPIRES_AT,
-        "domain": "$DOMAIN"
+        "domain": "$DOMAIN",
+        "realm": "$REALM"
     }
 }
 with open("$AUTH_FILE", "w") as f:
@@ -156,6 +167,7 @@ echo ""
 echo "============================================================"
 echo "  登录完成！"
 echo "  UID: $USER_ID"
+echo "  Realm: $REALM"
 echo "  Nickname: ${NICKNAME:-（未获取到）}"
 echo "  Token: ${TOKEN:0:30}..."
 echo "  有效期: $(date -d "@$EXPIRES_AT" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$EXPIRES_AT")"
