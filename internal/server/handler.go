@@ -185,16 +185,11 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// globalModels 国际版（global realm）模型名单（PLAN §7.2 附录 21 名）。
-// 与 CN 动态表不同：global 用内置静态名单（上游暂无对等的动态 models 接口）。
-// 每个 id 前加 "global:" 前缀，与 modelList 输出协议一致。
-var globalModels = []string{
-	"default-model", "fast-model", "balanced-model", "primary-model",
-	"hy4-preview", "gpt-5.6-sol", "gpt-5.6-terra", "deep-model",
-	"deepseek-v4.1-flash", "gpt-6-astra", "hy4-preview-f", "hy3",
-	"glm-5.2", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex",
-	"gemini-3.5-flash", "glm-5.3", "kimi-k3", "kimi-k2.6",
-}
+// globalModels 国际版（global realm）模型名名单（PLAN §7.2 附录 21 名）。
+// 同名名单的权威来源在 upstream.GlobalModelNames（探测 overlay 的静态基底），
+// 此处只在"无 global 账号 / 探测失败"时被 fetchGlobalModels 直接返回（零上游调用）。
+// 保留本别名引用，避免 handler 侧魔法数字与 upstream overlay 重复维护。
+var globalModels = upstream.GlobalModelNames
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
@@ -228,9 +223,11 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, e)
 		}
 	}
-	// global 静态名单（PLAN §7.2 21 名）：仅 GlobalEnabled=true 时列出。
+	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
+	// 名单 = 探测结果 ∪ §7.2 静态（fetchGlobalModels 内合并去重）；无 global 账号时
+	// 直接静态名单且零上游调用。
 	if h.cfg.GlobalEnabled {
-		for _, id := range globalModels {
+		for _, id := range h.fetchGlobalModels() {
 			out = append(out, map[string]any{
 				"id":             "global:" + id,
 				"object":         "model",
@@ -241,6 +238,21 @@ func (h *Handler) modelList() []map[string]any {
 		}
 	}
 	return out
+}
+
+// fetchGlobalModels 返回 global 模型名单（探测 ∪ 静态 overlay，去重）。
+// 与 fetchDynamicModels（CN 侧）同语义不同归位：缓存/失败回落封在 upstream.FetchGlobalModels
+// （内部 1h + 5min 负缓存）。本方法只负责"何时探测"：
+//   - 池中无 global 账号 → 直接静态名单（不发起上游调用）；
+//   - 有 global 账号 → 单账号 Pick（global 域谓词），交 upstream 探测并合并。
+//
+// GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
+func (h *Handler) fetchGlobalModels() []string {
+	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	if acct == nil {
+		return globalModels
+	}
+	return h.cfg.Upstream.FetchGlobalModels(acct)
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
