@@ -52,25 +52,37 @@ func (c *Client) cliVersion() string {
 	return defaultCliVersion
 }
 
-// defaultWorkBuddyUA 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`
-// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>；
-// SaaS 默认形态下 applicationName 与 platform 同为 WorkBuddy，两段相同）。
-// 与旧值 `CLI/2.63.2 CodeBuddy/2.63.2` 的差异：CodeBuddy 老品牌换为 WorkBuddy 三段式，
-// CLI 版本对齐官方内置 2.137.1。官方无任何 UA 随机化（step1 §4），故默认确定性。
+// defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
+// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
+// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>）。
+// 平台段（第二段）品牌按 realm 切换——CN 用 applicationName 同值 `WorkBuddy`，
+// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据
+// ANALYSIS-global-chat-solutions.md：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
+// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140
+// "request illegal" 风控。官方无任何 UA 随机化（step1 §4），故默认确定性。
+// realm 判定委托 auth.Realm()（含全局开关逃生门）。
+func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
+	platform := "WorkBuddy"
+	if a != nil && a.IsGlobal() {
+		platform = "WorkBuddy AI"
+	}
+	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
+}
+
+// defaultWorkBuddyUA 返回 CN 形态的默认 UA（默认账号形态即 CN，零回归兼容既有调用/测试）。
 func (c *Client) defaultWorkBuddyUA() string {
-	return "WorkBuddy/" + c.clientVersion() + " WorkBuddy/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	return c.defaultWorkBuddyUAFor(nil)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
-// 优先级：Client.UserAgent（config user_agent）显式覆盖 > 默认 WorkBuddy 三段式。
+// 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
 // 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
-// 未配则走官方桌面端默认形态（本任务 A 段核心变更）。
-func (c *Client) userAgent() string {
+// 未配则走官方桌面端默认形态（global 换 `WorkBuddy AI` 平台段）。
+func (c *Client) userAgent(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
 	}
-	return c.defaultWorkBuddyUA()
+	return c.defaultWorkBuddyUAFor(a)
 }
 
 // billingUA 白名单类（billing/checkin/banner）出站 UA。
@@ -118,7 +130,22 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", c.userAgent())
+	// User-Agent 按账号 realm 切换品牌段（global → `WorkBuddy AI`，见 defaultWorkBuddyUAFor）。
+	req.Header.Set("User-Agent", c.userAgent(a))
+}
+
+// injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
+// （ANALYSIS-global-chat-solutions.md）：
+//   - X-No-Enterprise-Id: 1  个人账号无企业 ID，显式声明（避免上游按缺省/可疑判定）
+//   - X-Domain: www.workbuddy.ai  显式声明国际版域（与 Origin/Referer 同域）
+//
+// 仅 global realm 注入；CN 账号走既有 X-No-Department-Info 等分支，零回归。
+func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || !a.IsGlobal() {
+		return
+	}
+	req.Header.Set("X-No-Enterprise-Id", "1")
+	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -137,16 +164,24 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-	} else {
-		req.Header.Set("X-No-Enterprise-Id", "1")
-	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	// 企业与域头按 realm 分发：CN 走既有分支（EnterpriseID/Domain 原样透传，缺省 X-No-*）；
+	// global 账号由 injectGlobalChatHeaders 统一覆写为国际客户端形态
+	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
+	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
+	if a != nil && !a.IsGlobal() {
+		if a.EnterpriseID != "" {
+			req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		} else {
+			req.Header.Set("X-No-Enterprise-Id", "1")
+		}
+		if a.Domain != "" {
+			req.Header.Set("X-Domain", a.Domain)
+		} else {
+			req.Header.Set("X-No-Department-Info", "1")
+		}
 	} else {
-		req.Header.Set("X-No-Department-Info", "1")
+		c.injectGlobalChatHeaders(req, a)
 	}
 	// 用量归属头：真实桌面端发 X-Agent-Purpose="conversation" + X-IDE-Name/Type/X-Product
 	// 识别 client，避免上游用量统计里 client/agentPurpose 为空。来源 xiaofan6ya/converter.py。
