@@ -215,6 +215,16 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN 凭证不带该键 → 自动按空值回落 CN，零迁移。
 
+**`--realm=global` 登录后自动注册激活 + trial 领取**：token 落盘后 login.sh 会依次执行两步（失败只提示不阻断登录，token 已落盘）：
+
+1. **注册激活**：`GET https://www.workbuddy.ai/auth/realms/copilot/overseas/user/register?userId=<uid>`
+   - `code=200`：成功（已激活 / 新激活，幂等）
+   - `code=500 "register region required"`：提示用户打开 `https://www.workbuddy.ai/login/register/user/complete` 完善注册地区后重跑 `./login.sh --realm=global`
+2. **trial 领取**：`POST https://www.workbuddy.ai/billing/ide/trial`
+   - `code=14051` = 已领取过（幂等，不算失败）；成功输出「国际版 trial 已激活，可以开始对话」
+
+> 新 global 账号必须先完成区注册再调 register 激活 trial，chat 才不报 `14017 trial not activated`；`11140 request illegal` 是账号级授权风控，触发后重新 OAuth 登录（`login.sh`）即可恢复。
+
 ### 模型名前缀协议
 
 请求 `model` 支持 `[realm:]model` 语法（小写）：
@@ -288,6 +298,7 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 | Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
+| 账号级故障 | HTTP 403 + `request illegal`（11140）/ `trial not activated`（14017） | 软冷却 `soft_rate`（与 429 同路径，账号级授权/配额故障：11140 = auth 风控需重登，14017 = register 未完成试用未激活） | 到期自动恢复 / 重新 OAuth 登录 |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
