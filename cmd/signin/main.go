@@ -77,6 +77,7 @@ func main() {
 				continue
 			}
 			// refresh 后写回文件（权限问题已修复）；落盘失败必须暴露，否则重启回旧 token
+			a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			if err := a.SaveAtomic(); err != nil {
 				log.Printf("signin %s save: %v", a.UID, err)
 			}

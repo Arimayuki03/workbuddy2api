@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -624,5 +626,94 @@ func TestCheckinAllReenablesCoolingAccount(t *testing.T) {
 	}
 	if st, _ := p.Status("u1"); st.Cooling {
 		t.Errorf("签到 + 余额恢复应解冻: %+v", st)
+	}
+}
+
+// TestRunKeepaliveBackfillsRealm 验证 keepalive refresh 成功后，SaveAtomic 落盘文件
+// 自动补上 realm 标识：老 global 文件（domain=workbuddy.ai，无 realm 键）→ global，
+// 老 CN 文件（空 domain，无 realm 键）→ cn；再次 refresh 不改变已补的标识（幂等）。
+func TestRunKeepaliveBackfillsRealm(t *testing.T) {
+	cases := []struct {
+		name       string
+		fixture    string
+		filename   string
+		wantRealm  string
+	}{
+		{
+			name: "老 global 落盘补 global",
+			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
+			filename:   "workbuddy-g1.json",
+			wantRealm:  "global",
+		},
+		{
+			name: "老 CN 空 domain 落盘补 cn",
+			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
+			filename:   "workbuddy-c1.json",
+			wantRealm:  "cn",
+		},
+		{
+			name: "已有 realm 不被覆盖——global domain 显式 cn 保持 cn",
+			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
+			filename:   "workbuddy-c2.json",
+			wantRealm:  "cn",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fp := filepath.Join(dir, c.filename)
+			if err := os.WriteFile(fp, []byte(c.fixture), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			a, err := auth.Parse([]byte(c.fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.FilePath = fp
+
+			p := pool.New("")
+			p.Add(a)
+
+			f := &fakeUpstream{}
+			srv := f.server()
+			defer srv.Close()
+			up := &upstream.Client{
+				HTTP:          srv.Client(),
+				ChatBaseCN:    srv.URL,
+				BillingBaseCN: srv.URL,
+			}
+			s := New(Config{Pool: p, Upstream: up})
+
+			s.RunKeepaliveNow()
+			if f.refreshCalls.Load() != 1 {
+				t.Fatalf("refresh calls=%d", f.refreshCalls.Load())
+			}
+			raw, err := os.ReadFile(fp)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			b, err := auth.Parse(raw)
+			if err != nil {
+				t.Fatalf("reparse: %v", err)
+			}
+			if b.RealmStored() != c.wantRealm {
+				t.Errorf("realm=%q want %q after refresh+save", b.RealmStored(), c.wantRealm)
+			}
+
+			// 幂等：已有标识后再跑一轮 refresh+save，值不变
+			s.RunKeepaliveNow()
+			raw2, err := os.ReadFile(fp)
+			if err != nil {
+				t.Fatalf("read after second run: %v", err)
+			}
+			b2, err := auth.Parse(raw2)
+			if err != nil {
+				t.Fatalf("reparse after second: %v", err)
+			}
+			if b2.RealmStored() != c.wantRealm {
+				t.Errorf("realm=%q want %q after idempotent run", b2.RealmStored(), c.wantRealm)
+			}
+		})
 	}
 }

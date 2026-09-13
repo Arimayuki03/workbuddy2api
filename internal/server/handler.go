@@ -470,6 +470,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				fail(acct.UID)
 				continue
 			}
+			acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
 				log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)

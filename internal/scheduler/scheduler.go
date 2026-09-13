@@ -265,9 +265,12 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 					out = append(out, oc)
 					continue
 				}
-			} else if err := a.SaveAtomic(); err != nil {
-				// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
-				log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+			} else {
+				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+				if err := a.SaveAtomic(); err != nil {
+					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
+					log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+				}
 			}
 		}
 		// 签到返回错误（含"今天已签到"）也继续查余额：余额恢复即可解冻账号。
@@ -418,6 +421,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
 		}
