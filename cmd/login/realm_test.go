@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -42,5 +44,84 @@ func TestParseRealmArgs(t *testing.T) {
 				t.Errorf("rest=%v want %v", rest, c.wantRest)
 			}
 		})
+	}
+}
+
+// TestResolveRealmInput 覆盖交互式选域的输入→realm 映射（login.sh 交互分支的核心决策）：
+// "1"/"cn"/""（回车默认）→ cn；"2"/"global" → global；大小写不敏感；非法 → ("",false)。
+func TestResolveRealmInput(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{input: "1", want: "cn"},
+		{input: "cn", want: "cn"},
+		{input: "CN", want: "cn"},
+		{input: "", want: "cn"}, // 回车默认
+		{input: "2", want: "global"},
+		{input: "global", want: "global"},
+		{input: "GLOBAL", want: "global"},
+	}
+	for _, c := range cases {
+		got, ok := resolveRealmInput(c.input)
+		if !ok {
+			t.Errorf("resolveRealmInput(%q) ok=false want true", c.input)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("resolveRealmInput(%q)=%q want %q", c.input, got, c.want)
+		}
+	}
+	// 非法输入 → (false)。
+	for _, bad := range []string{"3", "cnn", "globalx", "foo"} {
+		if got, ok := resolveRealmInput(bad); ok {
+			t.Errorf("resolveRealmInput(%q)=(%q,true) want (_,false)", bad, got)
+		}
+	}
+}
+
+// TestPromptRealm 覆盖 promptRealm 的 I/O 行为（out 将接 os.Stderr，stdout 只出 realm）：
+//
+//	1 / 2 / 回车默认 → 分别输出来 cn / global / cn；均打印"选择登录版本"提示；
+//	非法输入 → 警告并回落 cn；EOF（非交互直接管道）→ 回落 cn。
+func TestPromptRealm(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		want     string
+		wantHint bool // 输出中出现"选择登录版本"提示
+	}{
+		{name: "选 cn", input: "1\n", want: "cn", wantHint: true},
+		{name: "选 global", input: "2\n", want: "global", wantHint: true},
+		{name: "回车默认 cn", input: "\n", want: "cn", wantHint: true},
+		{name: "非法回落 cn", input: "foo\n", want: "cn", wantHint: true},
+		{name: "EOF 回落 cn", input: "", want: "cn", wantHint: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var out bytes.Buffer
+			got := promptRealm(strings.NewReader(c.input), &out)
+			if got != c.want {
+				t.Errorf("promptRealm(%q)=%q want %q", c.input, got, c.want)
+			}
+			if c.wantHint && !strings.Contains(out.String(), "选择登录版本") {
+				t.Errorf("prompt should contain '选择登录版本', got %q", out.String())
+			}
+		})
+	}
+}
+
+// TestRealmSubcommandSelection 通过命令形式验证 realm 子命令（login.sh 交互分支调用）：
+// 子命令剥离 --realm，剩余参数为首个 "realm"。
+func TestRealmSubcommandSelection(t *testing.T) {
+	realm, rest, err := parseRealmArgs([]string{"realm"})
+	if err != nil {
+		t.Fatalf("parseRealmArgs(realm) err=%v", err)
+	}
+	if realm != "cn" {
+		t.Errorf("realm default=%q want cn", realm)
+	}
+	if len(rest) != 1 || rest[0] != "realm" {
+		t.Errorf("rest=%v want [realm]", rest)
 	}
 }

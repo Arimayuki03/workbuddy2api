@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -131,10 +132,42 @@ func parseRealmArgs(args []string) (realm string, rest []string, err error) {
 	return realm, rest, nil
 }
 
+// resolveRealmInput 把交互式选域的一行输入归一化为 realm（纯函数，login.sh 交互分支
+// 的核心决策，可测）。规则：
+//
+//	"1"/"cn"（大小写不敏感）/""（回车默认）→ cn
+//	"2"/"global" → global
+//	其他 → ("", false)（调用方回默认 cn）
+func resolveRealmInput(input string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "", "1", "cn":
+		return realmCN, true
+	case "2", "global":
+		return realmGlobal, true
+	}
+	return "", false
+}
+
+// promptRealm 交互式选域：向 out 打印选项提示（out 接 stderr，stdout 留给 realm 本身），
+// 从 in 读一行，返回归一化 realm。非法输入警告后回落 cn；EOF（非交互/管道）回落 cn。
+func promptRealm(in io.Reader, out io.Writer) string {
+	fmt.Fprintln(out, "选择登录版本: 1) 国内版(cn) 2) 国际版(global) [默认 1/cn]: ")
+	line, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && line == "" {
+		// EOF/非交互 → 回落默认 cn
+		return realmCN
+	}
+	if realm, ok := resolveRealmInput(line); ok {
+		return realm
+	}
+	fmt.Fprintln(out, "无效选择，默认国内版 cn")
+	return realmCN
+}
+
 func main() {
 	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
-		fatal("%v (usage: login [--realm=cn|global] <url|poll>)", err)
+		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
 	}
 	if len(rest) < 1 {
 		fatal("usage: login [--realm=cn|global] <url|poll>")
@@ -217,7 +250,13 @@ func main() {
 		fmt.Println(string(oraw))
 		os.Remove(stateFile)
 
+	case "realm":
+		// 交互式选域（login.sh 无 --realm 传参且 stdin 为 tty 时调用）。
+		// 提示打到 stderr，stdout 只输出归一化 realm，供 $( ) 捕获。
+		realm := promptRealm(os.Stdin, os.Stderr)
+		fmt.Println(realm)
+
 	default:
-		fatal("unknown subcommand %q (want url|poll)", rest[0])
+		fatal("unknown subcommand %q (want url|poll|realm)", rest[0])
 	}
 }

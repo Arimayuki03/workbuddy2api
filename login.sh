@@ -2,14 +2,18 @@
 # login.sh — WorkBuddy OAuth 登录 → 落盘 auth 文件
 #
 # 用法:
-#   ./login.sh                 # CN realm（默认）
-#   ./login.sh --realm=global  # 国际版 WorkBuddy
+#   ./login.sh                 # 交互式选域（默认 1/国内版 cn）
+#   ./login.sh --realm=global  # 传参优先，直达国际版
+#   ./login.sh --realm=cn      # 传参优先，直达国内版
+#   非交互（管道/cron）→ 回落默认 cn
 #
 # 流程:
-#   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
-#   2. 你在浏览器打开 URL 完成登录
-#   3. 回到这里按 y → poll 拿 token+uid+nickname → （仅 CN）签到 → 落盘 auths/workbuddy-<uid>.json
-#   4. 重启 workbuddy2api 容器加载新账号
+#   1. 选域：--realm 传参优先；否则 stdin 是 tty → 交互式选域（go 侧 login realm
+#      子命令提示 1)国内版 2)国际版，默认 1/cn）；非交互 → 回落 cn
+#   2. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
+#   3. 你在浏览器打开 URL 完成登录
+#   4. 回到这里按 y → poll 拿 token+uid+nickname → （仅 CN）签到 → 落盘 auths/workbuddy-<uid>.json
+#   5. 重启 workbuddy2api 容器加载新账号
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -18,15 +22,28 @@ CONTAINER="workbuddy2api"
 
 mkdir -p "$AUTH_DIR"
 
-# realm 参数透传（缺省 cn）；global 时跳过 CN 签到、auth 文件写 realm=global
-REALM="${1:-cn}"
-REALM="${REALM#--realm=}"
-
 # login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
 LOGIN_BIN="./login"
 if [[ ! -x "$LOGIN_BIN" ]]; then
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
+
+# ─── realm 选域：--realm=cn|global 传参优先（跳过询问）──────────────
+# 无传参：stdin 是 tty → 交互式选域（login realm 子命令负责提示+读数，go 侧逻辑可测）；
+#         非交互（管道/cron，[ -t 0 ] 为假）→ 回落默认 cn 并提示。
+REALM=""
+if [[ $# -gt 0 && "$1" == --realm=* ]]; then
+    REALM="${1#--realm=}"
+fi
+if [[ -z "$REALM" ]]; then
+    if [[ -t 0 ]]; then
+        REALM=$("$LOGIN_BIN" realm)
+    else
+        REALM="cn"
+        echo "（非交互 stdin，默认国内版 cn；可用 --realm=global 指定国际版）" >&2
+    fi
+fi
+# global 时跳过 CN 签到、auth 文件写 realm=global（见下方签到分支）
 
 echo "============================================================"
 echo "  WorkBuddy OAuth 登录"
