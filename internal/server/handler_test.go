@@ -1522,3 +1522,88 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
 	}
 }
+
+// TestStatusRealmTotals /status 新增 realm_totals 字段：混合池各域计数独立分组，
+// 既有 total/healthy/cooling/disabled 汇总键零回归（仍全池口径）。
+func TestStatusRealmTotals(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+		&auth.Auth{UID: "cn2", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+		&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+		&auth.Auth{UID: "g2", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+	)
+	p.Cooldown("cn2", pool.CoolSoft, time.Hour, "429 rate limit")
+	p.Disable("g2", "session dead")
+
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Total, Healthy, Cooling, Disabled int
+		RealmTotals                        map[string]map[string]int `json:"realm_totals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status not json: %v body=%s", err, rec.Body)
+	}
+	// 既有汇总键零回归：全池 = 4 账号。
+	if body.Total != 4 || body.Healthy != 2 || body.Cooling != 1 || body.Disabled != 1 {
+		t.Errorf("summary = %d/%d/%d/%d want 4/2/1/1 (zero regression)", body.Total, body.Healthy, body.Cooling, body.Disabled)
+	}
+	if body.RealmTotals == nil {
+		t.Fatal("realm_totals missing from /status")
+	}
+	cn := body.RealmTotals["cn"]
+	if cn["total"] != 2 || cn["healthy"] != 1 || cn["cooling"] != 1 || cn["disabled"] != 0 {
+		t.Errorf("realm_totals.cn=%v want total=2 healthy=1 cooling=1 disabled=0", cn)
+	}
+	g := body.RealmTotals["global"]
+	if g["total"] != 2 || g["healthy"] != 1 || g["cooling"] != 0 || g["disabled"] != 1 {
+		t.Errorf("realm_totals.global=%v want total=2 healthy=1 cooling=0 disabled=1", g)
+	}
+}
+
+// TestHealthzRealmServable /healthz 新增 realm_servable 字段：各域可服务状态独立暴露。
+// global 全冷却 + cn 空闲 → realm_servable.global=false, cn=true；HTTP 仍 200（存在性语义零回归）。
+func TestHealthzRealmServable(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+		&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+		&auth.Auth{UID: "g2", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+	)
+	// global 全冷却（一软一硬），cn 空闲。
+	p.Cooldown("g1", pool.CoolSoft, time.Hour, "429 rate limit")
+	p.Cooldown("g2", pool.CoolHard, time.Hour, "余额不足")
+
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	// 存在性语义零回归：任一域可服务 → 200。
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 (cn servable keeps existence semantics)", rec.Code)
+	}
+	var resp struct {
+		Healthy       int              `json:"healthy"`
+		RealmServable map[string]bool  `json:"realm_servable"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
+	}
+	if resp.Healthy != 1 {
+		t.Errorf("healthy=%d want 1 (only cn1)", resp.Healthy)
+	}
+	if resp.RealmServable["cn"] != true {
+		t.Errorf("realm_servable.cn=%v want true", resp.RealmServable["cn"])
+	}
+	if resp.RealmServable["global"] != false {
+		t.Errorf("realm_servable.global=%v want false", resp.RealmServable["global"])
+	}
+}

@@ -119,12 +119,19 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	if !h.cfg.Pool.ServableNow() {
 		status = http.StatusServiceUnavailable
 	}
+	// realm_servable 域可服务维度：不改判活语义（存在性探活保持不变），
+	// 只新增 CN/global 各自可达性供双域部署运维观察（任一域不可用单独告警）。
+	realmServable := map[string]bool{
+		"cn":     h.cfg.Pool.ServableForRealm("cn"),
+		"global": h.cfg.Pool.ServableForRealm("global"),
+	}
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
 	writeJSON(w, status, map[string]any{
-		"healthy": healthy,
-		"total":   total,
-		"service": ServiceName,
+		"healthy":       healthy,
+		"total":         total,
+		"service":       ServiceName,
+		"realm_servable": realmServable,
 	})
 }
 
@@ -138,6 +145,8 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	if redisMode == "" {
 		redisMode = "noop"
 	}
+	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
+	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":        h.cfg.Pool.List(),
 		"total":           total,
@@ -145,9 +154,24 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
+		"realm_totals": map[string]map[string]int{
+			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
+			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
+		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 	})
+}
+
+// countsMapFrom 把 CountsDetailed 五元组编码为 /status realm_totals 的字段对象。
+func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[string]int {
+	return map[string]int{
+		"total":          total,
+		"healthy":        healthy,
+		"cooling":        cooling,
+		"disabled":       disabled,
+		"in_flight_full": inFlightFull,
+	}
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
