@@ -28,6 +28,7 @@ func (k CoolKind) String() string {
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
 	UID             string    `json:"uid"`
+	Realm           string    `json:"realm,omitempty"`
 	Nickname        string    `json:"nickname,omitempty"`
 	Credits         int64     `json:"credits"`
 	Cooling         bool      `json:"cooling"`

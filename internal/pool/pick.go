@@ -19,14 +19,14 @@ func (p *Pool) Pick() *auth.Auth {
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, "")
+	return p.pick(tried, "", "")
 }
 
 // PickExcludingForModel 模型感知选号：等同 PickExcluding，但对「6004 模型级冷却中的
 // 账号」进行模型豁免——请求模型与其 trigger 模型不同时视为可用（issue #31）。
 // reqModel 为空时即普通 PickExcluding（不影响既有调用语义）。
 func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *auth.Auth {
-	return p.pick(tried, reqModel)
+	return p.pick(tried, reqModel, "")
 }
 
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
@@ -36,15 +36,17 @@ func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *au
 // 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效；PickExcluding 传 ""）。
+// realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域；PickExcluding 传 ""）。
 // 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
 // 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
-func (p *Pool) pick(tried map[string]bool, reqModel string) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	healthyOf := func(e *entry) bool { return e.healthy(now) }
+	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
+	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return e.healthyForModel(now, reqModel) }
+		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
 	}
 	var cands []*entry
 	for uid, e := range p.byUID {
@@ -62,7 +64,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel string) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now)
+		return p.pickEarliestExpiryLocked(tried, now, realm)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -152,11 +154,14 @@ func (p *Pool) pick(tried map[string]bool, reqModel string) *auth.Auth {
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
 		}
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
