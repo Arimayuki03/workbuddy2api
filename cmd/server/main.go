@@ -42,6 +42,10 @@ func main() {
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
+	// global realm 路由开关（config global.enabled，缺省 false）：注入 auth 包全局闸。
+	// Realm()/IsGlobal() 先过此闸——开关未开恒 cn（纯 CN 零回归的双保险第一道闸）。
+	auth.SetGlobalEnabled(cfg.Global.Enabled)
+
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 
@@ -71,7 +75,9 @@ func main() {
 			Available:  p.AvailableUIDs,
 			// 按模型的可用性口径：绑定号在当前模型被 6004 限额时重分配，
 			// 而不是被钉在这个号上反复失败。
-			AvailableForModel: p.AvailableUIDsForModel,
+			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
+			// 见 wiring.go）；裸名走 cn（现状零回归）。
+			AvailableForModel: realmAwareAvailableForModel(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -107,6 +113,11 @@ func main() {
 	// 用量归属头（X-Product/X-IDE-*）+ 客户端 IP 透传开关（见 ChatHeaders / handler）。
 	up.ClientName = cfg.Upstream.ClientName
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// global realm 双域路由（config global 段）：base 空回落内置默认 https://www.workbuddy.ai；
+	// GlobalEnabled 与 auth 包开关一致（双保险第二道闸在 upstream.globalOn）。
+	up.ChatBaseGlobal = cfg.Global.ChatBase
+	up.BillingBaseGlobal = cfg.Global.BillingBase
+	up.GlobalEnabled = cfg.Global.Enabled
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
@@ -175,6 +186,12 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
+	if cfg.Global.Enabled {
+		log.Printf("global realm 已启用（chat_base=%q billing_base=%q，空=默认 workbuddy.ai）",
+			cfg.Global.ChatBase, cfg.Global.BillingBase)
+	} else {
+		log.Printf("global realm 已禁用（config global.enabled=false，纯 CN）")
+	}
 	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
