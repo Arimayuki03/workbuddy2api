@@ -42,8 +42,8 @@ func main() {
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
-	// global realm 路由开关（config global.enabled，缺省 false）：注入 auth 包全局闸。
-	// Realm()/IsGlobal() 先过此闸——开关未开恒 cn（纯 CN 零回归的双保险第一道闸）。
+	// global realm 路由开关（config global.enabled，缺省 true）：注入 auth 包全局闸。
+	// Realm()/IsGlobal() 先过此闸——显式 false 时恒 cn（逃生门：纯 CN 锁定的第一道闸）。
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。

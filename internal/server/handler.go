@@ -44,9 +44,10 @@ type Config struct {
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
 
-	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 false）。
+	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
-	// false 时即便 auth realm=global 也不提供 global: 模型名（modelList 不列 global 名单）。
+	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
+	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 }
 

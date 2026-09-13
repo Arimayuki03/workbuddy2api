@@ -13,11 +13,11 @@ import (
 )
 
 // globalTestClient 构造带 global 配置的 Client（GlobalEnabled=true + global base 指向 httptest 两段
-// chat/console 与 billing/meter），并临时打开 auth globalEnabled 开关。
+// chat/console 与 billing/meter），并确保 auth globalEnabled 开关开启（缺省）。
 func globalTestClient(t *testing.T, chatSrv, billingSrv *httptest.Server) *Client {
 	t.Helper()
 	auth.SetGlobalEnabled(true)
-	t.Cleanup(func() { auth.SetGlobalEnabled(false) })
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	return &Client{
 		HTTP:             &http.Client{}, // DefaultTransport → 走 httptest 服务器真实地址
 		ChatBaseCN:       "https://chat.example",

@@ -310,8 +310,8 @@ type Client struct {
 	ChatBaseGlobal    string
 	BillingBaseGlobal string
 
-	// GlobalEnabled 是否启用 global realm 路由（config global.enabled，缺省 false）。
-	// false 时即使用户 auth 写了 realm=global 也**不**路由到 global base——
+	// GlobalEnabled 是否启用 global realm 路由（config global.enabled，缺省 true）。
+	// false 即显式逃生门：即使用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
 }

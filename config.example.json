@@ -21,7 +21,7 @@
     "keepalive_enabled": true
   },
   "global": {
-    "enabled": false,
+    "enabled": true,
     "chat_base": "",
     "billing_base": ""
   },

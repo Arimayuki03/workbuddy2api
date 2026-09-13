@@ -8,12 +8,12 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// realmPool 构造一个含 cn/global 账号的池，并临时打开 globalEnabled 开关。
+// realmPool 构造一个含 cn/global 账号的池，并确保 globalEnabled 开关开启（缺省）。
 func realmPool(t *testing.T) *Pool {
 	t.Helper()
 	withNoPickGap(t)
 	auth.SetGlobalEnabled(true)
-	t.Cleanup(func() { auth.SetGlobalEnabled(false) })
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	p := New("")
 	// CN 账号（显式 cn realm 或空 realm+cn domain 均可）→ Realm()=="cn"
 	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})

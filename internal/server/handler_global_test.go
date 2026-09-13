@@ -59,10 +59,11 @@ func newRealmFake(t *testing.T) *realmFake {
 // TestChatRealmSelectionAndBodyRewrite 断言 realm 贯穿：
 // global: 前缀 → 全局号 + 出站 body 剥前缀 + /console 路径 + ensureConsoleSystem 补 system；
 // 裸名 → CN 号 + /v2 路径 + body 原样（零回归）。
-// TestModelsGlobalListGating 断言 global 名单（§7.2 21 名）在 GlobalEnabled=true 时列出
-//（带 global: 前缀）、false（缺省）时不出现——CN 模型恒加 cn: 前缀。
+// TestModelsGlobalListGating 断言 global 名单（§7.2 21 名）在 GlobalEnabled=true（缺省）时
+// 列出（带 global: 前缀）、false（逃生门）时不出现——CN 模型恒加 cn: 前缀。
 func TestModelsGlobalListGating(t *testing.T) {
 	// 关闭动态（无健康 CN 账号）→ 回退静态表，便于精确计数。
+	resetModelsCache()
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
 	up := upstream.New()
 	h := NewHandler(Config{Pool: p, Upstream: up, GlobalEnabled: true})
@@ -97,7 +98,7 @@ func TestModelsGlobalListGating(t *testing.T) {
 
 func TestChatRealmSelectionAndBodyRewrite(t *testing.T) {
 	auth.SetGlobalEnabled(true)
-	t.Cleanup(func() { auth.SetGlobalEnabled(false) })
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	cf := newRealmFake(t)
 	p := testPoolWith(
 		&auth.Auth{UID: "cn1", AccessToken: "at_cn", Domain: "www.codebuddy.cn", ExpiresAt: 9999999999},
@@ -155,9 +156,27 @@ func TestChatRealmSelectionAndBodyRewrite(t *testing.T) {
 	}
 }
 
-// TestChatRealmGlobalDisabled 零回归双保险：GlobalEnabled=false（缺省）时，
-// 即便池里有 domain=workbuddy.ai 的账号，global: 前缀请求也不路由 global → 503。
-func TestChatRealmGlobalDisabled(t *testing.T) {
+// TestChatRealmGlobalAbortedNoGlobalAccount 逃生门双保险：默认开启后，仅池里没有 global
+// 账号时，global: 前缀请求无可选号 → 503（不跨 realm 用 CN 号顶上）。
+func TestChatRealmGlobalAbortedNoGlobalAccount(t *testing.T) {
+	cf := newRealmFake(t)
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", AccessToken: "at_cn", Domain: "www.codebuddy.cn", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: cf.up, GlobalEnabled: true})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no global account: code=%d want 503 (must not fall back to cn)", rec.Code)
+	}
+}
+
+// TestChatRealmGlobalDisabledEscapeHatch 逃生门：config GlobalEnabled=false 时，即便默认
+// 开启（auth.Realm() 判 global 账号），也没有 global 上游可路由，请求回落 CN 路径（200，
+// 不崩溃、不泄漏 global 凭据）。
+func TestChatRealmGlobalDisabledEscapeHatch(t *testing.T) {
 	cf := newRealmFake(t)
 	cf.up.GlobalEnabled = false
 	p := testPoolWith(
@@ -168,7 +187,13 @@ func TestChatRealmGlobalDisabled(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"global:gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("global disabled: code=%d want 503 (must not route global)", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("global disabled escape hatch: code=%d want 200 (routes CN path)", rec.Code)
+	}
+	cf.mu.Lock()
+	gotPath := cf.path
+	cf.mu.Unlock()
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("global disabled escape hatch: path=%q want CN /v2/chat/completions", gotPath)
 	}
 }

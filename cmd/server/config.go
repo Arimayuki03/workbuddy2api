@@ -41,8 +41,11 @@ type Config struct {
 	Schedule config.Schedule `json:"schedule"`
 
 	Global struct {
-		// Enabled global realm 路由开关。缺省 false（纯 CN 零回归）：即便 auth 文件写了
-		// realm=global 也不路由 global base/路径（auth.Realm() 双保险的第一道闸）。
+		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
+		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
+		// 显式 "enabled": false 关闭（逃生门，纯 CN 锁定：即便 auth 写了 realm=global
+		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
+		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
 		Enabled bool `json:"enabled"`
 		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
 		// https://www.workbuddy.ai（D5，internal/upstream.defaultGlobalBase）。
@@ -151,7 +154,9 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
-	// Global.Enabled 缺省 false；ChatBase/BillingBase 缺省空（回落内置默认）。
+	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
+	// ChatBase/BillingBase 缺省空（回落内置默认）。
+	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "custom" // 缺省 custom：网关自有提示词从源头消灭 system 指纹误报
 	c.Pool.MaxInFlight = 3
