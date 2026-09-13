@@ -136,3 +136,82 @@ func TestSaveAtomicPreservesDeviceToken(t *testing.T) {
 		t.Errorf("roundtrip DeviceToken = %q want %q", b.DeviceToken, "persisted-tok")
 	}
 }
+
+// TestLoadDirBackfillsRealm 存量迁移：LoadDir 加载目录时对空 realm 的 auth 自动
+// backfill + SaveAtomic；已有 realm 的保持原值（不被 domain 覆盖）；文件全部带标识。
+func TestLoadDirBackfillsRealm(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fixtures := map[string]string{
+		"workbuddy-g1.json": `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
+		"workbuddy-c1.json": `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
+		// 已有 realm 的不因 domain 变化被覆盖：global domain + 显式 cn → 保持 cn
+		"workbuddy-c2.json": `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
+	}
+	for name, body := range fixtures {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	list, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("want 3 accounts, got %d", len(list))
+	}
+	want := map[string]string{"g1": "global", "c1": "cn", "c2": "cn"}
+	for _, a := range list {
+		// 内存态已补标识
+		if got := a.RealmStored(); got != want[a.UID] {
+			t.Errorf("uid=%s in-memory realm=%q want %q", a.UID, got, want[a.UID])
+		}
+		// 落盘文件也带 realm 键
+		raw, err := os.ReadFile(a.FilePath)
+		if err != nil {
+			t.Fatalf("read %s: %v", a.FilePath, err)
+		}
+		b, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("reparse %s: %v", a.FilePath, err)
+		}
+		if got := b.RealmStored(); got != want[a.UID] {
+			t.Errorf("uid=%s on-disk realm=%q want %q", a.UID, got, want[a.UID])
+		}
+	}
+}
+
+// TestLoadDirBackfillWriteFailureDoesNotBlock 单个文件 backfill 落盘失败（tmp 预置目录
+// 使 WriteFile 失败）不阻断启动：其他文件照常迁移，LoadDir 不向上抛错。
+// （历史纯 CN auth 目录一次性迁移时，个别文件不可写不应让整个服务起不来。）
+func TestLoadDirBackfillWriteFailureDoesNotBlock(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	good := `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy-g1.json"), []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 预置同名 .tmp 目录 → SaveAtomic 的 os.WriteFile(".tmp") 报 is a directory。
+	if err := os.Mkdir(filepath.Join(dir, "workbuddy-c1.json.tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bad := `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1},"account":{"uid":"c1"}}`
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy-c1.json"), []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("load err=%v want nil (write failure must not block startup)", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("want 2 accounts loaded, got %d", len(list))
+	}
+	// 好文件迁移成功
+	raw, _ := os.ReadFile(filepath.Join(dir, "workbuddy-g1.json"))
+	b, _ := Parse(raw)
+	if b.RealmStored() != "global" {
+		t.Errorf("good file realm=%q want global (migration should succeed)", b.RealmStored())
+	}
+}

@@ -5,12 +5,15 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/logfmt"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
@@ -245,6 +248,9 @@ func (a *Auth) SaveAtomic() error {
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
+// 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
+// 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
+// 避免历史 auth 目录个别文件不可写时整个服务起不来。
 func LoadDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
@@ -261,6 +267,15 @@ func LoadDir(dir string) ([]*Auth, error) {
 			continue
 		}
 		a.FilePath = f
+		if a.RealmStored() == "" {
+			if changed, r := a.BackfillRealm(); changed {
+				if err := a.SaveAtomic(); err != nil {
+					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.UID8(a.UID), err)
+				} else if r == "global" {
+					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
+				}
+			}
+		}
 		out = append(out, a)
 	}
 	return out, nil
