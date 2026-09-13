@@ -229,6 +229,8 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 
 `global.enabled` 默认 **true**（国际版路由开启）。显式设 **false** 为逃生门：纯 CN 部署，即便 auth 文件写了 `realm=global` 或 domain 为 `www.workbuddy.ai` 也恒按 CN 处理（路由与任务门控同步关闭）。
 
+> ⚠️ **逃生门守则**：`global.enabled=false` 时，`auth.Realm()` 恒返回 `cn`——auths/ 里残留的 global 凭证会被**降级按 CN 处理**并打向 CN 端点（chat 走 codebuddy.cn、调度器把它们当 CN 跑签到/旅行/活跃、`cmd/credit`/`scripts/*.py` 也按 CN 单域发起）。**若混布 global 号又关逃生门，属于配置错误**：逃生门唯一语义是「纯 CN 部署锁死一切」；关闭前请把 `realm=global` 的 auth 文件移出 `auths/`（或将 `global.enabled` 恢复 true）。
+
 ### Global 账号行为差异
 
 | 行为 | CN 账号 | Global 账号 |
@@ -354,6 +356,11 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 - **streak 自检**：上报成功后回读连登天数（只读 oracle），日志每号一行可 grep：`activity <uid>: streak days=N`。`days=0` 记 **warn**（`report OK but streak.days=0 (silent drop?)`，对应上游「200 但静默丢弃」）；回读失败记 warn 但不影响主流程（上报按天幂等，不重试，只观测）
 - 手动诊断 / 补跑用 `python3 scripts/task_runner.py`（成长任务一体机：查询/完成/领奖；默认 dry-run，写操作需 `--yes`）
 
+> **`scripts/` 任务脚本仅适用 CN 账号**：`task_runner.py` / `school_open_day_2026.py` / `school_open_day_cron.sh`
+> 面向国内版任务中心/开学季活动，端点为 `copilot.tencent.com` / `codebuddy.cn`。一旦 `auths/` 混入
+> `realm=global` 账号，脚本会打印 `[skip] <uid8> global realm 不适用 CN 任务` 并跳过该号（不发起任何请求）；
+> 纯 global 部署请勿直接跑这些脚本（全球版无任务中心），积分增益只看 `./credit.sh` 与一次性 `./trial.sh`。
+
 #### 猫猫旅行（独立排程）
 
 对池内每个可用账号在 `travel_hours`（默认 `[9, 21]` 整点）单趟推进一次，每趟只做一个动作，不轮询不等待。默认两趟闭环：9 点领昨日到站奖励并派出，21 点领当日到站奖励（`daily_limit_reached` 自动挡住二次派出）。
@@ -470,7 +477,7 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 |---|---|
 | `./login.sh [--realm=cn\|global]` | OAuth 登录（无参数交互式选域）→ 落盘 auth → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新；「已签到 / 未开启 / 已过期 / inactive」判幂等不算失败） |
-| `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
+| `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON）；realm 感知——global 账号查积分走 `workbuddy.ai`（`/billing/meter/*` 404 回落 `/v2`），CN 账号维持 `codebuddy.cn` |
 | `./trial.sh [auths_dir]` | 国际版 trial 加油包领取（仅 global 账号；`14051`=已领幂等） |
 | `python3 scripts/task_runner.py ALL` | 成长任务查询（默认 dry-run 只展示）；`--yes` 全量完成并领奖，`--only <task_code>` 指定单个任务，`--only-claim` 只领奖不点亮 |
 
