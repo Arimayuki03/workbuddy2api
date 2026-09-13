@@ -44,9 +44,10 @@ func newGlobalModelsHandlerFake(t *testing.T, status int, body string) *globalMo
 		_, _ = io.WriteString(w, cf.body)
 	}))
 	cf.up = &upstream.Client{
-		HTTP:            &http.Client{},
-		ChatBaseGlobal:  strings.TrimSuffix(ts.URL, "/"),
-		GlobalEnabled:   true,
+		HTTP:           &http.Client{},
+		ChatBaseCN:     "http://cn.invalid", // CN 动态探测若被触发，本地解析失败即回落，绝不外连
+		ChatBaseGlobal: strings.TrimSuffix(ts.URL, "/"),
+		GlobalEnabled:  true,
 	}
 	return cf
 }

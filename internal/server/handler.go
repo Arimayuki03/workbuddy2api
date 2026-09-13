@@ -218,8 +218,8 @@ func (h *Handler) modelList() []map[string]any {
 				e[k] = v
 			}
 			if id, ok := m["id"].(string); ok {
-			e["id"] = "cn:" + id
-		}
+				e["id"] = "cn:" + id
+			}
 			out = append(out, e)
 		}
 	}

@@ -43,18 +43,19 @@ var GlobalModelNames = []string{
 	"kimi-k2.6",
 }
 
-// fetchGlobalModelsCache 探测结果缓存（语义参照 CN 侧 dynamicModelsCache：1h TTL +
+// fetchGlobalModelsCache 探测结果缓存（语义参照 CN 侧 handler.dynamicModelsCache：1h TTL +
 // 5min 失败负缓存）。按 Client 实例持有（effortsMu 同模式），测试新建 Client 即隔离。
+// Mutex 内嵌，与 modelList 无并发读路径竞争（唯一读写点本文件内）。
 type fetchGlobalModelsCache struct {
 	sync.Mutex
-	names     []string // 成功缓存：探测 ∪ 静态名单（已去重）；nil = 未探测
-	fetched   time.Time
-	lastFail  time.Time
+	names    []string // 成功缓存：探测 ∪ 静态名单（已去重）；nil = 未探测
+	fetched  time.Time
+	lastFail time.Time
 }
 
 // globalModelsTTL / globalModelsFailCooldown 探测缓存时长：成功 1h，失败 5min 负缓存。
 const (
-	globalModelsTTL        = time.Hour
+	globalModelsTTL          = time.Hour
 	globalModelsFailCooldown = 5 * time.Minute
 )
 
@@ -70,21 +71,37 @@ var globalModelsProbePaths = []string{
 //
 // 成功：探测结果 ∪ GlobalModelNames（去重，静态 21 为基底，探测独有追加），缓存 1h。
 // 失败（家族端点全非 2xx / 解析失败 / 空列表）：记 5min 负缓存，回落 GlobalModelNames。
-// 缓存命中（成功缓存未过期 → 直接返回；负缓存冷却期内 → 直接返回静态名单）零上游调用。
+// 缓存/负缓存命中：直接返回，零上游调用。
 //
-// 调用方负责传递 global realm 账号（realm=global）与判定"有无 global 账号"（无则不应调本方法）。
+// 调用方负责：① 仅在有 global 账号时调用（无则不探测）；
+// ② GlobalEnabled 关闭时（逃生门）不得调用——本方法由 globalOn(a) 内部兜底，若账号
+// 因开关回落 cn 则返回 nil（handler 侧回落静态名单，仍零探测）。
 func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
-	if cached := c.globalModelCacheHit(); cached != nil {
-		return cached
+	if !c.globalOn(a) {
+		// 逃生门兜底：账号不路由 global 上游 → 不探测，回落静态名单（零上游调用）。
+		return GlobalModelNames
 	}
+
+	c.globalModels.Lock()
+	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
+		out := c.globalModels.names
+		c.globalModels.Unlock()
+		return out
+	}
+	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
+		// 负缓存冷却期内：避免反复打上游，直接按失败处理（回落静态）。
+		c.globalModels.Unlock()
+		return GlobalModelNames
+	}
+	c.globalModels.Unlock()
 
 	names, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 回落静态名单。
-		c.globalModelsMu.Lock()
+		c.globalModels.Lock()
 		c.globalModels.lastFail = time.Now()
 		c.globalModels.names = nil
-		c.globalModelsMu.Unlock()
+		c.globalModels.Unlock()
 		return GlobalModelNames
 	}
 
@@ -106,27 +123,12 @@ func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
 		merged = append(merged, id)
 	}
 
-	c.globalModelsMu.Lock()
+	c.globalModels.Lock()
 	c.globalModels.names = merged
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
-	c.globalModelsMu.Unlock()
+	c.globalModels.Unlock()
 	return merged
-}
-
-// globalModelCacheHit 返回缓存中的名单：成功缓存未过期 → 返回缓存；负缓存冷却期内 → nil
-// 的等价（调用方当回落静态）。未命中返回 nil（无成功缓存且不在负缓存冷却期）。
-func (c *Client) globalModelCacheHit() []string {
-	c.globalModelsMu.Lock()
-	defer c.globalModelsMu.Unlock()
-	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
-		return c.globalModels.names
-	}
-	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
-		// 负缓存冷却期内：避免反复打上游，直接按失败处理（回落静态）。
-		return GlobalModelNames
-	}
-	return nil
 }
 
 // probeGlobalModels 按候选路径序列发起一次探测，返回模型名列表（未去重、已滤 disabled）。

@@ -45,9 +45,9 @@ func modelsResp(ids ...string) string {
 func globalModelsClient(t *testing.T, srv *httptest.Server) *Client {
 	t.Helper()
 	return &Client{
-		HTTP:            &http.Client{},
-		ChatBaseGlobal:  strings.TrimSuffix(srv.URL, "/"),
-		GlobalEnabled:   true,
+		HTTP:           &http.Client{},
+		ChatBaseGlobal: strings.TrimSuffix(srv.URL, "/"),
+		GlobalEnabled:  true,
 	}
 }
 
