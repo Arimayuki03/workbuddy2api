@@ -75,6 +75,19 @@ func (a *Auth) Realm() string {
 	return "cn"
 }
 
+// ResolveRealm 归一化 realm（cn/global）：显式非空优先，否则按原始 domain 推断
+// （isGlobalDomain）。不受逃生门影响（逃生门是路由锁，不应影响标识判定）；
+// domain 也为空 → "cn"（老 CN 凭证零回归）。
+func ResolveRealm(explicit, domain string) string {
+	if r := strings.TrimSpace(explicit); r != "" {
+		return r
+	}
+	if isGlobalDomain(domain) {
+		return "global"
+	}
+	return "cn"
+}
+
 // BackfillRealm 为缺省 realm 标识的账号持久化补标识：a.realm 为空时按「原始 domain 推断」
 // 写回（cn/global），返回 (是否有变更, 归一化后的 realm)。已有标识不动（幂等）。
 //
@@ -85,10 +98,7 @@ func (a *Auth) BackfillRealm() (bool, string) {
 	if strings.TrimSpace(a.realm) != "" {
 		return false, a.realm
 	}
-	r := "cn"
-	if isGlobalDomain(a.Domain) {
-		r = "global"
-	}
+	r := ResolveRealm("", a.Domain)
 	a.realm = r
 	return true, r
 }

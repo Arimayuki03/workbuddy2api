@@ -251,3 +251,24 @@ func assertRealmStored(a *Auth, want string, t *testing.T) {
 		t.Errorf("stored realm field=%q want %q", a.realm, want)
 	}
 }
+
+// TestResolveRealm 纯函数归一化显式 realm，缺失时按 domain 推断（与 BackfillRealm
+// 共用同一来源；不受逃生门影响）。显式值优先于 domain 推断。
+func TestResolveRealm(t *testing.T) {
+	t.Parallel() // 纯函数：不触碰全局开关
+	cases := []struct {
+		explicit, domain, want string
+	}{
+		{"global", "www.codebuddy.cn", "global"},   // 显式优先：cn domain 也写 global
+		{"cn", "www.workbuddy.ai", "cn"},           // 显式优先：global domain 也写 cn
+		{"", "www.workbuddy.ai", "global"},         // 缺省按 domain 推断
+		{"", "workbuddy.ai", "global"},
+		{"", "codebuddy.cn", "cn"},
+		{"", "", "cn"},                             // 空 domain → cn（老 CN 凭证零回归）
+	}
+	for _, c := range cases {
+		if got := ResolveRealm(c.explicit, c.domain); got != c.want {
+			t.Errorf("ResolveRealm(%q,%q)=%q want %q", c.explicit, c.domain, got, c.want)
+		}
+	}
+}

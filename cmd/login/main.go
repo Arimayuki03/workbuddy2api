@@ -24,6 +24,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	auth2 "workbuddy2api/internal/auth"
 )
 
 // 上游常量（CN only）
@@ -164,6 +166,31 @@ func promptRealm(in io.Reader, out io.Writer) string {
 	return realmCN
 }
 
+// buildLoginOutput 组装 poll 输出的完整 JSON（login.sh 据此落盘 auth 文件）。
+// realm 永不空：显式 --realm 优先（ResolveRealm 处理），否则按上游返回的 domain 推断——
+// 保证登录落盘的 auth 文件恒带 realm 键。
+func buildLoginOutput(tok struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int64  `json:"expiresIn"`
+	Domain       string `json:"domain"`
+}, realm string, acct struct {
+	UID          string `json:"uid"`
+	EnterpriseID string `json:"enterpriseId"`
+	Nickname     string `json:"nickname"`
+}) map[string]any {
+	return map[string]any{
+		"access_token":  tok.AccessToken,
+		"refresh_token": tok.RefreshToken,
+		"expires_in":    tok.ExpiresIn,
+		"domain":        tok.Domain,
+		"realm":         auth2.ResolveRealm(realm, tok.Domain),
+		"uid":           acct.UID,
+		"enterprise_id": acct.EnterpriseID,
+		"nickname":      acct.Nickname,
+	}
+}
+
 func main() {
 	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
@@ -236,17 +263,7 @@ func main() {
 		if acctRaw, _, errAcct := doJSON(client, http.MethodGet, endpointLoginAcct+ls.State, acctHeaders, nil); errAcct == nil {
 			_ = json.Unmarshal(acctRaw, &acct)
 		}
-		out := map[string]any{
-			"access_token":  tok.AccessToken,
-			"refresh_token": tok.RefreshToken,
-			"expires_in":    tok.ExpiresIn,
-			"domain":        tok.Domain,
-			"realm":         realm,
-			"uid":           acct.UID,
-			"enterprise_id": acct.EnterpriseID,
-			"nickname":      acct.Nickname,
-		}
-		oraw, _ := json.Marshal(out)
+		oraw, _ := json.Marshal(buildLoginOutput(tok, realm, acct))
 		fmt.Println(string(oraw))
 		os.Remove(stateFile)
 

@@ -125,3 +125,45 @@ func TestRealmSubcommandSelection(t *testing.T) {
 		t.Errorf("rest=%v want [realm]", rest)
 	}
 }
+
+// TestBuildLoginOutputRealmAlwaysSet 登录产物（login.sh 据此落盘 auth 文件）恒含 realm 键：
+// 显式 --realm 优先，缺省时按 domain 推断（echo 出的 global 账号即便未显式指定也带 global）。
+// 这是「登录落盘永远带 realm 标识」契约的测试载体。
+func TestBuildLoginOutputRealmAlwaysSet(t *testing.T) {
+	tok := struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}{AccessToken: "at", RefreshToken: "rt", ExpiresIn: 3600, Domain: "www.codebuddy.cn"}
+	acct := struct {
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+	}{UID: "u1", Nickname: "n1"}
+
+	cases := []struct {
+		name     string
+		realm    string
+		domain   string
+		wantRealm string
+	}{
+		{name: "显式 global 优先", realm: "global", domain: "www.codebuddy.cn", wantRealm: "global"},
+		{name: "显式 cn 优先", realm: "cn", domain: "www.workbuddy.ai", wantRealm: "cn"},
+		{name: "缺省按 domain 推断 global", realm: "", domain: "www.workbuddy.ai", wantRealm: "global"},
+		{name: "缺省空 domain 回落 cn", realm: "", domain: "", wantRealm: "cn"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tok.Domain = c.domain
+			out := buildLoginOutput(tok, c.realm, acct)
+			m, ok := out["realm"].(string)
+			if !ok {
+				t.Fatalf("missing realm key in login output: %v", out)
+			}
+			if m != c.wantRealm {
+				t.Errorf("realm=%q want %q", m, c.wantRealm)
+			}
+		})
+	}
+}
