@@ -22,10 +22,16 @@ const (
 	// 可覆盖（空 = 内置默认）。
 	defaultCliVersion = "2.137.1"
 
-	originRefererCN = "https://www.codebuddy.cn"
+	originRefererCN     = "https://www.codebuddy.cn"
+	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
+// originRefererFor 按账号 realm 返回 Origin/Referer 基础域：
+// global → https://www.workbuddy.ai；cn（含全局开关未开）→ https://www.codebuddy.cn。
 func originRefererFor(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return originRefererGlobal
+	}
 	return originRefererCN
 }
 

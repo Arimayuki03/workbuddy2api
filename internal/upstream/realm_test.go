@@ -1,0 +1,244 @@
+package upstream
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"workbuddy2api/internal/auth"
+)
+
+// globalTestClient 构造带 global 配置的 Client（GlobalEnabled=true + global base 指向 httptest 两段
+// chat/console 与 billing/meter），并临时打开 auth globalEnabled 开关。
+func globalTestClient(t *testing.T, chatSrv, billingSrv *httptest.Server) *Client {
+	t.Helper()
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(false) })
+	return &Client{
+		HTTP:             &http.Client{}, // DefaultTransport → 走 httptest 服务器真实地址
+		ChatBaseCN:       "https://chat.example",
+		BillingBaseCN:    "https://billing.example",
+		ChatBaseGlobal:   strings.TrimSuffix(chatSrv.URL, "/"),
+		BillingBaseGlobal: strings.TrimSuffix(billingSrv.URL, "/"),
+		GlobalEnabled:     true,
+	}
+}
+
+// globalAcct 构造一个 realm=global 的账号（显式 domain fallback：www.workbuddy.ai）。
+func globalAcct() *auth.Auth {
+	return &auth.Auth{AccessToken: "at", RefreshToken: "rt", UID: "g1", Domain: "www.workbuddy.ai"}
+}
+
+// TestGlobalChatUsesConsolePathAndBase 断言 global 账号的 chat 打到 ChatBaseGlobal + /console/chat/completions，
+// 且首条消息非 system 时自动补兜底 system（ensureConsoleSystem）。
+func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
+	var gotPath, gotOrigin, gotModel string
+	var gotMsgs []map[string]any
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotOrigin = r.Header.Get("Origin")
+		raw, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(raw, &req)
+		gotModel, _ = req["model"].(string)
+		if msgs, ok := req["messages"].([]any); ok {
+			for _, m := range msgs {
+				if mm, ok := m.(map[string]any); ok {
+					gotMsgs = append(gotMsgs, mm)
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer chatSrv.Close()
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer billSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	a := globalAcct()
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`), "")
+	if err != nil || status != 200 {
+		t.Fatalf("chat: status=%d err=%v", status, err)
+	}
+	rc.Close()
+
+	if gotPath != "/console/chat/completions" {
+		t.Errorf("global chat path=%q want /console/chat/completions", gotPath)
+	}
+	if gotOrigin != "https://www.workbuddy.ai" {
+		t.Errorf("global chat Origin=%q want https://www.workbuddy.ai", gotOrigin)
+	}
+	if gotModel != "gpt-5.4" {
+		t.Errorf("model=%q", gotModel)
+	}
+	// ensureConsoleSystem：首条 user → 前置 system 兜底。
+	if len(gotMsgs) != 2 || gotMsgs[0]["role"] != "system" {
+		t.Errorf("expected prepended system fallback, got %v", gotMsgs)
+	}
+}
+
+// TestGlobalChatFallsBackToV2Path 断言 /console 404 时 fallback /v2/chat/completions（同一 base 二次请求）。
+func TestGlobalChatFallsBackToV2Path(t *testing.T) {
+	var calls []string
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		if r.URL.Path == "/console/chat/completions" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer chatSrv.Close()
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer billSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "")
+	if err != nil || status != 200 {
+		t.Fatalf("chat fallback: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if len(calls) != 2 || calls[0] != "/console/chat/completions" || calls[1] != "/v2/chat/completions" {
+		t.Errorf("chat fallback calls=%v want [console, v2]", calls)
+	}
+}
+
+// TestGlobalBillingUsesBillingMeterThenV2Fallback 断言 global billing 先打 /billing/meter/*
+// 404 时 fallback /v2/billing/meter/*；CN billing 直接 /v2/billing/meter/*（现状逐字）。
+func TestGlobalBillingUsesBillingMeterThenV2Fallback(t *testing.T) {
+	var billingCalls []string
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		billingCalls = append(billingCalls, r.URL.Path)
+		if r.URL.Path == "/billing/meter/get-user-resource" {
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`))
+	}))
+	defer billSrv.Close()
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer chatSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	remain, err := c.UserResource(globalAcct())
+	if err != nil {
+		t.Fatalf("global billing: %v", err)
+	}
+	if remain != 0 {
+		t.Errorf("remain=%d want 0", remain)
+	}
+	if len(billingCalls) != 2 ||
+		billingCalls[0] != "/billing/meter/get-user-resource" ||
+		billingCalls[1] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("global billing fallback calls=%v want [/billing/meter/get-user-resource, /v2/billing/meter/get-user-resource]", billingCalls)
+	}
+}
+
+// TestGlobalRefreshUsesGlobalChatBase 断言 global 账号 refresh 打到 ChatBaseGlobal + /v2/plugin/auth/token/refresh。
+func TestGlobalRefreshUsesGlobalChatBase(t *testing.T) {
+	var gotPath, gotHost string
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotHost = r.Host
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"newat","expiresIn":3600}}`))
+	}))
+	defer chatSrv.Close()
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer billSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	a := globalAcct()
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("global refresh: %v", err)
+	}
+	if gotPath != "/v2/plugin/auth/token/refresh" {
+		t.Errorf("global refresh path=%q", gotPath)
+	}
+	if !strings.HasPrefix(gotHost, "127.0.0.1") {
+		t.Errorf("global refresh host=%q want httptest server", gotHost)
+	}
+}
+
+// TestCNChatPathUnchanged 零回归：CN 账号（realm=cn）chat 仍打 CN base + /v2/chat/completions，
+// 无首条 system 兜底（ensureConsoleSystem 只对 global）。
+func TestCNChatPathUnchanged(t *testing.T) {
+	var gotPath, gotMsgsJSON string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		gotPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		gotMsgsJSON = string(raw)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"}
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`), "")
+	if err != nil || status != 200 {
+		t.Fatalf("cn chat: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("cn chat path=%q", gotPath)
+	}
+	// 零回归：body 不因 ensureConsoleSystem 注入 system。
+	if bytes.Contains([]byte(gotMsgsJSON), []byte(`"system"`)) {
+		t.Errorf("cn chat body should not be modified with system fallback: %s", gotMsgsJSON)
+	}
+}
+
+// TestGlobalChatServerFallbackErrorCode 断言 fallback 只在 404/405 时发生；500 不发起第二次请求。
+func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
+	var calls []string
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte(`{"code":500,"msg":"boom"}`))
+	}))
+	defer chatSrv.Close()
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer billSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "")
+	if err != nil {
+		t.Fatalf("chat 500: %v", err)
+	}
+	if status != 500 {
+		t.Errorf("status=%d want 500", status)
+	}
+	if len(calls) != 1 {
+		t.Errorf("500 should NOT retry /v2, calls=%v", calls)
+	}
+}

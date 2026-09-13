@@ -304,6 +304,16 @@ type Client struct {
 
 	ChatBaseCN    string
 	BillingBaseCN string
+
+	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
+	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
+	ChatBaseGlobal    string
+	BillingBaseGlobal string
+
+	// GlobalEnabled 是否启用 global realm 路由（config global.enabled，缺省 false）。
+	// false 时即使用户 auth 写了 realm=global 也**不**路由到 global base——
+	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
+	GlobalEnabled bool
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -332,7 +342,35 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
+// defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
+const defaultGlobalBase = "https://www.workbuddy.ai"
+
+// globalChatBase 生效的 global chat base：Client.ChatBaseGlobal 非空取之，否则默认。
+func (c *Client) globalChatBase() string {
+	if c.ChatBaseGlobal != "" {
+		return c.ChatBaseGlobal
+	}
+	return defaultGlobalBase
+}
+
+// globalBillingBase 生效的 global billing base：Client.BillingBaseGlobal 非空取之，否则默认。
+func (c *Client) globalBillingBase() string {
+	if c.BillingBaseGlobal != "" {
+		return c.BillingBaseGlobal
+	}
+	return defaultGlobalBase
+}
+
+// globalOn 报告账号是否路由到 global 上游：GlobalEnabled 开且账号 Realm()==global。
+// 双保险：config 开关是第一道闸（上游侧），auth.Realm() 的开关闸是第二道（账号侧）。
+func (c *Client) globalOn(a *auth.Auth) bool {
+	return c.GlobalEnabled && a != nil && a.Realm() == "global"
+}
+
 func (c *Client) chatBase(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return c.globalChatBase()
+	}
 	return c.ChatBaseCN
 }
 
@@ -356,15 +394,39 @@ func (c *Client) effortsSnapshot() map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return c.globalBillingBase()
+	}
 	return c.BillingBaseCN
 }
 
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
 // 统一走 billingJSON 发请求。
 const (
-	billingMeterPath = "/v2/billing/meter/get-user-resource"
-	dailyCheckinPath = "/v2/billing/meter/daily-checkin"
+	billingMeterPath  = "/billing/meter/get-user-resource"  // global 首选（R9：国际版无 /v2 前缀）
+	dailyCheckinPath  = "/billing/meter/daily-checkin"      // global 首选
+	billingMeterPathV2 = "/v2/billing/meter/get-user-resource" // CN 现状 / global fallback
+	dailyCheckinPathV2 = "/v2/billing/meter/daily-checkin"
 )
+
+// billingMeterPaths 按 realm 返回 billing/meter 域路径候选序列：
+// global → [无 /v2, 有 /v2]（404 时 fallback）；cn → [有 /v2]（现状逐字，零回归）。
+// 仅作用于 get-user-resource / daily-checkin（/billing/meter/* 族）；report /v2/report 不参与，
+// 其他 billing 端点（growth 等）路径不含 /billing/meter 前缀，走原常量不受影响。
+func (c *Client) billingMeterPaths(a *auth.Auth) []string {
+	if c.globalOn(a) {
+		return []string{billingMeterPath, billingMeterPathV2}
+	}
+	return []string{billingMeterPathV2}
+}
+
+// checkinMeterPaths 同上，针对 daily-checkin。
+func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
+	if c.globalOn(a) {
+		return []string{dailyCheckinPath, dailyCheckinPathV2}
+	}
+	return []string{dailyCheckinPathV2}
+}
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
@@ -433,39 +495,85 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	return nil
 }
 
+// chatPath 按 realm 返回 chat 端点路径（不含 base）：
+// global → /console/chat/completions（404/405 时由 ChatStream fallback /v2/chat/completions）；
+// cn → /v2/chat/completions（现状逐字，零回归）。
+func (c *Client) chatPath(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return globalChatConsolePath
+	}
+	return chatCompletionsPath
+}
+
+// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
+const (
+	chatCompletionsPath   = "/v2/chat/completions"
+	globalChatConsolePath = "/console/chat/completions"
+)
+
+// chatFallbackHTTPStatus global chat fallback 只在 404/405 时发生（R9：上游新旧路径分叉）。
+func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
+
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // clientIP 为本次请求的客户端 IP（PassthroughIP=true 时注入；空串表示不透传）。
 // 按**请求传递**而非读共享字段：避免并发请求交叉污染对方 IP（issue：ClientIP 竞态）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
+//
+// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
+// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
-	if err != nil {
-		return nil, 0, nil, err
+	var cancel context.CancelFunc
+	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
+	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
+	prepared := c.prepareBody(body)
+	if c.globalOn(a) {
+		prepared = ensureConsoleSystem(prepared)
 	}
-	c.ChatHeaders(req, a, clientIP)
-	ctx, cancel := context.WithCancel(context.Background())
-	req = req.WithContext(ctx)
-	resp, err := c.chatHTTP().Do(req)
-	if err != nil {
-		cancel()
-		log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
-		return nil, 0, nil, err
+	for attempt, path := range c.chatPaths(a) {
+		url := c.chatBase(a) + path
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		c.ChatHeaders(req, a, clientIP)
+		ctx, cancel := context.WithCancel(context.Background())
+		req = req.WithContext(ctx)
+		resp, err := c.chatHTTP().Do(req)
+		if err != nil {
+			cancel()
+			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			return nil, 0, nil, err
+		}
+		if resp.StatusCode >= 400 {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			cancel()
+			kind := Classify(resp.StatusCode, string(raw))
+			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
+				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
+			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
+				continue
+			}
+			return nil, resp.StatusCode, raw, nil
+		}
+		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
+		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
+		// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
+		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		cancel()
-		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-			logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-		return nil, resp.StatusCode, raw, nil
+	cancel()
+	return nil, 0, nil, nil
+}
+
+// chatPaths 返回按 realm 的 chat 路径候选序列：
+// global → [console, /v2]（向 Fallback 迭代）；cn → [/v2]（单元素，现状）。
+func (c *Client) chatPaths(a *auth.Auth) []string {
+	if c.globalOn(a) {
+		return []string{globalChatConsolePath, chatCompletionsPath}
 	}
-	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
-	// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
-	// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
-	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+	return []string{chatCompletionsPath}
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
@@ -580,6 +688,25 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
+// billingMeterJSON 按 realm 候选路径发 billing/meter 域请求，ErrNotFound 时换下一候选路径
+// （global：/billing/meter/* → /v2/billing/meter/*；cn：单路径 /v2/billing/meter/* 现状）。
+func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
+	var lastErr error
+	for i, p := range paths {
+		data, err := c.billingJSON(a, method, p, body)
+		if err != nil {
+			lastErr = err
+			var ue *Error
+			if i < len(paths)-1 && errors.As(err, &ue) && ue.Kind == ErrNotFound {
+				continue // /billing/meter/* 404 → 换 /v2/billing/meter/*
+			}
+			return nil, err
+		}
+		return data, nil
+	}
+	return nil, lastErr
+}
+
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 	now := time.Now()
@@ -591,7 +718,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	}
-	data, err := c.billingJSON(a, http.MethodPost, billingMeterPath, body)
+	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
 		return 0, err
 	}
@@ -633,7 +760,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingJSON(a, http.MethodPost, dailyCheckinPath, map[string]any{})
+	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
 	return err
 }
 
