@@ -198,7 +198,7 @@ var globalModels = []string{
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
-// 动态失败回退静态表；global.enabled=false（缺省）时只列 CN（global 名单不出现）。
+// 动态失败回退静态表；global.enabled=false（显式逃生门）时只列 CN（global 名单不出现）。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0, len(staticModels)+len(globalModels))
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
