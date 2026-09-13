@@ -242,3 +242,86 @@ func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 		t.Errorf("500 should NOT retry /v2, calls=%v", calls)
 	}
 }
+// TestEffortsKeyedByRealm efforts 缓存按 realm 隔离：CN 探测写入的 supportedEfforts
+// 不得被 global 同模型名请求复用（C-2）。global 侧无 efforts 探测 → 原样透传不降级；
+// 同 Client 上 CN 请求仍按 CN 探测结果降级。
+func TestEffortsKeyedByRealm(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	var globalBody, cnBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			// CN 探测（FetchModels 走 chatBase(cn)）= CN base + 该路径。
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[
+				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"medium","supportedEfforts":["low","medium"]}}
+			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`))
+		case strings.HasSuffix(r.URL.Path, "/console/chat/completions"):
+			globalBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case strings.HasSuffix(r.URL.Path, "/v2/chat/completions"):
+			cnBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
+		}
+	}))
+	defer srv.Close()
+
+	base := strings.TrimSuffix(srv.URL, "/")
+	c := &Client{
+		HTTP:               http.DefaultClient,
+		ChatBaseCN:         base,
+		BillingBaseCN:      "https://billing.example",
+		ChatBaseGlobal:     base,
+		GlobalEnabled:      true,
+		SanitizeFingerprints: true,
+	}
+	cn := &auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"}
+
+	// step 1：CN 探测写 cn 桶（glm-5.2 → [low, medium]）。
+	if _, err := c.FetchModels(cn); err != nil {
+		t.Fatalf("cn fetch models: %v", err)
+	}
+
+	// step 2：global 账号同模型名请求 → 不应命中 CN 探测的 supportedEfforts，原样透传 high。
+	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[{"role":"system","content":"s"}]}`), "")
+	if err != nil || status != 200 {
+		t.Fatalf("global chat: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	var m map[string]any
+	if err := json.Unmarshal(globalBody, &m); err != nil {
+		t.Fatalf("unmarshal global outbound: %v (%s)", err, globalBody)
+	}
+	if got, _ := m["reasoning_effort"].(string); got != "high" {
+		t.Errorf("global reasoning_effort=%v want high (CN efforts must not contaminate global)", m["reasoning_effort"])
+	}
+
+	// step 3：同 Client 的 CN 请求仍按 CN 桶降级（high 不在 [low,medium] → 降至 medium）。
+	rc, status, _, err = c.ChatStream(cn, []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[]}`), "")
+	if err != nil || status != 200 {
+		t.Fatalf("cn chat: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if err := json.Unmarshal(cnBody, &m); err != nil {
+		t.Fatalf("unmarshal cn outbound: %v (%s)", err, cnBody)
+	}
+	if got, _ := m["reasoning_effort"].(string); got != "medium" {
+		t.Errorf("cn reasoning_effort=%v want medium (cn bucket still applies within realm)", m["reasoning_effort"])
+	}
+}
+
+func cloneBody(r *http.Request) []byte {
+	raw, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	return raw
+}

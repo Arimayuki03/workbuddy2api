@@ -257,8 +257,10 @@ type Client struct {
 	IdleTimeout time.Duration
 
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
+	// 键按 realm 分层（map[realm]map[model][]efforts）：CN 探测结果不得被 global 同模型名
+	// 请求复用（同名不同档位会错误降级，C-2）。global 侧暂无 efforts 探测 → 桶缺失即透传。
 	effortsMu sync.RWMutex
-	efforts   map[string][]string
+	efforts   map[string]map[string][]string
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
@@ -379,22 +381,32 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
+// 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
+func (c *Client) prepareBody(body []byte, realm string) []byte {
+	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(realm))
 }
 
-// effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
-func (c *Client) effortsSnapshot() map[string][]string {
+// effortsSnapshot 返回指定 realm 的 effort 能力缓存副本；该域无探测 → nil（透传不降级）。
+func (c *Client) effortsSnapshot(realm string) map[string][]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	if len(c.efforts) == 0 {
+	bucket, ok := c.efforts[realmKey(realm)]
+	if !ok || len(bucket) == 0 {
 		return nil
 	}
-	cp := make(map[string][]string, len(c.efforts))
-	for k, v := range c.efforts {
+	cp := make(map[string][]string, len(bucket))
+	for k, v := range bucket {
 		cp[k] = v
 	}
 	return cp
+}
+
+// realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
+func realmKey(realm string) string {
+	if realm == "" {
+		return "cn"
+	}
+	return realm
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
@@ -530,7 +542,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 	var cancel context.CancelFunc
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
-	prepared := c.prepareBody(body)
+	prepared := c.prepareBody(body, a.Realm())
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
@@ -686,8 +698,15 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			cache[mi.ID] = mi.Efforts
 		}
 	}
+	if len(cache) == 0 {
+		return out, nil
+	}
+	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
 	c.effortsMu.Lock()
-	c.efforts = cache
+	if c.efforts == nil {
+		c.efforts = make(map[string]map[string][]string)
+	}
+	c.efforts[realmKey(a.Realm())] = cache
 	c.effortsMu.Unlock()
 	return out, nil
 }
