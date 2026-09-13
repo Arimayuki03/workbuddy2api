@@ -45,6 +45,9 @@ const (
 // 登录 state 落盘路径（var 便于测试替换临时文件）
 var stateFile = "/tmp/wb2api-login-state.json"
 
+// exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
+var exitFunc = os.Exit
+
 // realmConfig 按 realm 返回上游 base 与 Origin/Referer origin：global →
 // (www.workbuddy.ai, www.workbuddy.ai)；cn/非法/缺省 → (copilot.tencent.com, codebuddy.cn)。
 func realmConfig(realm string) (base, origin string) {
@@ -110,7 +113,7 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "login: "+format+"\n", args...)
-	os.Exit(1)
+	exitFunc(1)
 }
 
 type loginState struct {
@@ -186,6 +189,15 @@ func promptRealm(in io.Reader, out io.Writer) string {
 	return realmCN
 }
 
+// validateRealmMatch 校验 state 文件 realm 与命令行 --realm 一致（防混域）：
+// state 无 realm（旧文件）放行；非空且不一致 → error。
+func validateRealmMatch(stateRealm, cliRealm string) error {
+	if stateRealm != "" && stateRealm != cliRealm {
+		return fmt.Errorf("realm mismatch: state file realm=%q, command --realm=%q（url 与 poll 需同一 realm）", stateRealm, cliRealm)
+	}
+	return nil
+}
+
 // runURL 执行 url 子命令：向 upstreamBase 的 state 端点 POST 取授权 URL，
 // state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；stateFile 为落盘路径
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
@@ -222,8 +234,8 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 		fatal("parse state: %v", err)
 	}
 	// 防混域：state 落盘 realm 与命令行 --realm 不一致则拒绝（url 与 poll 必须同域）
-	if ls.Realm != "" && ls.Realm != realm {
-		fatal("realm mismatch: state file realm=%q, command --realm=%q（url 与 poll 需同一 realm）", ls.Realm, realm)
+	if err := validateRealmMatch(ls.Realm, realm); err != nil {
+		fatal("%v", err)
 	}
 	headers := commonHeaders(origin)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
