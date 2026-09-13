@@ -166,7 +166,77 @@ with open("$AUTH_FILE", "w") as f:
 print(f"已保存（${ACTION}）: $AUTH_FILE")
 PYEOF
 
-# ─── 重启服务 ────────────────────────────────────────────
+# ─── 国际版注册激活 + trial 领取（仅 global；token 已落盘，失败只提示不阻断）──────
+#
+# 根因（ANALYSIS-workbuddy-client-reverse.md）：新 global 账号需先完善注册地区
+# （/login/register/user/complete）再调 register 接口激活 Trial，chat 才不报 14017。
+# 两步都是幂等：register code=200 成功 / 500 region required 需补地区；trial 幂等码
+# 14051=已领过不算失败。任何失败不回退登录结果（auth 文件已写好）。
+if [[ "$REALM" == "global" ]]; then
+python3 - <<PYEOF
+import json, urllib.request, urllib.error, urllib.parse
+
+GLOBAL_BASE = "https://www.workbuddy.ai"
+ACCOUNT_UID = "$USER_ID"
+headers = {
+    "Authorization": "Bearer $TOKEN",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "X-User-Id": ACCOUNT_UID,
+    "Origin": GLOBAL_BASE,
+    "Referer": GLOBAL_BASE + "/",
+}
+
+def trial_ok(body_dict):
+    return "14051" in json.dumps(body_dict, ensure_ascii=False)
+
+# 1) register 激活（幂等）：GET .../register?userId=<uid>
+#    成功 / 已激活 → code 200；region 缺失 → code 500 "register region required"（需补地区）。
+#    注意用 ACCOUNT_UID 而非 `UID`：UID 是 bash 只读内置变量，赋值/传址会得到 0。
+try:
+    url = GLOBAL_BASE + "/auth/realms/copilot/overseas/user/register?userId=" + ACCOUNT_UID
+    req = urllib.request.Request(url, method="GET", headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        register = json.loads(r.read().decode() or "{}")
+except Exception as e:
+    register = {"_net_error": str(e)}
+
+reg_code = register.get("code")
+reg_msg = register.get("msg", "")
+if "_net_error" in register:
+    print(f"注册激活: 网络失败（不阻断登录）: {register['_net_error']}")
+elif reg_code == 200:
+    print("注册激活: 成功")
+elif reg_code == 500 or "region required" in reg_msg:
+    print("⚠️  国际版账号需要完善注册地区：")
+    print("  请打开 https://www.workbuddy.ai/login/register/user/complete?redirect_uri=https%3A%2F%2Fwww.workbuddy.ai%2F")
+    print("  完成后重新运行: ./login.sh --realm=global")
+else:
+    print(f"注册激活: 未预期 code={reg_code} msg={reg_msg[:120]}")
+
+# 2) trial 领取（幂等）：POST /billing/ide/trial；14051=已领过，不算失败。
+try:
+    req = urllib.request.Request(GLOBAL_BASE + "/billing/ide/trial", method="POST",
+                                 data=b"{}", headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        trial = json.loads(r.read().decode() or "{}")
+except urllib.error.HTTPError as e:
+    # 幂等码 14051 也可能以业务错误体形式随 4xx 返回，此处同样识别为已领取。
+    try:
+        trial = json.loads(e.read().decode() or "{}")
+    except Exception:
+        trial = {"_http_error": True, "code": e.code}
+except Exception as e:
+    trial = {"_net_error": str(e)}
+
+if "_net_error" in trial:
+    print(f"国际版 trial: 网络失败（不阻断登录）: {trial['_net_error']}")
+elif trial.get("code") == 0 or trial_ok(trial):
+    print("国际版 trial: 已激活，可以开始对话")
+else:
+    print(f"国际版 trial: {trial.get('msg', json.dumps(trial)[:150])}")
+PYEOF
+fi
 echo ""
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
