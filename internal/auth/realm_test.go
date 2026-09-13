@@ -187,3 +187,67 @@ func TestSaveAtomicWritesRealm(t *testing.T) {
 		t.Error("roundtrip global account IsGlobal()=false")
 	}
 }
+// TestBackfillRealmDomain CN/global 按原始 domain 推断（backfill 为导出空 realm 字段服务）。
+func TestBackfillRealmDomain(t *testing.T) {
+	t.Parallel() // 不触碰全局开关
+	cases := []struct {
+		domain string
+		want   string
+	}{
+		{"www.workbuddy.ai", "global"},
+		{"workbuddy.ai", "global"},
+		{"sub.workbuddy.ai", "global"},
+		{"www.codebuddy.cn", "cn"},
+		{"codebuddy.cn", "cn"},
+		{"", "cn"}, // 空 domain + 空 realm → cn（老 CN 凭证核心）
+	}
+	for _, c := range cases {
+		a := &Auth{Domain: c.domain}
+		changed, got := a.BackfillRealm()
+		if !changed {
+			t.Errorf("Domain=%q backfill changed=false want true", c.domain)
+		}
+		assertRealmStored(a, c.want, t)
+		if got != c.want {
+			t.Errorf("Domain=%q backfill got realm=%q want %q", c.domain, got, c.want)
+		}
+	}
+}
+
+// TestBackfillRealmEscapeHatchFree 逃生门关闭时 backfill 仍按原始 domain 推断（不受 Realm() 降级影响）。
+func TestBackfillRealmEscapeHatchFree(t *testing.T) {
+	withGlobalDisabled(t) // 逃生门关闭：Realm() 恒 cn，但 backfill 不得被污染
+	a := &Auth{Domain: "www.workbuddy.ai"}
+	if g := a.Realm(); g != "cn" {
+		t.Fatalf("precondition Realm()=%q want cn (escape hatch on)", g)
+	}
+	changed, got := a.BackfillRealm()
+	if !changed {
+		t.Fatal("backfill changed=false want true (escape hatch free)")
+	}
+	assertRealmStored(a, "global", t)
+	if got != "global" {
+		t.Errorf("backfill got=%q want global (escape hatch must not corrupt backfill)", got)
+	}
+}
+
+// TestBackfillRealmIdempotent 已有 realm 标识的文件不做修改（幂等）。
+func TestBackfillRealmIdempotent(t *testing.T) {
+	t.Parallel()
+	a := &Auth{Domain: "www.workbuddy.ai", realm: "cn"} // 已有 cn，domain 会推断 global——绝不覆盖
+	changed, got := a.BackfillRealm()
+	if changed {
+		t.Errorf("backfill changed=true want false (existing realm must win)")
+	}
+	if got != "cn" {
+		t.Errorf("backfill got=%q want cn (existing realm preserved)", got)
+	}
+	assertRealmStored(a, "cn", t)
+}
+
+func assertRealmStored(a *Auth, want string, t *testing.T) {
+	t.Helper()
+	if a.realm != want {
+		t.Errorf("stored realm field=%q want %q", a.realm, want)
+	}
+}

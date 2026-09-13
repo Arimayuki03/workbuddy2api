@@ -75,6 +75,27 @@ func (a *Auth) Realm() string {
 	return "cn"
 }
 
+// BackfillRealm 为缺省 realm 标识的账号持久化补标识：a.realm 为空时按「原始 domain 推断」
+// 写回（cn/global），返回 (是否有变更, 归一化后的 realm)。已有标识不动（幂等）。
+//
+// 注意用 isGlobalDomain(a.Domain) 直接推断，而非 Realm()——Realm() 在逃生门
+// （SetGlobalEnabled(false)）下恒降级 cn，把 global 账号写死成 cn 会永久污染凭证
+// （逃生门是纯 CN 部署的临时锁，不应改写落盘数据）。domain 也为空时写 "cn"（老 CN 凭证）。
+func (a *Auth) BackfillRealm() (bool, string) {
+	if strings.TrimSpace(a.realm) != "" {
+		return false, a.realm
+	}
+	r := "cn"
+	if isGlobalDomain(a.Domain) {
+		r = "global"
+	}
+	a.realm = r
+	return true, r
+}
+
+// RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
+func (a *Auth) RealmStored() string { return a.realm }
+
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 
