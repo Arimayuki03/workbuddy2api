@@ -20,6 +20,11 @@
     "activity_enabled": true,
     "keepalive_enabled": true
   },
+  "global": {
+    "enabled": false,
+    "chat_base": "",
+    "billing_base": ""
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
