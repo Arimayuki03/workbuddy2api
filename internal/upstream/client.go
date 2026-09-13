@@ -260,6 +260,11 @@ type Client struct {
 	effortsMu sync.RWMutex
 	efforts   map[string][]string
 
+	// globalModelsMu/globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
+	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
+	globalModelsMu sync.Mutex
+	globalModels   fetchGlobalModelsCache
+
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
