@@ -824,12 +824,12 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 	found := false
 	for _, m := range data {
-		if m.(map[string]any)["id"] == "glm-5.2" {
+		if m.(map[string]any)["id"] == "cn:glm-5.2" {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("glm-5.2 missing")
+		t.Error("cn:glm-5.2 missing (static models prefixed)")
 	}
 }
 
@@ -862,27 +862,27 @@ func TestModelsDynamic(t *testing.T) {
 	for _, m := range data {
 		ids[m.(map[string]any)["id"].(string)] = true
 	}
-	if !ids["dyn-model-a"] || !ids["glm-9.9"] {
-		t.Errorf("dynamic ids missing: %v", ids)
+	if !ids["cn:dyn-model-a"] || !ids["cn:glm-9.9"] {
+		t.Errorf("dynamic ids (cn-prefixed) missing: %v", ids)
 	}
 
 	// 断言字段映射：maxInputTokens → context_length，maxOutputTokens → max_output_tokens
 	for _, m := range data {
 		mm := m.(map[string]any)
 		switch mm["id"] {
-		case "dyn-model-a":
+		case "cn:dyn-model-a":
 			if mm["context_length"].(float64) != 65536 {
-				t.Errorf("dyn-model-a context_length=%v want 65536", mm["context_length"])
+				t.Errorf("cn:dyn-model-a context_length=%v want 65536", mm["context_length"])
 			}
 			if mm["max_output_tokens"].(float64) != 8192 {
-				t.Errorf("dyn-model-a max_output_tokens=%v want 8192", mm["max_output_tokens"])
+				t.Errorf("cn:dyn-model-a max_output_tokens=%v want 8192", mm["max_output_tokens"])
 			}
-		case "glm-9.9":
+		case "cn:glm-9.9":
 			if mm["context_length"].(float64) != 262144 {
-				t.Errorf("glm-9.9 context_length=%v want 262144", mm["context_length"])
+				t.Errorf("cn:glm-9.9 context_length=%v want 262144", mm["context_length"])
 			}
 			if mm["max_output_tokens"].(float64) != 32768 {
-				t.Errorf("glm-9.9 max_output_tokens=%v want 32768", mm["max_output_tokens"])
+				t.Errorf("cn:glm-9.9 max_output_tokens=%v want 32768", mm["max_output_tokens"])
 			}
 		}
 	}
