@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,10 +22,16 @@ type Auth struct {
 	RefreshToken string
 	ExpiresAt    int64 // Unix 秒
 	Domain       string
-	UID          string
-	EnterpriseID string
-	Nickname     string
-	FilePath     string // 来源文件；refresh 后原子写回此处
+	// realm 账号域（"cn" / "global"），落盘于 auth.realm（嵌套形）或顶层 realm（扁平形）。
+	// 空 = 缺省：Realm() 按 domain 后缀回落，最终恒非空。
+	//
+	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
+	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
+	realm          string
+	UID            string
+	EnterpriseID   string
+	Nickname       string
+	FilePath       string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
@@ -38,6 +45,41 @@ func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+// globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
+// 默认关闭（纯 CN 零回归）。cmd/server 启动时按 config global.enabled 注入。
+// Realm()/IsGlobal() 均先过此闸：开关未开时恒 cn，即便 auth 文件写了 realm=global
+// 或 domain 为 .workbuddy.ai——「开了才路由」的单一闸口集中收敛在这些方法里。
+var globalEnabled atomic.Bool
+
+// SetGlobalEnabled 注入 global realm 路由开关（false = 纯 CN）。
+func SetGlobalEnabled(enabled bool) { globalEnabled.Store(enabled) }
+
+// GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
+func GlobalEnabled() bool { return globalEnabled.Load() }
+
+// Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，
+// 否则 "cn"。显式 global 优先于 domain 回落（D1）。恒在 globalEnabled 开关之后：
+// 开关未开 → 一律 "cn"（即便显式 global）。
+func (a *Auth) Realm() string {
+	if !globalEnabled.Load() {
+		return "cn"
+	}
+	if strings.TrimSpace(a.realm) == "global" || isGlobalDomain(a.Domain) {
+		return "global"
+	}
+	return "cn"
+}
+
+// IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
+func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
+
+// isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
+// 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
+func isGlobalDomain(d string) bool {
+	d = strings.ToLower(strings.TrimSpace(d))
+	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+}
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
@@ -67,6 +109,7 @@ func Parse(raw []byte) (*Auth, error) {
 				RefreshToken string `json:"refreshToken"`
 				ExpiresAt    int64  `json:"expiresAt"`
 				Domain       string `json:"domain"`
+				Realm        string `json:"realm"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -85,6 +128,7 @@ func Parse(raw []byte) (*Auth, error) {
 			RefreshToken: n.Auth.RefreshToken,
 			ExpiresAt:    n.Auth.ExpiresAt,
 			Domain:       n.Auth.Domain,
+			realm:        n.Auth.Realm,
 			UID:          n.Account.UID,
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
@@ -96,6 +140,7 @@ func Parse(raw []byte) (*Auth, error) {
 			RefreshToken string `json:"refreshToken"`
 			ExpiresAt    int64  `json:"expiresAt"`
 			Domain       string `json:"domain"`
+			Realm        string `json:"realm"`
 			UID          string `json:"uid"`
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
@@ -109,6 +154,7 @@ func Parse(raw []byte) (*Auth, error) {
 			RefreshToken: f.RefreshToken,
 			ExpiresAt:    f.ExpiresAt,
 			Domain:       f.Domain,
+			realm:        f.Realm,
 			UID:          f.UID,
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
@@ -139,6 +185,7 @@ func (a *Auth) SaveAtomic() error {
 			"refreshToken": a.RefreshToken,
 			"expiresAt":    a.ExpiresAt,
 			"domain":       a.Domain,
+			"realm":        a.realm,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,
