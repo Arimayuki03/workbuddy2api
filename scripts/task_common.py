@@ -49,7 +49,9 @@ CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2"
 def load_auth(uid_or_file: str) -> dict:
     """从 auths/ 加载账号凭证，uid_or_file 为 uid 前缀或 auths 文件名。
 
-    返回 {token, uid, domain, nick, file} 五元组。
+    返回 {token, uid, domain, nick, file, realm} 六元组。
+    realm 读取兼容嵌套形（`auth.realm`，login.sh --realm=global 落盘形态）与
+    扁平形（顶层 `realm`）；两种都缺省 → "cn"（老 CN 凭证零回归）。
     """
     if os.path.sep in uid_or_file or uid_or_file.endswith(".json"):
         p = uid_or_file
@@ -63,9 +65,23 @@ def load_auth(uid_or_file: str) -> dict:
         p = hits[0]
     d = json.load(open(p))
     a, acc = d["auth"], d["account"]
+    realm = a.get("realm") or d.get("realm") or ""
     return {"token": a["accessToken"], "domain": a.get("domain") or "",
             "uid": acc["uid"], "nick": acc.get("nickname", ""),
-            "file": os.path.basename(p)}
+            "file": os.path.basename(p), "realm": realm}
+
+
+def auth_is_global(auth: dict) -> bool:
+    """判定账号是否属于 global realm：realm==global 或 domain 后缀 .workbuddy.ai。
+
+    与 Go auth.Realm() 的判定口径一致（显式 realm 优先于 domain 回落）。
+    供 CN-only 任务脚本跳过 global 账号、明确提示，避免把 global token 打向
+    copilot.tencent.com/codebuddy.cn（全球版无任务中心，打 CN 端点属错误行为）。
+    """
+    if (auth.get("realm") or "").strip().lower() == "global":
+        return True
+    d = (auth.get("domain") or "").strip().lower()
+    return d == "workbuddy.ai" or d.endswith(".workbuddy.ai")
 
 
 def chat_base(auth: dict) -> str:

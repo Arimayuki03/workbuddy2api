@@ -1031,6 +1031,12 @@ def main():
             print(f"ERR: {e}")
             continue
         stats["accounts"] += 1
+        # global realm 不适用 CN 任务中心：明确跳过、不发起任何请求（P2 门控结论）。
+        if tc.auth_is_global(c):
+            uid8 = (c.get("uid") or "")[:8] or "?"
+            print(f"[skip] {uid8} global realm 不适用 CN 任务")
+            stats["skip"] += 1
+            continue
         process_account(c, a, stats)
 
     print_summary(stats)
