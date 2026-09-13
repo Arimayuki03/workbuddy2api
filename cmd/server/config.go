@@ -40,6 +40,16 @@ type Config struct {
 
 	Schedule config.Schedule `json:"schedule"`
 
+	Global struct {
+		// Enabled global realm 路由开关。缺省 false（纯 CN 零回归）：即便 auth 文件写了
+		// realm=global 也不路由 global base/路径（auth.Realm() 双保险的第一道闸）。
+		Enabled bool `json:"enabled"`
+		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
+		// https://www.workbuddy.ai（D5，internal/upstream.defaultGlobalBase）。
+		ChatBase    string `json:"chat_base"`
+		BillingBase string `json:"billing_base"`
+	} `json:"global"`
+
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
@@ -141,6 +151,7 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
+	// Global.Enabled 缺省 false；ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "custom" // 缺省 custom：网关自有提示词从源头消灭 system 指纹误报
 	c.Pool.MaxInFlight = 3
