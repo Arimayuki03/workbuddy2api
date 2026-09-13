@@ -71,14 +71,9 @@ func main() {
 	p := pool.New(c.StateFile)
 	p.SyncToDir(auths)
 
-	up := upstream.New()
-	if c.Upstream.TimeoutSeconds > 0 {
-		up.HTTP.Timeout = time.Duration(c.Upstream.TimeoutSeconds) * time.Second
-	}
-
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
-		Upstream:            up,
+		Upstream:            newUpstream(&c),
 		CheckinHours:        c.Schedule.CheckinHours,
 		TravelHours:         c.Schedule.TravelHours,
 		ActivityHours:       c.Schedule.ActivityHours,
@@ -87,4 +82,17 @@ func main() {
 	})
 	sch.RunActivityNow()
 	log.Printf("activity run complete")
+}
+
+// newUpstream 构造上游客户端并显式接线 global realm 路由。
+// activity 是 CN 任务中心的上报工具（global 账号已被 scheduler 的 IsGlobal 门控跳过），
+// 但 GlobalEnabled=false 会把工具自造的 global 账号请求路由到 CN base（codebuddy.cn）而必然失败。
+// 与 cmd/signin、cmd/credit、cmd/trial 同风格：显式接线，避免 Producer 误读成「未适配」。
+func newUpstream(c *cfgFile) *upstream.Client {
+	up := upstream.New()
+	up.GlobalEnabled = true
+	if c.Upstream.TimeoutSeconds > 0 {
+		up.HTTP.Timeout = time.Duration(c.Upstream.TimeoutSeconds) * time.Second
+	}
+	return up
 }
