@@ -103,6 +103,22 @@ func (p *Pool) NoteError(uid string) {
 	}
 }
 
+// ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
+// 供测试/运维断言成本账本内容；无观测或观测过期（modelCostTTL）时 ok=false。
+func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, exists := p.byUID[uid]
+	if !exists {
+		return 0, false
+	}
+	mc, ok := e.modelCostOf(model, time.Now())
+	if !ok {
+		return 0, false
+	}
+	return mc.CostPer1k, true
+}
+
 // NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本。
 // credit 为上游 usage.credit（本次真实扣费），tokens 为本次请求的 token 总数
 // （prompt+completion，用于折算单位成本）。tokens<=0 时不记录：无法折算单价，
