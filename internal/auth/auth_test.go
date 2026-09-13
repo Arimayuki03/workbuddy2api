@@ -1,8 +1,11 @@
 package auth
 
 import (
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -213,5 +216,51 @@ func TestLoadDirBackfillWriteFailureDoesNotBlock(t *testing.T) {
 	b, _ := Parse(raw)
 	if b.RealmStored() != "global" {
 		t.Errorf("good file realm=%q want global (migration should succeed)", b.RealmStored())
+	}
+}
+
+// TestLoadDirDuplicateUIDWarning 同 UID 双 realm auth 文件（概率近零的 EDGE）：LoadDir
+// 检测到重复 UID 时打 WARN（含两文件路径），且不改变加载行为——后载入者胜出（返回 1 个、
+// 不 panic、realm 为后载入者值）。LoadDir 现在有额外 seenUID 副作用，逐字验证 WARN。
+func TestLoadDirDuplicateUIDWarning(t *testing.T) {
+	dir := t.TempDir()
+	// 同一 UID u9 的两个文件：cn realm 文件按文件名排序在前（workbuddy-a-...），
+	// global realm 文件在后 → 后载入者（global）胜出。
+	cn := `{"auth":{"accessToken":"at1","refreshToken":"r","expiresAt":1,"domain":"www.codebuddy.cn"},"account":{"uid":"u9"}}`
+	gl := `{"auth":{"accessToken":"at2","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"u9"}}`
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy-a-cn.json"), []byte(cn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy-z-global.json"), []byte(gl), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 捕获 log 输出（本测试不 t.Parallel：log.SetOutput 是进程级全局，需串行）。
+	old := log.Writer()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.SetOutput(w)
+
+	list, err := LoadDir(dir)
+	_ = w.Close()
+	raw, _ := io.ReadAll(r)
+	log.SetOutput(old)
+
+	if err != nil {
+		t.Fatalf("load err=%v", err)
+	}
+	// 行为稳定（不改加载结果）：LoadDir 返回全部可解析文件（去重发生在 pool.SyncToDir
+	// 的 UID 键 upsert），不 panic。
+	if len(list) != 2 {
+		t.Fatalf("want 2 accounts loaded (dedup later in pool), got %d", len(list))
+	}
+	// WARN 已触发且含两文件路径。
+	if !strings.Contains(string(raw), "WARN: uid") ||
+		!strings.Contains(string(raw), "duplicated") ||
+		!strings.Contains(string(raw), "workbuddy-a-cn.json") ||
+		!strings.Contains(string(raw), "workbuddy-z-global.json") {
+		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
 	}
 }

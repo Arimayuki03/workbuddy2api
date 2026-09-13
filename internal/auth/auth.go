@@ -256,6 +256,9 @@ func LoadDir(dir string) ([]*Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
+	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
+	seenUID := make(map[string]string, len(files))
 	var out []*Auth
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
@@ -267,6 +270,11 @@ func LoadDir(dir string) ([]*Auth, error) {
 			continue
 		}
 		a.FilePath = f
+		if prev, ok := seenUID[a.UID]; ok {
+			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
+				logfmt.UID8(a.UID), prev, f)
+		}
+		seenUID[a.UID] = f
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
 				if err := a.SaveAtomic(); err != nil {
