@@ -484,10 +484,20 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 | `./login.sh [--realm=cn\|global]` | OAuth 登录（无参数交互式选域）→ 落盘 auth → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新；「已签到 / 未开启 / 已过期 / inactive」判幂等不算失败） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON）；realm 感知——global 账号查积分走 `workbuddy.ai`（`/billing/meter/*` 404 回落 `/v2`），CN 账号维持 `codebuddy.cn` |
-| `./trial.sh [auths_dir]` | 国际版 trial 加油包领取（仅 global 账号；`14051`=已领幂等） |
+| `./trial.sh [auths_dir]` | 国际版 trial 加油包领取（仅 global 账号；`14051`=已领幂等）；镜像内置 `/app/trial_bin`，容器内零 go 构建直接跑（见下「容器内工具」） |
 | `python3 scripts/task_runner.py ALL` | 成长任务查询（默认 dry-run 只展示）；`--yes` 全量完成并领奖，`--only <task_code>` 指定单个任务，`--only-claim` 只领奖不点亮 |
 
 二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）。
+
+**容器内工具**（镜像内置 `/app/wb2api`、`signin_bin`、`login`、`credit`、`trial_bin`、`activity_bin`，无 go 工具链可直接执行；脚本自动复用预置产物、不重复构建）：
+
+```bash
+docker exec -w /app workbuddy2api ./trial.sh           # 镜像内置 trial_bin，零构建
+docker exec -w /app workbuddy2api ./signin.sh
+docker exec -w /app workbuddy2api /app/activity_bin   # 活跃上报一次性触发（等价 cmd/activity）
+```
+
+`trial.sh` 的二进制解析优先序：`/app/trial_bin`（容器内预置）→ `$CACHE_DIR` 缓存 → 源码更新则 `go build`；无 go 且无预置产物时明确报错提示。
 
 ### 账号管理
 

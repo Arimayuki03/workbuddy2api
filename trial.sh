@@ -23,14 +23,21 @@ if [[ $# -gt 0 ]]; then
     AUTHS_DIR="$1"
 fi
 
-CACHE_DIR="${TMPDIR:-/tmp}/workbuddy2api-bin"
-mkdir -p "$CACHE_DIR"
-
-# 构建缓存：源码变更才重编（与 checkin.sh 同策略）。
-TRIAL_BIN="$CACHE_DIR/trial_bin"
-if [[ ! -x "$TRIAL_BIN" ]] || find . -name '*.go' -newer "$TRIAL_BIN" -print -quit | grep -q .; then
-    echo "构建 trial.." >&2
-    go build -o "$TRIAL_BIN" ./cmd/trial
+# 二进制解析优先序：1) 容器内预置 /app/trial_bin（镜像带产物，无需 go）；2) $CACHE_DIR 缓存；
+# 3) 源码更新则重编（需 go 工具链，本地/CI 用）。容器内（/app 有预置产物的环境）零构建直接跑。
+TRIAL_BIN="$(cd "$(dirname "$0")" && pwd)/trial_bin"
+if [[ ! -x "$TRIAL_BIN" ]]; then
+    CACHE_DIR="${TMPDIR:-/tmp}/workbuddy2api-bin"
+    mkdir -p "$CACHE_DIR"
+    TRIAL_BIN="$CACHE_DIR/trial_bin"
+    if [[ ! -x "$TRIAL_BIN" ]] || find . -name '*.go' -newer "$TRIAL_BIN" -print -quit | grep -q .; then
+        if ! command -v go >/dev/null 2>&1; then
+            echo "需要 go 构建 trial_bin（或镜像内置 /app/trial_bin）" >&2
+            exit 1
+        fi
+        echo "构建 trial.." >&2
+        go build -o "$TRIAL_BIN" ./cmd/trial
+    fi
 fi
 
 "$TRIAL_BIN" "$AUTHS_DIR"
