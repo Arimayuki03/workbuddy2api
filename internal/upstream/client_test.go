@@ -343,6 +343,91 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	}
 }
 
+// TestResourceSummaryAggregation 断言 ResourceSummary 聚合口径：
+// remain 取 Cycle 期剩余、size 取 CycleSize（TotalDosage 作 size 下限）、used 派生。
+func TestResourceSummaryAggregation(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"TotalDosage":3000,"Accounts":[
+			{"PackageName":"签到包","CapacitySize":2000,"CapacityRemain":1200,"CapacityUsed":800,"CycleCapacitySize":2000,"CycleCapacityRemain":1200,"CycleCapacityUsed":800},
+			{"PackageName":"体验包","CapacitySize":1000,"CapacityRemain":300,"CapacityUsed":700,"CycleCapacitySize":1000,"CycleCapacityRemain":300,"CycleCapacityUsed":700}
+		]}}}}`), nil
+	})
+	remain, used, size, packs, err := c.ResourceSummary(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if remain != 1500 || size != 3000 {
+		t.Errorf("summary remain=%d size=%d want 1500/3000 (TotalDosage 作 size 下限)", remain, size)
+	}
+	// used = TotalDosage(3000) - remain(1500) = 1500。
+	if used != 1500 {
+		t.Errorf("used=%d want 1500", used)
+	}
+	if packs != 2 {
+		t.Errorf("packs=%d want 2", packs)
+	}
+}
+
+// TestResourceSummaryGlobalRealm 断言 global 账号走 global billing base + /billing/meter/*
+// （无 /v2 前缀），且 404 时 fallback /v2——realm 感知双路径，供 cmd/credit 复用。
+func TestResourceSummaryGlobalRealm(t *testing.T) {
+	var billingCalls []string
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		billingCalls = append(billingCalls, r.URL.Path)
+		if r.URL.Path == "/billing/meter/get-user-resource" {
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"PackageName":"g","CycleCapacitySize":500,"CycleCapacityRemain":200,"CycleCapacityUsed":300}
+		]}}}}`))
+	}))
+	defer billSrv.Close()
+
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	c := &Client{
+		HTTP:              &http.Client{},
+		BillingBaseCN:     "https://billing.cn",
+		BillingBaseGlobal: strings.TrimSuffix(billSrv.URL, "/"),
+		GlobalEnabled:     true,
+	}
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	remain, used, size, packs, err := c.ResourceSummary(a)
+	if err != nil {
+		t.Fatalf("global summary: %v", err)
+	}
+	if remain != 200 || used != 300 || size != 500 || packs != 1 {
+		t.Errorf("global summary=%d/%d/%d/%d want 200/300/500/1", remain, used, size, packs)
+	}
+	if len(billingCalls) != 2 ||
+		billingCalls[0] != "/billing/meter/get-user-resource" ||
+		billingCalls[1] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("global billing fallback calls=%v", billingCalls)
+	}
+}
+
+// TestResourceSummaryCNUnchanged 零回归：CN 账号仍是 /v2/billing/meter/get-user-resource 单路径。
+func TestResourceSummaryCNUnchanged(t *testing.T) {
+	var calls []string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		calls = append(calls, r.URL.Path)
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
+	})
+	_, _, _, _, err := c.ResourceSummary(&auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"})
+	if err != nil {
+		t.Fatalf("cn summary: %v", err)
+	}
+	if len(calls) != 1 || calls[0] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("cn billing calls=%v want single /v2 path", calls)
+	}
+}
+
 func TestUserResourceAggregation(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
