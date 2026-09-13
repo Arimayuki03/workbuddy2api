@@ -215,14 +215,19 @@ func TestGlobalE2ER9CreditIsomorphic(t *testing.T) {
 		t.Fatalf("R9 chat global:deepseek-v4.1-flash code=%d body=%s", rec.Code, snippet)
 	}
 
-	usage, frames, lastFrame := sseReadSummary(rec.Body)
+	lastFrameObj, frames, lastFrame := sseReadSummary(rec.Body)
+	if lastFrameObj == nil {
+		t.Fatalf("R9 末帧不可解析（frames=%d lastFrame=%s）", frames, lastFrame)
+	}
+	// 末帧是 OpenAI chunk：usage 是顶层 object 内的子对象（非顶层键）。
+	usage, _ := lastFrameObj["usage"].(map[string]any)
 	if usage == nil {
-		t.Fatalf("R9 末帧无 usage 对象（frames=%d lastFrame=%s）", frames, lastFrame)
+		t.Fatalf("R9 末帧无 usage 子对象（frames=%d lastFrame=%s）", frames, lastFrame)
 	}
 	if _, hasCredit := usage["credit"]; !hasCredit {
-		t.Errorf("R9 末帧缺少 usage.credit（global SSE 与 CN 非同构）: usage=%v", usage)
+		t.Errorf("R9 末帧 usage 缺少 credit 字段（global SSE 与 CN 非同构）: usage=%v", usage)
 	} else {
-		t.Logf("R9 末帧存在 usage.credit（与 CN 同构 ✓）")
+		t.Logf("R9 末帧 usage.credit 存在（与 CN 同构 ✓）")
 	}
 
 	// NoteModelCost 被调用：账本应记录该 (uid, model) 观测，且为 tier0 免费（credit=0）。
@@ -276,7 +281,8 @@ func TestGlobalE2ER2ChatV2(t *testing.T) {
 	}
 	cl := e2eChatClient()
 	a := loadSSEGlobalAcct(t)
-	body := sseChatBody(cl, a, "gpt-5.4", 1)
+	// default-model 用 max_tokens=10 足够（最便宜稳定）；gpt-5.4 更贵且要求 ≥100。
+	body := sseChatBody(cl, a, "default-model", 10)
 	status, raw := sseDoProbe(cl, a, http.MethodPost, sseE2EBase+"/v2/chat/completions",
 		func(req *http.Request, ac *auth.Auth) { cl.ChatHeaders(req, ac, "") }, body)
 	t.Logf("R2 /v2/chat/completions status=%d", status)
@@ -299,10 +305,12 @@ func TestGlobalE2EDefaultAndGpt54(t *testing.T) {
 
 	for _, model := range []string{"global:default-model", "global:gpt-5.4"} {
 		_, bare := ResolveModel(model)
+		// gpt-5.4 实测要求 max_tokens ≥100（code 11133 integer_below_min_value 否则）；
+		// default-model 无此限制。统一用 100 保证两型号都通过。
 		body, _ := json.Marshal(map[string]any{
 			"model":      model,
 			"stream":     true,
-			"max_tokens": 10,
+			"max_tokens": 100,
 			"messages": []any{
 				map[string]any{"role": "user", "content": "Reply with the single word 'ok'."},
 			},
@@ -314,12 +322,15 @@ func TestGlobalE2EDefaultAndGpt54(t *testing.T) {
 		if rec.Code != 200 {
 			continue
 		}
-		if usage, _, _ := sseReadSummary(rec.Body); usage != nil {
-			if c, has := usage["credit"]; has && c != nil {
-				if f, ok := c.(float64); ok {
-					t.Logf("模型 %s → credit=%.4f", model, f)
-				} else {
-					t.Logf("模型 %s → credit=%v", model, c)
+		if frame, _, _ := sseReadSummary(rec.Body); frame != nil {
+			usage, _ := frame["usage"].(map[string]any)
+			if usage != nil {
+				if c, has := usage["credit"]; has && c != nil {
+					if f, ok := c.(float64); ok {
+						t.Logf("模型 %s → credit=%.4f", model, f)
+					} else {
+						t.Logf("模型 %s → credit=%v", model, c)
+					}
 				}
 			}
 		}
