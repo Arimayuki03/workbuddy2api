@@ -60,11 +60,12 @@ const (
 )
 
 // globalModelsProbePaths global 模型目录端点候选序列（按 realm 切 base，路径"家族"）：
-// console 家族优先（与 global chat 路径同域），404/500 时换 /v2（CLI 窄表）。
-// 参考 PLAN v1 §2.2 分歧③：console 路径在 global 上或 500，/v2 返回窄表。
+// /v2 家族优先（PR #20 实测 /v2/enterprises/personal/models 200 含完整模型表），
+// /console 作 fallback（同域旧路径，或 500）。参考 PLAN v1 §2.2 分歧③ 与
+// rockswang/wild-work PR #20 实测结论：console 路径在 global 上非 200 → 先 /v2。
 var globalModelsProbePaths = []string{
-	"/console/enterprises/personal/models",
 	"/v2/enterprises/personal/models",
+	"/console/enterprises/personal/models",
 }
 
 // FetchGlobalModels 探测 global 账号的模型名目录并返回模型名列表（含 context 无关、无倍率）。

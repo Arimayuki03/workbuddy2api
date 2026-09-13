@@ -455,8 +455,8 @@ func TestGlobalE2EFetchModels(t *testing.T) {
 	headers := func(req *http.Request, ac *auth.Auth) { cl.CommonHeaders(req, ac) }
 
 	paths := []string{
-		"/console/enterprises/personal/models", // 家族首选
-		"/v2/enterprises/personal/models",      // /v2 窄表
+		"/v2/enterprises/personal/models",      // 家族首选（PR #20 实测 200 完整模型表）
+		"/console/enterprises/personal/models", // /console 兜底（旧路径或 500）
 	}
 	probed := false
 	for _, p := range paths {
@@ -537,7 +537,7 @@ func TestGlobalE2EErrorCodeSemantics(t *testing.T) {
 		{"chat console", http.MethodPost, globalE2EBase + "/console/chat/completions", chatHeaders, rawChat},
 		{"chat v2", http.MethodPost, globalE2EBase + "/v2/chat/completions", chatHeaders, rawChat},
 		{"billing get-resource", http.MethodPost, globalE2EBase + "/billing/meter/get-user-resource", billHeaders, raw},
-		{"models console", http.MethodGet, globalE2EBase + "/console/enterprises/personal/models", commonHeaders, nil},
+		{"models v2", http.MethodGet, globalE2EBase + "/v2/enterprises/personal/models", commonHeaders, nil},
 		{"trial POST", http.MethodPost, globalE2EBase + "/billing/ide/trial", billHeaders, nil},
 	}
 	for _, ep := range eps {

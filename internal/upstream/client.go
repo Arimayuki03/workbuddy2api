@@ -635,10 +635,30 @@ type ModelInfo struct {
 	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
 }
 
+// 模型目录端点路径常量（按 realm 切）：
+// CN 现状 /console/enterprises/personal/models 逐字保留（零回归）；
+// global 走 /v2/enterprises/personal/models（PR #20 实测 /console 500、/v2 200 含
+// credits 倍率的完整模型表）。modelsPath 按 globalOn 分发。
+const (
+	cnModelsPath     = "/console/enterprises/personal/models"
+	globalModelsPath = "/v2/enterprises/personal/models"
+)
+
+// modelsPath 按 realm 返回动态模型目录端点路径（不含 base）。
+// CN → /console/enterprises/personal/models（现状，零回归）；
+// global → /v2/enterprises/personal/models（国际版实测可用路径，见 global_models.go
+// probe 家族）：governed by globalOn（config global.enabled + 账号 realm 双闸）。
+func (c *Client) modelsPath(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return globalModelsPath
+	}
+	return cnModelsPath
+}
+
 // FetchModels 调上游动态模型接口。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	url := c.chatBase(a) + "/console/enterprises/personal/models"
+	url := c.chatBase(a) + c.modelsPath(a)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

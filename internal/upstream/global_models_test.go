@@ -51,8 +51,8 @@ func globalModelsClient(t *testing.T, srv *httptest.Server) *Client {
 	}
 }
 
-// TestFetchGlobalModelsProbeMergesAndHeaders 探测命中：走 global base + console 路径 + Bearer 鉴权头，
-// 结果为「探测 ∪ 静态名单」去重（重复 id 只出现一次，disabled 不入）。
+// TestFetchGlobalModelsProbeMergesAndHeaders 探测命中：走 global base + /v2 路径（家族首选）
+// + Bearer 鉴权头，结果为「探测 ∪ 静态名单」去重（重复 id 只出现一次，disabled 不入）。
 func TestFetchGlobalModelsProbeMergesAndHeaders(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -75,8 +75,8 @@ func TestFetchGlobalModelsProbeMergesAndHeaders(t *testing.T) {
 	if !strings.HasPrefix(srv.URL, "http://") {
 		t.Fatal("unexpected srv.URL")
 	}
-	if len(calls) != 1 || calls[0] != "/console/enterprises/personal/models" {
-		t.Fatalf("probe calls=%v want [/console/enterprises/personal/models]", calls)
+	if len(calls) != 1 || calls[0] != "/v2/enterprises/personal/models" {
+		t.Fatalf("probe calls=%v want [/v2/enterprises/personal/models] (v2 家族首选)", calls)
 	}
 	if gotAuthz != "Bearer at" {
 		t.Errorf("probe authz=%q want Bearer at", gotAuthz)
@@ -97,7 +97,7 @@ func TestFetchGlobalModelsProbeMergesAndHeaders(t *testing.T) {
 	}
 }
 
-// TestFetchGlobalModelsFallbackStaticOnFailure 探测家族全失败（console+v2 均 500）→ 回落静态名单。
+// TestFetchGlobalModelsFallbackStaticOnFailure 探测家族全失败（v2+console 均 500）→ 回落静态名单。
 func TestFetchGlobalModelsFallbackStaticOnFailure(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -110,8 +110,8 @@ func TestFetchGlobalModelsFallbackStaticOnFailure(t *testing.T) {
 
 	got := globalModelsClient(t, srv).FetchGlobalModels(globalAcct())
 
-	if len(calls) != 2 || calls[0] != "/console/enterprises/personal/models" || calls[1] != "/v2/enterprises/personal/models" {
-		t.Fatalf("fallback calls=%v want [/console/..., /v2/...]", calls)
+	if len(calls) != 2 || calls[0] != "/v2/enterprises/personal/models" || calls[1] != "/console/enterprises/personal/models" {
+		t.Fatalf("fallback calls=%v want [/v2/..., /console/...]", calls)
 	}
 	if len(got) != len(GlobalModelNames) || !reflect.DeepEqual(got, GlobalModelNames) {
 		t.Errorf("fallback result != GlobalModelNames (static)")

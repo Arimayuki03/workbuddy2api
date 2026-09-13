@@ -174,7 +174,10 @@ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[stri
 	}
 }
 
-// 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
+// 静态 CN 模型表（api-reference §5，**动态拉取失败才用的兜底**，见 modelList）：
+// 动态接口成功时以动态结果优先（含真实 context_length/max_output_tokens）；
+// 本表全用 context_length=131072 只是兜底形态，不得理解为权威值。
+// 触底前提：fetchDynamicModels 返回空（拉取失败 / 负缓存 / 池中无健康 CN 号）。
 var staticModels = []map[string]any{
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},

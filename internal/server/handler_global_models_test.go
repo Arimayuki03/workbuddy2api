@@ -125,10 +125,10 @@ func TestModelListTwoFamilies(t *testing.T) {
 		t.Errorf("global models dedupe failed: gpt-5.4 count=%d", countOf(globIDs, "gpt-5.4"))
 	}
 
-	// 探测走 global base（httptest Host）+ Bearer 鉴权头。
+	// 探测走 global base（httptest Host）+ Bearer 鉴权头 + /v2 家族首选。
 	cnt, path, authz, host := cf.snapshot()
-	if cnt == 0 || path != "/console/enterprises/personal/models" {
-		t.Errorf("probe path=%q cnt=%d want /console/enterprises/personal/models", path, cnt)
+	if cnt == 0 || path != "/v2/enterprises/personal/models" {
+		t.Errorf("probe path=%q cnt=%d want /v2/enterprises/personal/models", path, cnt)
 	}
 	if authz != "Bearer at_gl" {
 		t.Errorf("probe authz=%q want Bearer at_gl", authz)

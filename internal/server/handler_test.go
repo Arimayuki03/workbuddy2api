@@ -1097,6 +1097,100 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	}
 }
 
+// TestModelsDynamicZeroContextFallback 动态模型缺 maxInputTokens → context_length 兜底 131072，
+// 其余真实值不得被覆盖（issue 提醒：不能全表统一 131072 抹平真实 ContextLength）。
+func TestModelsDynamicZeroContextFallback(t *testing.T) {
+	resetModelsCache()
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[
+			{"id":"dyn-zero-ctx","maxInputTokens":0,"maxOutputTokens":4096},
+			{"id":"dyn-real-ctx","maxInputTokens":262144,"maxOutputTokens":32768}
+		],"agents":[{"name":"cli","models":["dyn-zero-ctx","dyn-real-ctx"]}]}}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := jsonUnmarshal(rec.Body.String(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	zero := map[string]any{}
+	real := map[string]any{}
+	for _, m := range resp.Data {
+		switch m["id"] {
+		case "cn:dyn-zero-ctx":
+			zero = m
+		case "cn:dyn-real-ctx":
+			real = m
+		}
+	}
+	// 缺 maxInputTokens → 兜底 131072（其余字段保持真实）。
+	if zc, _ := zero["context_length"].(float64); zc != 131072 {
+		t.Errorf("zero-ctx context_length=%v want 131072 fallback", zc)
+	}
+	if zo, _ := zero["max_output_tokens"].(float64); zo != 4096 {
+		t.Errorf("zero-ctx max_output_tokens=%v want 4096 (real value preserved)", zo)
+	}
+	// 有真实 maxInputTokens → 必须用真实值，不得被兜底抹平。
+	if rc, _ := real["context_length"].(float64); rc != 262144 {
+		t.Errorf("real-ctx context_length=%v want 262144 (real value must win)", rc)
+	}
+	if ro, _ := real["max_output_tokens"].(float64); ro != 32768 {
+		t.Errorf("real-ctx max_output_tokens=%v want 32768", ro)
+	}
+}
+
+// TestModelsDynamicUnderscoresStaticAndPreservesBodies 动态成功时优先动态结果（连 headers
+// 字段一并保留原样），失败才回退静态表——两条路径都产出 valid models 响应。
+func TestModelsDynamicUnderscoresStaticAndPreservesBodies(t *testing.T) {
+	resetModelsCache()
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[
+			{"id":"dyn-only","maxInputTokens":200000,"maxOutputTokens":20000,"name":"Dyn Only"}
+		],"agents":[{"name":"cli","models":["dyn-only"]}]}}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := jsonUnmarshal(rec.Body.String(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Data) == 0 {
+		t.Fatal("no models returned")
+	}
+	// 动态优先：动态模型出现即证明未走静态 fallback。
+	found := false
+	for _, m := range resp.Data {
+		if m["id"] == "cn:dyn-only" {
+			found = true
+			if cl, _ := m["context_length"].(float64); cl != 200000 {
+				t.Errorf("cn:dyn-only context_length=%v want 200000 (dynamic value)", cl)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("/v1/models must include cn:dyn-only when dynamic fetch succeeds: %v", resp.Data)
+	}
+
+	// 失败路径仍 return 静态表（既有行为由 TestModelsDynamicFallsBackToStatic 覆盖）。
+	if len(resp.Data) == 0 {
+		t.Fatal("static fallback produced empty list")
+	}
+}
+
 func TestAPIKeyAuth(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
@@ -1640,7 +1734,7 @@ func TestStatusRealmTotals(t *testing.T) {
 	}
 	var body struct {
 		Total, Healthy, Cooling, Disabled int
-		RealmTotals                        map[string]map[string]int `json:"realm_totals"`
+		RealmTotals                       map[string]map[string]int `json:"realm_totals"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v body=%s", err, rec.Body)
@@ -1685,8 +1779,8 @@ func TestHealthzRealmServable(t *testing.T) {
 		t.Fatalf("code=%d want 200 (cn servable keeps existence semantics)", rec.Code)
 	}
 	var resp struct {
-		Healthy       int              `json:"healthy"`
-		RealmServable map[string]bool  `json:"realm_servable"`
+		Healthy       int             `json:"healthy"`
+		RealmServable map[string]bool `json:"realm_servable"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
