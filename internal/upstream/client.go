@@ -519,8 +519,14 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
 // body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints,
-		c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm))
+	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
+	if realmKey(realm) == "global" {
+		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
+		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
+		// （issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
+		efforts, defs = globalEffortMap(efforts, defs)
+	}
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -564,6 +570,36 @@ func realmKey(realm string) string {
 		return "cn"
 	}
 	return realm
+}
+
+// storeEfforts 按 realm 写入 effort 能力缓存桶（efforts + defaultEfforts），并发安全。
+// 供 CN FetchModels 与 global 探测共用：拉取到的模型档位落桶后，出站请求体 normalizeReasoningEffort
+// 才能按域降级。efforts 与 defs 均空时删除该 realm 桶（等价「该域无可降级档位」）。
+// 调用方负责在「无新数据」时跳过写（CN 侧空桶不清既有桶，见 FetchModels 尾部）。
+func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs map[string]string) {
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	if c.efforts == nil {
+		c.efforts = make(map[string]map[string][]string)
+	}
+	if c.defaultEfforts == nil {
+		c.defaultEfforts = make(map[string]map[string]string)
+	}
+	k := realmKey(realm)
+	if len(efforts) == 0 && len(defs) == 0 {
+		delete(c.efforts, k)
+		delete(c.defaultEfforts, k)
+		return
+	}
+	c.efforts[k] = efforts
+	c.defaultEfforts[k] = defs
+}
+
+// GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
+// 供 /v1/models 输出 reasoning_supported_efforts / reasoning_default_effort。
+// 返回副本；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。
+func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults map[string]string) {
+	return c.effortsSnapshot("global"), c.defaultEffortsSnapshot("global")
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
@@ -811,7 +847,7 @@ type ModelInfo struct {
 	MaxTokens      int64    // = maxOutputTokens
 	Efforts        []string // reasoning.supportedEfforts（空=未知/固定档）
 	DefaultEffort  string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
-	SupportsImages bool    // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+	SupportsImages bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 }
 
 // 模型目录端点路径常量（按 realm 切）：
@@ -950,9 +986,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			ID:             m.ID,
 			Name:           m.Name,
 			ContextWindow:  m.MaxInputTokens,
-			MaxTokens:       m.MaxOutputTokens,
-			Efforts:         m.Efforts,
-			DefaultEffort:   m.DefaultEffort,
+			MaxTokens:      m.MaxOutputTokens,
+			Efforts:        m.Efforts,
+			DefaultEffort:  m.DefaultEffort,
 			SupportsImages: m.SupportsImages,
 		})
 	}
@@ -960,6 +996,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
+	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶（例：cn 桶已有档位，再次探测返回全无等级 → 不应清空）。
 	cache := make(map[string][]string, len(out))
 	defCache := make(map[string]string, len(out))
 	for _, mi := range out {
@@ -974,16 +1011,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return out, nil
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.effortsMu.Lock()
-	if c.efforts == nil {
-		c.efforts = make(map[string]map[string][]string)
-	}
-	if c.defaultEfforts == nil {
-		c.defaultEfforts = make(map[string]map[string]string)
-	}
-	c.efforts[realmKey(a.Realm())] = cache
-	c.defaultEfforts[realmKey(a.Realm())] = defCache
-	c.effortsMu.Unlock()
+	c.storeEfforts(a.Realm(), cache, defCache)
 	return out, nil
 }
 

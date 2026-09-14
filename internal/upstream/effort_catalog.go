@@ -112,3 +112,34 @@ func containsEffort(efforts []string, want string) bool {
 	}
 	return false
 }
+
+// globalEffortMap global 域降级用的 effort 能力表：静态兜底表为基，远端桶覆盖（权威优先）。
+//
+// prepareBody 对 global 请求调此函数（而非直接用远端桶），因为 global 上游可能不下发
+// supportedEfforts——此时也必须按产品静态表降级（issue #84：deepseek-v4.1-flash 国际版
+// 只认 high，客户端传 low/max 必降级到 high，否则上游 400 毁掉请求）。
+// 语义对齐参考仓库 effortsFor（remoteMeta → productFallback → 静态表），只取前两级：
+// 远端桶（探测已解析）→ 本产品静态表（本文件），缺档位即无（不再到通用静态表）。
+func globalEffortMap(remoteEfforts map[string][]string, remoteDefaults map[string]string) (map[string][]string, map[string]string) {
+	efforts := make(map[string][]string, len(globalEffortFallback)+len(remoteEfforts))
+	defs := make(map[string]string, len(globalEffortFallback)+len(remoteDefaults))
+	// 静态兜底为基。
+	for id, cap := range globalEffortFallback {
+		efforts[id] = append([]string(nil), cap.efforts...)
+		if cap.defaultEffort != "" {
+			defs[id] = cap.defaultEffort
+		}
+	}
+	// 远端权威覆盖（仅当远端确实下发了该模型档位）。
+	for id, v := range remoteEfforts {
+		if len(v) > 0 {
+			efforts[id] = v
+		}
+	}
+	for id, v := range remoteDefaults {
+		if v != "" {
+			defs[id] = v
+		}
+	}
+	return efforts, defs
+}
