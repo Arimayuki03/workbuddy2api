@@ -237,7 +237,15 @@ func (h *Handler) modelList() []map[string]any {
 				entry["context_length"] = 131072 // 兜底
 			}
 			if mi.SupportsImages {
-				entry["supports_images"] = true // P1：多模态能力透出
+				entry["supports_images"] = true // 多模态能力透出
+			}
+			// P0：effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
+			// （issue #84 客户端可发现档位，不再盲传）。无档位→省略字段（非空数组）。
+			if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+				entry["reasoning_supported_efforts"] = efforts
+				if def != "" {
+					entry["reasoning_default_effort"] = def
+				}
 			}
 			out = append(out, entry)
 		}
@@ -249,6 +257,13 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			if id, ok := m["id"].(string); ok {
 				e["id"] = "cn:" + id
+				// P0：静态兜底分支同样按 CN 静态档位表透出 effort 能力（远端不可用时的可发现性）。
+				if efforts, def := upstream.EffortListing("cn", id, nil, ""); efforts != nil {
+					e["reasoning_supported_efforts"] = efforts
+					if def != "" {
+						e["reasoning_default_effort"] = def
+					}
+				}
 			}
 			out = append(out, e)
 		}
@@ -258,13 +273,22 @@ func (h *Handler) modelList() []map[string]any {
 	// 直接静态名单且零上游调用。
 	if h.cfg.GlobalEnabled {
 		for _, id := range h.fetchGlobalModels() {
-			out = append(out, map[string]any{
+			entry := map[string]any{
 				"id":             "global:" + id,
 				"object":         "model",
 				"created":        1753600000,
 				"owned_by":       "workbuddy",
 				"context_length": 131072,
-			})
+			}
+			// P0：global 域 effort 能力透出（静态兜底表，issue #84——deepseek-v4.1-flash
+			// 国际版只认 ['high']，三档是 CN 面能力）。探测下发档位接入见下步 global effort 解析。
+			if efforts, def := upstream.EffortListing("global", id, nil, ""); efforts != nil {
+				entry["reasoning_supported_efforts"] = efforts
+				if def != "" {
+					entry["reasoning_default_effort"] = def
+				}
+			}
+			out = append(out, entry)
 		}
 	}
 	return out
