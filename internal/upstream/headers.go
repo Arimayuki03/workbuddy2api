@@ -135,6 +135,17 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("User-Agent", c.userAgent(a))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-CodeBuddy-Request", "1")
+	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
+	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
+	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+}
+
+// acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
+func acceptLanguageFor(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return "en-US"
+	}
+	return "zh-CN"
 }
 
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
@@ -339,6 +350,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
+	// Accept-Language 按 realm 切（D5）：billing 域未走 CommonHeaders，单独注入。
+	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	} else if ua := c.billingUA(); ua != "" {

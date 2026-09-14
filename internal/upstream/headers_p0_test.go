@@ -47,3 +47,39 @@ func TestRefreshHeadersAuthRefreshSource(t *testing.T) {
 		t.Errorf("X-Auth-Refresh-Source = %q want %q", got, "plugin")
 	}
 }
+
+// TestCommonHeadersAcceptLanguageByRealm Accept-Language 按 realm 切（D5）：
+// CN 账号 zh-CN，global 账号 en-US。chat/refresh 路径（走 CommonHeaders）均覆盖。
+func TestCommonHeadersAcceptLanguageByRealm(t *testing.T) {
+	c := &Client{}
+
+	// CN 账号 chat
+	cnA := &auth.Auth{AccessToken: "at", UID: "c1"}
+	req := mustRequest(t)
+	c.ChatHeaders(req, cnA, "", ChatMeta{})
+	if got := req.Header.Get("Accept-Language"); got != "zh-CN" {
+		t.Errorf("CN chat Accept-Language = %q want %q", got, "zh-CN")
+	}
+
+	// global 账号 chat
+	glA := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	req2 := mustRequest(t)
+	c.ChatHeaders(req2, glA, "", ChatMeta{})
+	if got := req2.Header.Get("Accept-Language"); got != "en-US" {
+		t.Errorf("global chat Accept-Language = %q want %q", got, "en-US")
+	}
+
+	// CN 账号 refresh
+	req3 := mustRequest(t)
+	c.RefreshHeaders(req3, cnA)
+	if got := req3.Header.Get("Accept-Language"); got != "zh-CN" {
+		t.Errorf("CN refresh Accept-Language = %q want %q", got, "zh-CN")
+	}
+
+	// global 账号 refresh
+	req4 := mustRequest(t)
+	c.RefreshHeaders(req4, glA)
+	if got := req4.Header.Get("Accept-Language"); got != "en-US" {
+		t.Errorf("global refresh Accept-Language = %q want %q", got, "en-US")
+	}
+}
