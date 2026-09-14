@@ -2130,3 +2130,55 @@ func TestNewHandlerPromptDefaultPassthrough(t *testing.T) {
 		t.Errorf("system count=%d want 1 (passthrough keeps client system exactly once)", sysCount)
 	}
 }
+
+// TestContentBlockedCustomIgnoresActiveDegrade 显式 custom 模式在降级期仍走自有提示词、
+// 不参与降级：先人为触发 degrade.Active()（模拟 passthrough 首遇后进入降级期），
+// 再发 custom 请求 → 出站 body 为自有提示词而非 Degraded，且仍不经降级重试。
+//
+// 相交矩阵关键格：degrade gate 是 Handler 级全局状态（handler.go:69），passthrough
+// 请求可能在不经意间把整实例带入降级期。守卫在 handler.go:450-455 的 if/elseif 结构：
+// custom 分支恒优先，Active() 只在 passthrough 分支才被求值 → custom 请求永远
+// 命不中降级分支。此测试把该行为锁死，防未来重构把两分支合并后 custom 被降级期带偏。
+func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
+	var sentBodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			sentBodies = append(sentBodies, raw)
+			// 全部返回 200：本测试只论「custom 请求在降级期内的出站体」，不涉及重试。
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	const customSys = "我是网关自有提示词"
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: customSys})
+
+	// 人为把降级门拨到激活态（模拟 passthrough 首遇 400 后进入降级期）。
+	h.degrade.Trigger()
+	if !h.degrade.Active() {
+		t.Fatal("precondition: degrade gate should be active after Trigger")
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(sentBodies) != 1 {
+		t.Fatalf("want exactly 1 upstream call (custom does not degrade/retry), got %d", len(sentBodies))
+	}
+	out := string(sentBodies[0])
+	// custom 请求在降级期仍注入自有提示词，而非降级中性提示词。
+	if !strings.Contains(out, customSys) {
+		t.Errorf("custom request should rewrite to custom prompt even in degrade period: %s", out)
+	}
+	if strings.Contains(out, prompt.Degraded) {
+		t.Errorf("custom request must NOT use Degraded prompt even in degrade period: %s", out)
+	}
+}
