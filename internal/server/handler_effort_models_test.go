@@ -116,6 +116,44 @@ func TestModelListEffortFieldsGlobal(t *testing.T) {
 	}
 }
 
+// TestModelListEffortFieldsGlobalRemote 探测下发档位 → /v1/models global 面用远端桶（权威），
+// 远程未覆盖的模型仍落静态兜底表。
+func TestModelListEffortFieldsGlobalRemote(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	resetModelsCache()
+
+	cf := newGlobalModelsHandlerFake(t, 200, `{"code":0,"data":{"models":[
+		{"id":"gpt-5.4","reasoning":{"supportedEfforts":["low","medium","high","xhigh"],"defaultEffort":"high"}},
+		{"id":"probe-only-x","reasoning":{"supportedEfforts":["low"],"defaultEffort":"low"}}
+	]}}`)
+	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at_gl", Domain: "www.workbuddy.ai", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: cf.up, GlobalEnabled: true})
+
+	got := h.modelList()
+	byID := map[string]map[string]any{}
+	for _, m := range got {
+		if id, ok := m["id"].(string); ok {
+			byID[id] = m
+		}
+	}
+	// 远端下发的 gpt-5.4 effort 权威透出。
+	if !reflect.DeepEqual(byID["global:gpt-5.4"]["reasoning_supported_efforts"], []string{"low", "medium", "high", "xhigh"}) {
+		t.Errorf("gpt-5.4 remote efforts=%v want [low medium high xhigh]", byID["global:gpt-5.4"]["reasoning_supported_efforts"])
+	}
+	if byID["global:gpt-5.4"]["reasoning_default_effort"] != "high" {
+		t.Errorf("gpt-5.4 remote default=%v want high", byID["global:gpt-5.4"]["reasoning_default_effort"])
+	}
+	// 探测独有的 probe-only-x 也透出远程档位。
+	if !reflect.DeepEqual(byID["global:probe-only-x"]["reasoning_supported_efforts"], []string{"low"}) {
+		t.Errorf("probe-only-x remote efforts=%v want [low]", byID["global:probe-only-x"]["reasoning_supported_efforts"])
+	}
+	// 静态兜底表仍生效（deepseek-v4.1-flash 国际版 ['high']，探测未下发）。
+	if !reflect.DeepEqual(byID["global:deepseek-v4.1-flash"]["reasoning_supported_efforts"], []string{"high"}) {
+		t.Errorf("static fallback efforts=%v want [high]", byID["global:deepseek-v4.1-flash"]["reasoning_supported_efforts"])
+	}
+}
+
 // TestModelsEndpointFullJSONLockExistingKeys /v1/models 全量 JSON 键回归：
 // 既有字段 id/object/created/owned_by/context_length 保持原样（新增字段不删不改）。
 func TestModelsEndpointFullJSONLockExistingKeys(t *testing.T) {

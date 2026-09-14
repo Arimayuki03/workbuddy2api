@@ -272,7 +272,11 @@ func (h *Handler) modelList() []map[string]any {
 	// 名单 = 探测结果 ∪ §7.2 静态（fetchGlobalModels 内合并去重）；无 global 账号时
 	// 直接静态名单且零上游调用。
 	if h.cfg.GlobalEnabled {
-		for _, id := range h.fetchGlobalModels() {
+		// global 域 effort 能力三级查找：探测下发桶（权威）→ 静态兜底表 → 省略。
+		// 先 fetchGlobalModels（内部探测并落 effort 桶），再按 id 取快照。
+		globalIDs := h.fetchGlobalModels()
+		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
+		for _, id := range globalIDs {
 			entry := map[string]any{
 				"id":             "global:" + id,
 				"object":         "model",
@@ -280,9 +284,7 @@ func (h *Handler) modelList() []map[string]any {
 				"owned_by":       "workbuddy",
 				"context_length": 131072,
 			}
-			// P0：global 域 effort 能力透出（静态兜底表，issue #84——deepseek-v4.1-flash
-			// 国际版只认 ['high']，三档是 CN 面能力）。探测下发档位接入见下步 global effort 解析。
-			if efforts, def := upstream.EffortListing("global", id, nil, ""); efforts != nil {
+			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
 				entry["reasoning_supported_efforts"] = efforts
 				if def != "" {
 					entry["reasoning_default_effort"] = def
