@@ -163,17 +163,17 @@ func TestModelCostEmptyModelUnaffected(t *testing.T) {
 func TestPickByUIDForModel(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	// 触发一次带解析时间的 6004 冷却：softRateModel=hy4-preview，
+	// 触发一次带解析时间的 6004 冷却：modelCooldowns[hy4-preview] 记录，
 	// 该账号对 hy4-preview 冷却、对其他模型豁免（issue #31 语义）。
 	reset := time.Now().Add(time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "hy4-preview", "6004 model rate limit")
 
 	// 先确认冷却真的落上了（否则后面两个断言是假阳性）。
 	p.mu.RLock()
-	recorded := p.byUID["u1"].softRateModel
+	_, recorded := p.byUID["u1"].modelCooldowns["hy4-preview"]
 	p.mu.RUnlock()
-	if recorded != "hy4-preview" {
-		t.Fatalf("softRateModel=%q want hy4-preview（6004 模型级冷却未记录模型）", recorded)
+	if !recorded {
+		t.Fatalf("modelCooldowns[hy4-preview] 缺失（6004 模型级冷却未记录模型）")
 	}
 
 	if a := p.PickByUIDForModel("u1", "hy4-preview"); a != nil {

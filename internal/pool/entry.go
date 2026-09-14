@@ -38,8 +38,8 @@ type Status struct {
 	Reason        string    `json:"reason,omitempty"`
 	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
-	// 仅「带解析时间 6004」触发的模型级软冷却仍生效时非空（softRateModel 非空且未到期）；
-	// 运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
+	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
+	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	Disabled          bool               `json:"disabled"`
 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
@@ -56,7 +56,8 @@ type Status struct {
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
 type RateLimitedModel struct {
 	Model string `json:"model"`
-	// Until 冷却到期时刻 = entry.until 截断后的下游可挑选截止（与 Status.Until 同值）。
+	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
+	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
 	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断，跟 softRateReset）；
 	// 截断后 Until==ResetAt，省略 ResetAt 让台账自然减少一列。
@@ -88,15 +89,12 @@ type entry struct {
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
-	// softRateModel 触发 6004 模型级限流时的模型名（issue #31 模型豁免）。
-	// 仅当冷却由「带解析时间的 6004」触发时记录；空 = 普通软冷却（不豁免）。
-	// 运行态语义（不持久化）：重启清零，退化为现状。
-	softRateModel string
-	// softRateReset 上游「将在 … 重置」解析出的原始墙钟（与 softRateModel 同生同灭）。
-	// 与 until 的区别：until 可能被 soft_rate_max 截断，本字段记录未经截断的上游权威
-	// 重置时刻（issue #36 限额台账，运维按真实恢复时刻观察）。零值 = 无上游重置信息。
-	// 运行态语义（不持久化），重启清零。
-	softRateReset time.Time
+	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
+	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
+	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
+	// 单 until 字段做不到的）。only 6004 触发时记录；空 map = 无模型级限流（不豁免）。
+	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
+	modelCooldowns map[string]modelCooldown
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
 	// 运行态语义（不持久化，与 inFlight 同语义）：重启清零可接受——重启后首个 keepalive
@@ -141,26 +139,62 @@ func (e *entry) healthy(now time.Time) bool {
 	return true
 }
 
-// modelExempt 报告账号是否处于「6004 模型级软冷却」形态：冷却由带解析时间的
-// 6004 触发（coolKind==CoolSoft 且 softRateModel 非空），且尚未禁用、未熔断。
-// 此形态下账号仅对 softRateModel 不可用，对其他模型仍可选（issue #31）。
+// modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
+// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
+// 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
-// 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看 until 是否已过）。
+// 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
-	return e.coolKind == CoolSoft && e.softRateModel != "" &&
+	return len(e.modelCooldowns) > 0 &&
 		!e.disabled && e.breakerUntil.IsZero()
 }
 
-// healthyForModel 报告账号对指定 model 是否可选（含模型级豁免）：
-// 冷却为由 6004 触发的**模型级**软冷却（softRateModel 非空）且请求模型不同
-// （softRateModel != reqModel）时，跳过冷却判定——该模型限流不代表账号在其他
-// 模型下不可用（issue #31）。空 reqModel / 未记录模型 / 同模型 → 与 healthy 一致。
-func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if !e.healthy(now) && reqModel != "" && e.modelExempt() && e.softRateModel != reqModel {
-		// 非 healthy 但属于可豁免场景：仍受 disabled/breakerUntil 约束（modelExempt 已含）。
-		return true
+// modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
+// 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
+func (e *entry) modelCooled(now time.Time, reqModel string) bool {
+	if reqModel == "" {
+		return false
 	}
+	mc, ok := e.modelCooldowns[reqModel]
+	if !ok {
+		return false
+	}
+	return !mc.Until.IsZero() && now.Before(mc.Until)
+}
+
+// healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
+//   - disabled → 永不可选（最高优先级）；
+//   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
+//     （多模型限流时各自独立，互不影响——这是本次 issue 的核心）；
+//   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
+//
+// 对比旧实现（softRateModel 单字段豁免"仅锁一个模型、其他豁免"），新语义天然支持
+// 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
+// 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
+func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
+	if e.disabled {
+		return false
+	}
+	if e.modelCooled(now, reqModel) {
+		// 该模型在 6004 独立冷却中 → 不可选。
+		return false
+	}
+	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
 	return e.healthy(now)
+}
+
+// pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
+// pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
+// 无需清理。调用方必须已持有 p.mu 写锁。
+func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
+	if len(e.modelCooldowns) == 0 {
+		return
+	}
+	for m, mc := range e.modelCooldowns {
+		if mc.Until.IsZero() || !now.Before(mc.Until) {
+			delete(e.modelCooldowns, m)
+		}
+	}
 }
 
 // expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
@@ -236,6 +270,17 @@ type modelCostEntry struct {
 	CostPer1k float64
 	LastSeen  time.Time
 	Samples   int
+}
+
+// modelCooldown 单个 (账号, 模型) 的 6004 独立冷却记录（运行态，不持久化）。
+type modelCooldown struct {
+	// Until 该模型的冷却截止（= now+min(resetAt-now, soft_rate_max)，截断后）。
+	Until time.Time
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）。
+	// 与 Until 的区别同旧 softRateReset：Until 可能截断，ResetAt 是上游权威恢复时刻。
+	ResetAt time.Time
+	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
+	Reason string
 }
 
 // stateFile 持久化格式。

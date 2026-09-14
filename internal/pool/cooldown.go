@@ -35,32 +35,31 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
-		// 非模型级冷却入口：清空 6004 模型豁免痕迹（softRateModel + softRateReset），
-		// 避免上一次模型级限流的 softRateModel 泄漏到本次**账号级**限流上
+		// 非模型级冷却入口：清空 6004 模型级独立冷却表（modelCooldowns），
+		// 避免上一次模型级限流的模型豁免泄漏到本次**账号级**限流上
 		// （否则换模型请求会错误绕过本次冷却）。
-		e.softRateModel = ""
-		e.softRateReset = time.Time{}
+		e.modelCooldowns = nil
 		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
 		p.dirty.Store(true)
 	}
 }
 
 // CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）。
-// 区别于 Cooldown：当上游 6004 明说「将在 … 重置」时，把冷却截止精确设为
-// resetAt（上游给定时间，不再靠固定基数+指数退避猜测），并记录触发模型 softRateModel，
-// 后续该模型被豁免冷却（切模型立即可用，见 healthyForModel）。
+// 区别于 Cooldown：当上游 6004 明说「将在 … 重置」时，把 **该模型** 的冷却截止精确
+// 设为 resetAt（上游给定时间，不再靠固定基数+指数退避猜测），记录到独立的
+// modelCooldowns[model]——每模型独立计时，多个模型同时 6004 互不覆盖（这是单 until
+// 字段做不到的）。不写 until（全账号级冷却不受 6004 污染）。
 //
-// 收窄规则：
-//   - resetAt 非零（6004 带解析时间）→ until = min(resetAt, now+softRateMax)，
-//     softRateModel = model。指数退避**不适用**：重置时间已是上游权威，再指数放大
-//     会无视它明说的恢复时刻（这恰是本 issue 的核心痛点）。
+// 收窄规则（与旧实现一致）：
+//   - resetAt 非零（6004 带解析时间）→ modelCooldowns[model].Until = min(resetAt,
+//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。指数退避
+//     **不适用**：重置时间已是上游权威，再指数放大会无视它明说的恢复时刻。
 //   - resetAt 零值（6004 无时间文案 / 非 6004 的 soft）→ 完全退回 Cooldown 现状
-//     （soft_streak 指数退避 + 封顶 soft_rate_max），softRateModel 保持空（不豁免）。
+//     （soft_streak 指数退避 + 封顶 soft_rate_max，写 until），不记录模型（不豁免）。
 //
 // 熔断信号照旧喂入（冷却与熔断正交，行为与 Cooldown 一致）；softStreak 仍递增
-// （无论是否命中解析时间），single 一致性由 Cooldown 之外的语义保证：解析时间的
-// 冷却**不**参与指数退避，但 softStreak 计数照常累加，后续无时间的 6004 从当前
-// streak 继续退避——与任务书「指数退避逻辑保持不变，只在两个点收窄」的口径一致。
+// （无论是否命中解析时间）——解析时间的冷却**不**参与指数退避，但 softStreak 计数
+// 照常累加，后续无时间的 6004 从当前 streak 继续退避（与任务书口径一致）。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -81,20 +80,24 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				d = time.Millisecond
 			}
 		}
-		e.until = time.Now().Add(d)
 		e.coolKind = CoolSoft
 		e.reason = reason
-		switch {
-		case hasReset:
-			// 带解析时间的 6004：记录触发模型 + 上游原始重置墙钟（issue #36 台账）。
-			// softRateReset 未经 soft_rate_max 截断，until 截断到封顶；台账用 ResetAt
-			// 呈现真实恢复时刻。与 softRateModel 同生同灭（见 statusOf 台账行）。
-			e.softRateModel = model
-			e.softRateReset = resetAt
-		default:
-			// 无解析时间（普通软冷却/非 6004）：不豁免、无台账。
-			e.softRateModel = ""
-			e.softRateReset = time.Time{}
+		if hasReset {
+			// 6004 带解析时间：写该模型的独立冷却表（不写 until）。until 截断到封顶，
+			// ResetAt 保留上游原始墙钟（台账 ResetAt 呈现真实恢复时刻）。
+			now := time.Now()
+			if e.modelCooldowns == nil {
+				e.modelCooldowns = map[string]modelCooldown{}
+			}
+			e.modelCooldowns[model] = modelCooldown{
+				Until:   now.Add(d),
+				ResetAt: resetAt,
+				Reason:  reason,
+			}
+		} else {
+			// 无解析时间（普通软冷却/非 6004）：退回账号级 until 冷却，且清空模型豁免。
+			e.until = time.Now().Add(d)
+			e.modelCooldowns = nil
 		}
 		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
 		p.dirty.Store(true)
@@ -181,8 +184,7 @@ func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
-	e.softRateModel = "" // 冷却域清零时一并清模型豁免痕迹
-	e.softRateReset = time.Time{}
+	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
 }
 
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。

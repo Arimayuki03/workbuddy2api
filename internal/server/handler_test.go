@@ -834,13 +834,17 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
 	}
-	// bad 已进入 soft 冷却，until ≈ reset。
+	// bad 已进入 6004 模型级冷却：模型级台账含 glm-5.3 + 该模型独立截止 ≈ reset。
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling from 6004: %+v", st)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("bad should have glm-5.3 model limit ledger: %+v", st)
 	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~reset=%v (diff %v)", st.Until, reset, d)
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
+	}
+	// 6004 不写账号级 until（模型级独立冷却）。
+	if !st.Until.IsZero() {
+		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
 	}
 	// 记录触发模型（bad 池内 private 字段需经 Status 不可见，改用行为断言）：
 	// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
@@ -1405,7 +1409,7 @@ func TestStatusPortraitFields(t *testing.T) {
 }
 
 // TestStatusRateLimitedModelsLedger end-to-end（issue #36）：上游 429 6004 带
-// 「将在 … 重置」→ 账号 softRateModel 被记录 → /status accounts 输出该模型的
+// 「将在 … 重置」→ 账号 modelCooldowns 被写入 → /status accounts 输出该模型的
 // 限额台账（rate_limited_models[].model + reset_at + until）。
 func TestStatusRateLimitedModelsLedger(t *testing.T) {
 	reset := time.Now().Add(35 * time.Minute)
@@ -1432,8 +1436,8 @@ func TestStatusRateLimitedModelsLedger(t *testing.T) {
 	if !ok {
 		t.Fatal("u1 missing")
 	}
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("u1 应进入 6004 模型级软冷却: %+v", st)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.2" {
+		t.Fatalf("u1 应进入 6004 模型级软冷却（glm-5.2 台账）: %+v", st)
 	}
 
 	statusRec := httptest.NewRecorder()
@@ -1467,8 +1471,12 @@ func TestStatusRateLimitedModelsLedger(t *testing.T) {
 	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("reset_at=%v want ~35m 后=%v", row.ResetAt, reset)
 	}
-	if !row.Until.Equal(su1.Until) {
-		t.Errorf("until=%v want Status.Until=%v", row.Until, su1.Until)
+	// 6004 模型级冷却不写账号级 until：Status.Until 应为零值，模型截止在台账行里。
+	if !su1.Until.IsZero() {
+		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", su1.Until)
+	}
+	if d := row.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("until=%v want ~35m 后=%v", row.Until, reset)
 	}
 	// 未命中测试账号（u2 也被限流）也会带台账——但只断言 u1（被选中的号）即验证端到端。
 }

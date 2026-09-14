@@ -834,24 +834,31 @@ func TestSoftStreakMissingInLegacyStateFile(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCooldownSoftForModelParsedUntil(t *testing.T) {
-	// 6004 msg 带「将在 … 重置」→ until 精确等于解析时间（wall-clock 判断）。
-	// 用未来 5 分钟的时间戳：解析后 until ≈ now+5m，远短于固定 600s 基数的指数退避，
-	// 证明"上游明说重置时间"优先于"600s 起指数退避"。
+	// 6004 msg 带「将在 … 重置」→ modelCooldowns[glm-5.3].Until 精确等于解析时间
+	// （wall-clock 判断）。用未来 5 分钟的时间戳：解析后 ≈ now+5m，远短于固定 600s
+	// 基数的指数退避，证明"上游明说重置时间"优先于"600s 起指数退避"。
 	reset := time.Now().Add(5 * time.Minute)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, ok := p.Status("u1")
-	if !ok || st.CoolKind != "soft_rate" {
-		t.Fatalf("want soft_rate cooling: %+v ok=%v", st, ok)
+	if !ok {
+		t.Fatalf("status missing: %+v", st)
 	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~reset=%v (diff %v)", st.Until, reset, d)
+	// 6004 模型级冷却：账号级 until 不被写（独立模型冷却），台账携带模型截止。
+	if !st.Until.IsZero() {
+		t.Errorf("until=%v 应为零值（6004 不写账号级 until）", st.Until)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("rate_limited_models=%+v want [glm-5.3] 的模型级台账", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
 	}
 }
 
 func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 截断到 soft_rate_max（不无限期拉黑）。
+	// 解析时间超出 soft_rate_max → 模型级冷却 until 截断到 soft_rate_max（不无限期拉黑）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
@@ -859,8 +866,11 @@ func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
 	before := time.Now()
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, _ := p.Status("u1")
-	if st.Until.Sub(before) > 10*time.Minute+time.Second {
-		t.Errorf("until=%v want capped at soft_rate_max=10m", st.Until)
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%+v want 1 行", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(before); d > 10*time.Minute+time.Second {
+		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
 	}
 }
 
@@ -908,7 +918,7 @@ func TestPickExcludingForModelAllowsDifferentModel(t *testing.T) {
 }
 
 // TestCooldownSoftWithoutModelRecordsNone 非 6004 的普通软冷却（resetAt 零值，
-// 不记录 softRateModel）→ 不因模型切换而豁免（现状语义）。
+// 不写 modelCooldowns）→ 退回账号级 until 冷却，不因模型切换而豁免（现状语义）。
 func TestCooldownSoftWithoutModelRecordsNone(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -917,7 +927,7 @@ func TestCooldownSoftWithoutModelRecordsNone(t *testing.T) {
 	p.SetCredits("u2", 1)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "", "429 rate limit")
-	// 冷却中 + 不同 model 请求仍跳过 u1（无 softRateModel，不豁免）。
+	// 冷却中 + 不同 model 请求仍跳过 u1（无模型级冷却条目，不豁免）。
 	got := p.PickExcludingForModel(nil, "hy3-x")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("no model recorded → must not bypass, got %+v", got)
@@ -948,7 +958,7 @@ func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServableNowModelExemptCounts(t *testing.T) {
-	// 单号处于 6004 模型级软冷却（带解析时间、记录 softRateModel）→ 其他模型仍可达，
+	// 单号处于 6004 模型级软冷却（带解析时间、记录 modelCooldowns）→ 其他模型仍可达，
 	// ServableNow 必须为 true（与 chat 的 healthyForModel 放行切模型请求同口径）。
 	// 反向（同模型不可选）已由 TestPickExcludingForModelSkipsSoftCoolingSameModel 覆盖；
 	// 本池无其他候选，同模型选号会走全冷却兜底，不在此重复断言。
@@ -961,7 +971,7 @@ func TestServableNowModelExemptCounts(t *testing.T) {
 }
 
 func TestServableNowPlainSoftNotExempt(t *testing.T) {
-	// 普通软冷却（无 softRateModel，非 6004 模型级）→ 账号级不可用，ServableNow 必须 false。
+	// 普通软冷却（无 modelCooldowns，非 6004 模型级）→ 账号级不可用，ServableNow 必须 false。
 	// 守门：豁免不得从模型级泄漏到普通冷却。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -997,10 +1007,10 @@ func TestServableNowExemptButDisabled(t *testing.T) {
 	}
 }
 
-// TestSoftRateModelClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
-// **非模型级**软冷却（plain Cooldown），softRateModel 必须被清空——否则上次 6004 的
+// TestModelCooldownsClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
+// **非模型级**软冷却（plain Cooldown），modelCooldowns 必须被清空——否则上次 6004 的
 // 模型豁免会泄漏到本次账号级限流上，导致"换模型请求"错误绕过本次冷却。
-func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
+func TestModelCooldownsClearedByPlainCooldown(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -1017,16 +1027,16 @@ func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
 	// 2) 账号恢复后经历普通账号级软冷却（无模型语义）。
 	p.NoteSuccess("u1") // 还原 fresh 状态（Cooldown 会重设 until）
 	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
-	// 3) 换模型请求不得再豁免（softRateModel 已清空）。
+	// 3) 换模型请求不得再豁免（modelCooldowns 已清空）。
 	got := p.PickExcludingForModel(nil, "hy3-x")
 	if got == nil || got.UID != "u2" {
-		t.Fatalf("plain cooldown must clear softRateModel (no bypass), got %+v", got)
+		t.Fatalf("plain cooldown must clear modelCooldowns (no bypass), got %+v", got)
 	}
 }
 
-// TestSoftRateModelNotPersistedToState 新字段 softRateModel 缺省空 = 现状兼容：
+// TestModelCooldownsNotPersistedToState 新字段 modelCooldowns 缺省空 = 现状兼容：
 // 旧 state.json 不写它也能正常加载；落盘不引入该字段（运行态语义，重启即清零）。
-func TestSoftRateModelNotPersistedToState(t *testing.T) {
+func TestModelCooldownsNotPersistedToState(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
@@ -1037,21 +1047,17 @@ func TestSoftRateModelNotPersistedToState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "soft_rate_model") {
-		t.Errorf("state.json should not persist soft_rate_model (runtime-only):\n%s", raw)
+	if strings.Contains(string(raw), "model_cooldowns") || strings.Contains(string(raw), "modelCooldowns") {
+		t.Errorf("state.json should not persist modelCooldowns (runtime-only):\n%s", raw)
 	}
-	// 重载后账号仍在冷却（until 持久化），softRateModel 清零。
+	// 重载后 modelCooldowns 清零（运行态语义，重启退化为账号级冷却现状）。
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
-	st, ok := p2.Status("u1")
-	if !ok || !st.Cooling {
-		t.Fatalf("cooldown should persist after reload: %+v ok=%v", st, ok)
-	}
 	p2.mu.RLock()
-	em := p2.byUID["u1"].softRateModel
+	n := len(p2.byUID["u1"].modelCooldowns)
 	p2.mu.RUnlock()
-	if em != "" {
-		t.Errorf("softRateModel should reset on reload, got %q", em)
+	if n != 0 {
+		t.Errorf("modelCooldowns should reset on reload, found %d entries", n)
 	}
 }
 
@@ -1059,7 +1065,7 @@ func TestSoftRateModelNotPersistedToState(t *testing.T) {
 // issue #36：限额台账——/status 透出仍在限额的模型 + 预计恢复时间
 // ---------------------------------------------------------------------------
 
-// TestRateLimitedModelsInStatus 6004 带解析时间 → softRateModel 被设置 →
+// TestRateLimitedModelsInStatus 6004 带解析时间 → modelCooldowns 被写入 →
 // Status.RateLimitedModels 输出含限流模型 + 冷却截止 + 上游原始重置墙钟。
 func TestRateLimitedModelsInStatus(t *testing.T) {
 	p := New("")
@@ -1081,9 +1087,13 @@ func TestRateLimitedModelsInStatus(t *testing.T) {
 	if row.Reason != "6004 model rate limit" {
 		t.Errorf("reason=%q want 6004 model rate limit", row.Reason)
 	}
-	// Until 应等于（截断后的）冷却截止，与 Status.Until 同值。
-	if !row.Until.Equal(st.Until) {
-		t.Errorf("until=%v want Status.Until=%v", row.Until, st.Until)
+	// 6004 模型级冷却不写账号级 until：st.Until 应为零值，模型截止在台账行里。
+	if !st.Until.IsZero() {
+		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
+	}
+	// row.Until = 该模型的独立冷却截止（≈ reset，35m < soft_rate_max 2h 未截断）。
+	if d := row.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("row.until=%v want ~%v", row.Until, reset)
 	}
 	// ResetAt 是未经 6004 截断的上游重置墙钟（35m < soft_rate_max 2h，因此未被截断）。
 	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
@@ -1105,12 +1115,13 @@ func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
 		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
 	}
 	row := st.RateLimitedModels[0]
-	// until 被截断到封顶（≤ 10m），且与 Status.Until 同值。
-	if !row.Until.Equal(st.Until) {
-		t.Errorf("until=%v want Status.Until=%v", row.Until, st.Until)
+	// row.Until = 该模型的冷却截止（被截断到封顶 ≤ 10m）。
+	if rem := row.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
+		t.Errorf("row.until 应在 (0, 10m] 区间，实际剩余 %v", rem)
 	}
-	if rem := st.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("until 应在 (0, 10m] 区间，实际剩余 %v", rem)
+	// 6004 模型级冷却不写账号级 until：st.Until 为零值。
+	if !st.Until.IsZero() {
+		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
 	}
 	// reset_at 保留原始 2h 墙钟（未被截断）。
 	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
@@ -1145,7 +1156,7 @@ func TestRateLimitedModelsNoLimitZeroRegression(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "ok"})
 	p.Add(&auth.Auth{UID: "plain"})
-	p.Cooldown("plain", CoolSoft, time.Minute, "429 rate limit") // 普通软冷却（无 softRateModel）
+	p.Cooldown("plain", CoolSoft, time.Minute, "429 rate limit") // 普通软冷却（无 modelCooldowns）
 	for _, uid := range []string{"ok", "plain"} {
 		st, ok := p.Status(uid)
 		if !ok {

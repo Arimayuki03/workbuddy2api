@@ -162,6 +162,9 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
+// **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
+// 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
+// 冷却（Cooldown/reviveCoolingLocked）清除。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -387,9 +390,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
 		UID: uid,
-		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空。
-		// 到期判据 = until 未过且 softRateModel 非空；条件满足才输出，随到期自然消失，
-		// 普通软冷却（无 softRateModel）/硬冷却不产生台账（零回归）。
+		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
+		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
+		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
+		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
@@ -422,27 +426,40 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	return st
 }
 
-// rateLimitedModelsLocked 构建单账号的限额台账行。**有效期判据独立**（用 until，不看
-// coolKind/softRateModel 形态）：只要 until 未过就输出台账行，到期即消失——
-// 与 /status 里"还能显示多久"的观感天然一致。调用方必须已持有 p.mu。
+// rateLimitedModelsLocked 构建单账号的限额台账行，从 modelCooldowns 遍历输出——
+// 每模型一行（含该模型的独立 until + 上游原始 resetAt），多模型同时 6004 全部展示。
+// 有效期判据 = 该模型的独立冷却 until 未过；随到期自然消失（与 /status 观感一致）。
+// 无模型级冷却（普通软冷却/硬冷却）→ nil（零回归）。调用方必须已持有 p.mu。
 func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
-	if e.softRateModel == "" {
+	if len(e.modelCooldowns) == 0 {
 		return nil
 	}
-	// 与 healthy 的冷却判据对齐：until 未过才算仍在限额中（issue #36 台账"还在限额"语义）。
-	if e.until.IsZero() || !now.Before(e.until) {
+	// 先排序模型名，保证 /status 输出稳定（map 遍历无序）。
+	models := make([]string, 0, len(e.modelCooldowns))
+	for m := range e.modelCooldowns {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	rows := make([]RateLimitedModel, 0, len(models))
+	for _, m := range models {
+		mc := e.modelCooldowns[m]
+		if !mc.Until.IsZero() && now.Before(mc.Until) {
+			row := RateLimitedModel{
+				Model:  m,
+				Until:  mc.Until,
+				Reason: mc.Reason,
+			}
+			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
+			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+				row.ResetAt = mc.ResetAt
+			}
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 0 {
 		return nil
 	}
-	row := RateLimitedModel{
-		Model:  e.softRateModel,
-		Until:  e.until,
-		Reason: e.reason,
-	}
-	// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-	if !e.softRateReset.IsZero() && !e.softRateReset.Equal(e.until) {
-		row.ResetAt = e.softRateReset
-	}
-	return []RateLimitedModel{row}
+	return rows
 }
 
 // ---------------------------------------------------------------------------
