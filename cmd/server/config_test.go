@@ -289,6 +289,16 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
 	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat enabled defaults want true/true, got %v/%v",
+			c.Schedule.SchoolEnabled, c.Schedule.CatEnabled)
+	}
 }
 
 // TestScheduleLegacyConfigKeepsRunning 老 config（只写签到/保活小时数组，无新键）加载后仍是启用态，
@@ -316,6 +326,15 @@ func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want default [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat switches must default true on legacy config: %+v", c.Schedule)
 	}
 }
 

@@ -67,6 +67,8 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		KeepaliveHours:   []int{22},
 		TravelDisabled:   true,
 		ActivityDisabled: true,
+		SchoolDisabled:   true,
+		CatDisabled:      true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -121,13 +123,15 @@ func TestNextWakeKeepaliveDisabled(t *testing.T) {
 	}
 }
 
-// TestNextWakeBothDisabledNothingScheduled 四类任务都显式禁用 → 无可唤醒时点。
+// TestNextWakeBothDisabledNothingScheduled 六类任务都显式禁用 → 无可唤醒时点。
 func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
+		SchoolDisabled:    true,
+		CatDisabled:       true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 	})
@@ -137,7 +141,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	}
 }
 
-// TestRunAllDisabledNoSpinNoCalls 四类任务全禁用：Run 不空转（只等退出信号），
+// TestRunAllDisabledNoSpinNoCalls 六类任务全禁用：Run 不空转（只等退出信号），
 // 且不能触发任何上游请求。
 func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	var calls atomic.Int32
@@ -161,6 +165,8 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
+		SchoolDisabled:    true,
+		CatDisabled:       true,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -170,7 +176,7 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if calls.Load() != 0 {
-		t.Errorf("upstream calls=%d want 0（四类全禁用）", calls.Load())
+		t.Errorf("upstream calls=%d want 0（六类全禁用）", calls.Load())
 	}
 	if elapsed < 200*time.Millisecond {
 		t.Errorf("Run returned after %v, before ctx done（不应提前返回）", elapsed)

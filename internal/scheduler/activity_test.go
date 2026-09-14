@@ -545,6 +545,8 @@ func TestNextWakeActivityDisabled(t *testing.T) {
 		ActivityHours:    []int{10},
 		ActivityDisabled: true,
 		KeepaliveHours:   []int{22},
+		SchoolDisabled:   true,
+		CatDisabled:      true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -576,13 +578,15 @@ func TestCheckinDisabledTravelStillRuns(t *testing.T) {
 	}
 }
 
-// TestAllFourDisabledNoSpin 四类任务全禁用：Run 不空转。
+// TestAllFourDisabledNoSpin 六类任务全禁用：Run 不空转。
 func TestAllFourDisabledNoSpin(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
+		SchoolDisabled:    true,
+		CatDisabled:       true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},
@@ -590,7 +594,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {
-		t.Errorf("at=%v kinds=%v want zero/nil（四类全禁用）", at, kinds)
+		t.Errorf("at=%v kinds=%v want zero/nil（六类全禁用）", at, kinds)
 	}
 }
 
@@ -626,7 +630,7 @@ func TestRunDispatchesActivityAndTravel(t *testing.T) {
 		ActivityHours:  []int{},
 		KeepaliveHours: []int{},
 	})
-	// 四类全空 hours → nextWake 回落默认 → 会构造 timer，ctx 取消即返回。
+	// 六类全空 hours → nextWake 回落默认 → 会构造 timer，ctx 取消即返回。
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { s.Run(ctx); close(done) }()

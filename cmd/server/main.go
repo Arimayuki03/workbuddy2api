@@ -126,11 +126,15 @@ func main() {
 		TravelHours:         cfg.Schedule.TravelHours,
 		ActivityHours:       cfg.Schedule.ActivityHours,
 		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
+		SchoolHours:         cfg.Schedule.SchoolHours,
+		CatHours:            cfg.Schedule.CatHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
+		CatDisabled:         !cfg.Schedule.CatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -154,6 +158,16 @@ func main() {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
 	} else {
 		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
+	}
+	if !cfg.Schedule.SchoolEnabled {
+		log.Printf("开学季任务已禁用（schedule.school_enabled=false）")
+	} else {
+		log.Printf("开学季任务已启用：%v 点（school_open_day_2026.py ALL --run --yes）", cfg.Schedule.SchoolHours)
+	}
+	if !cfg.Schedule.CatEnabled {
+		log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
+	} else {
+		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
 
 	h := server.NewHandler(server.Config{

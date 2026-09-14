@@ -1,4 +1,4 @@
-// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive 四类独立排程。
+// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 六类独立排程。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
 package scheduler
 
@@ -18,7 +18,7 @@ import (
 
 // Config 调度器依赖。
 //
-// 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
+// 任务开关用「禁用」命名而非「启用」：零值 Config 即六类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
 	Pool           *pool.Pool
@@ -27,6 +27,8 @@ type Config struct {
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
+	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
+	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -40,6 +42,10 @@ type Config struct {
 	ActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
+	// SchoolDisabled 显式关闭开学季任务排程（schedule.school_enabled=false）。
+	SchoolDisabled bool
+	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
+	CatDisabled bool
 }
 
 // Scheduler 调度器。
@@ -68,6 +74,12 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
+	}
+	if len(cfg.SchoolHours) == 0 {
+		cfg.SchoolHours = []int{12}
+	}
+	if len(cfg.CatHours) == 0 {
+		cfg.CatHours = []int{1}
 	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
@@ -125,6 +137,8 @@ const (
 	taskTravel
 	taskActivity
 	taskKeepalive
+	taskSchool
+	taskCat
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -147,6 +161,12 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.KeepaliveDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+	}
+	if !s.cfg.SchoolDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
+	}
+	if !s.cfg.CatDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -174,7 +194,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
-			// 四类任务全部禁用：不空转，只等退出信号。
+			// 六类任务全部禁用：不空转，只等退出信号。
 			<-ctx.Done()
 			return
 		}
@@ -186,18 +206,28 @@ func (s *Scheduler) Run(ctx context.Context) {
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			for _, k := range kinds {
-				switch k {
-				case taskCheckin:
-					s.RunCheckinNow()
-				case taskTravel:
-					s.RunTravelNow()
-				case taskActivity:
-					s.RunActivityNow()
-				case taskKeepalive:
-					s.RunKeepaliveNow()
-				}
+				s.dispatch(k)
 			}
 		}
+	}
+}
+
+// dispatch 按任务类型分发到对应执行函数。脚本类（school/cat）失败只记 WARN、
+// 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
+func (s *Scheduler) dispatch(k taskKind) {
+	switch k {
+	case taskCheckin:
+		s.RunCheckinNow()
+	case taskTravel:
+		s.RunTravelNow()
+	case taskActivity:
+		s.RunActivityNow()
+	case taskKeepalive:
+		s.RunKeepaliveNow()
+	case taskSchool:
+		s.RunSchoolNow()
+	case taskCat:
+		s.RunCatNow()
 	}
 }
 
