@@ -35,9 +35,11 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
-		// 非模型级冷却入口：清空 6004 模型豁免痕迹，避免上一次模型级限流的
-		// softRateModel 泄漏到本次**账号级**限流上（否则换模型请求会错误绕过本次冷却）。
+		// 非模型级冷却入口：清空 6004 模型豁免痕迹（softRateModel + softRateReset），
+		// 避免上一次模型级限流的 softRateModel 泄漏到本次**账号级**限流上
+		// （否则换模型请求会错误绕过本次冷却）。
 		e.softRateModel = ""
+		e.softRateReset = time.Time{}
 		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
 		p.dirty.Store(true)
 	}
@@ -82,10 +84,17 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 		e.until = time.Now().Add(d)
 		e.coolKind = CoolSoft
 		e.reason = reason
-		if hasReset {
-			e.softRateModel = model // 仅带解析时间的 6004 才记录模型（豁免画界）
-		} else {
+		switch {
+		case hasReset:
+			// 带解析时间的 6004：记录触发模型 + 上游原始重置墙钟（issue #36 台账）。
+			// softRateReset 未经 soft_rate_max 截断，until 截断到封顶；台账用 ResetAt
+			// 呈现真实恢复时刻。与 softRateModel 同生同灭（见 statusOf 台账行）。
+			e.softRateModel = model
+			e.softRateReset = resetAt
+		default:
+			// 无解析时间（普通软冷却/非 6004）：不豁免、无台账。
 			e.softRateModel = ""
+			e.softRateReset = time.Time{}
 		}
 		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
 		p.dirty.Store(true)
@@ -173,6 +182,7 @@ func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 	e.reason = ""
 	e.softStreak = 0
 	e.softRateModel = "" // 冷却域清零时一并清模型豁免痕迹
+	e.softRateReset = time.Time{}
 }
 
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。

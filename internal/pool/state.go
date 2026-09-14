@@ -386,22 +386,26 @@ func (p *Pool) List() []Status {
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
-		UID:             uid,
-		Realm:           e.a.Realm(),
-		Nickname:        e.a.Nickname,
-		Credits:         e.credits,
-		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:          e.reason,
-		Disabled:        e.disabled,
-		SuccessCount:    e.successCount,
-		ErrTotal:        e.errTotal,
-		LastSuccessTime: e.lastSuccess,
-		LastErrTime:     e.lastErr,
-		Until:           e.until,
-		SoftStreak:      e.softStreak,
-		InFlight:        int(e.inFlight.Load()),
-		BreakerFails:    e.fails,
-		BreakerUntil:    e.breakerUntil,
+		UID: uid,
+		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空。
+		// 到期判据 = until 未过且 softRateModel 非空；条件满足才输出，随到期自然消失，
+		// 普通软冷却（无 softRateModel）/硬冷却不产生台账（零回归）。
+		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
+		Realm:             e.a.Realm(),
+		Nickname:          e.a.Nickname,
+		Credits:           e.credits,
+		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
+		Reason:            e.reason,
+		Disabled:          e.disabled,
+		SuccessCount:      e.successCount,
+		ErrTotal:          e.errTotal,
+		LastSuccessTime:   e.lastSuccess,
+		LastErrTime:       e.lastErr,
+		Until:             e.until,
+		SoftStreak:        e.softStreak,
+		InFlight:          int(e.inFlight.Load()),
+		BreakerFails:      e.fails,
+		BreakerUntil:      e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -416,6 +420,29 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.CoolKind = e.coolKind.String()
 	}
 	return st
+}
+
+// rateLimitedModelsLocked 构建单账号的限额台账行。**有效期判据独立**（用 until，不看
+// coolKind/softRateModel 形态）：只要 until 未过就输出台账行，到期即消失——
+// 与 /status 里"还能显示多久"的观感天然一致。调用方必须已持有 p.mu。
+func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
+	if e.softRateModel == "" {
+		return nil
+	}
+	// 与 healthy 的冷却判据对齐：until 未过才算仍在限额中（issue #36 台账"还在限额"语义）。
+	if e.until.IsZero() || !now.Before(e.until) {
+		return nil
+	}
+	row := RateLimitedModel{
+		Model:  e.softRateModel,
+		Until:  e.until,
+		Reason: e.reason,
+	}
+	// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
+	if !e.softRateReset.IsZero() && !e.softRateReset.Equal(e.until) {
+		row.ResetAt = e.softRateReset
+	}
+	return []RateLimitedModel{row}
 }
 
 // ---------------------------------------------------------------------------

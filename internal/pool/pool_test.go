@@ -1055,6 +1055,108 @@ func TestSoftRateModelNotPersistedToState(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// issue #36：限额台账——/status 透出仍在限额的模型 + 预计恢复时间
+// ---------------------------------------------------------------------------
+
+// TestRateLimitedModelsInStatus 6004 带解析时间 → softRateModel 被设置 →
+// Status.RateLimitedModels 输出含限流模型 + 冷却截止 + 上游原始重置墙钟。
+func TestRateLimitedModelsInStatus(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(35 * time.Minute)
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatalf("status missing")
+	}
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
+	}
+	row := st.RateLimitedModels[0]
+	if row.Model != "glm-5.3" {
+		t.Errorf("model=%q want glm-5.3", row.Model)
+	}
+	if row.Reason != "6004 model rate limit" {
+		t.Errorf("reason=%q want 6004 model rate limit", row.Reason)
+	}
+	// Until 应等于（截断后的）冷却截止，与 Status.Until 同值。
+	if !row.Until.Equal(st.Until) {
+		t.Errorf("until=%v want Status.Until=%v", row.Until, st.Until)
+	}
+	// ResetAt 是未经 6004 截断的上游重置墙钟（35m < soft_rate_max 2h，因此未被截断）。
+	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("reset_at=%v want ~%v", row.ResetAt, reset)
+	}
+}
+
+// TestRateLimitedModelsRetainsUncappedResetAt soft_rate_max 截断了 until，
+// 但台账必须保留上游未截断的原始重置墙钟（issue #36：运维按真实恢复时刻观察）。
+func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(10 * time.Minute)
+	reset := time.Now().Add(2 * time.Hour) // 远超封顶 10m
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
+
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
+	}
+	row := st.RateLimitedModels[0]
+	// until 被截断到封顶（≤ 10m），且与 Status.Until 同值。
+	if !row.Until.Equal(st.Until) {
+		t.Errorf("until=%v want Status.Until=%v", row.Until, st.Until)
+	}
+	if rem := st.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
+		t.Errorf("until 应在 (0, 10m] 区间，实际剩余 %v", rem)
+	}
+	// reset_at 保留原始 2h 墙钟（未被截断）。
+	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("reset_at=%v want ~2h 后=%v", row.ResetAt, reset)
+	}
+}
+
+// TestRateLimitedModelsExpired 限额到期后台账从 Status 消失（恢复）。
+// 用近未来 30ms 的重置墙钟：初始显示台账，等墙钟过后台账消失 + 账号退出冷却。
+// （带解析时间 6004 的 until 由 resetAt 决定，故等待几百 ms 即可确定性触达过期边界。）
+func TestRateLimitedModelsExpired(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(30 * time.Millisecond)
+	p.CooldownSoftForModel("u1", time.Hour, reset, "glm-5.3", "6004 model rate limit")
+	if st, _ := p.Status("u1"); len(st.RateLimitedModels) != 1 {
+		t.Fatalf("初始应对该模型限额显示台账: %+v", st.RateLimitedModels)
+	}
+	time.Sleep(80 * time.Millisecond) // 越过重置墙钟（until 已过）
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 0 {
+		t.Errorf("到期后台账应消失: %+v", st.RateLimitedModels)
+	}
+	if st.Cooling {
+		t.Errorf("到期后账号应退出冷却: %+v", st)
+	}
+}
+
+// TestRateLimitedModelsNoLimitZeroRegression 未限流 / 普通软冷却账号零回归：
+// RateLimitedModels 必须为空（nil），不产生台账行。
+func TestRateLimitedModelsNoLimitZeroRegression(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "ok"})
+	p.Add(&auth.Auth{UID: "plain"})
+	p.Cooldown("plain", CoolSoft, time.Minute, "429 rate limit") // 普通软冷却（无 softRateModel）
+	for _, uid := range []string{"ok", "plain"} {
+		st, ok := p.Status(uid)
+		if !ok {
+			t.Fatalf("status(%s) missing", uid)
+		}
+		if len(st.RateLimitedModels) != 0 {
+			t.Errorf("uid=%s rate_limited_models=%v want 空（零回归）", uid, st.RateLimitedModels)
+		}
+	}
+}
+
 func TestList(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1", Nickname: "nick1"})

@@ -1345,6 +1345,75 @@ func TestStatusPortraitFields(t *testing.T) {
 	}
 }
 
+// TestStatusRateLimitedModelsLedger end-to-end（issue #36）：上游 429 6004 带
+// 「将在 … 重置」→ 账号 softRateModel 被记录 → /status accounts 输出该模型的
+// 限额台账（rate_limited_models[].model + reset_at + until）。
+func TestStatusRateLimitedModelsLedger(t *testing.T) {
+	reset := time.Now().Add(35 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	body := `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, body, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at", ExpiresAt: 9999999999},
+	)
+	const soft = 600 * time.Second
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	// 双号都被 6004 → 全部换完仍 503（无健康号），但换号过程已把 u1 冷却。
+	if rec.Code != 503 {
+		t.Fatalf("code=%d want 503 body=%s", rec.Code, rec.Body)
+	}
+	// u1 被选中过（已冷却 + 有台账）。
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 missing")
+	}
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("u1 应进入 6004 模型级软冷却: %+v", st)
+	}
+
+	statusRec := httptest.NewRecorder()
+	h.ServeHTTP(statusRec, httptest.NewRequest("GET", "/status", nil))
+	if statusRec.Code != 200 {
+		t.Fatalf("status code=%d body=%s", statusRec.Code, statusRec.Body)
+	}
+	var sbody struct {
+		Accounts []pool.Status `json:"accounts"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &sbody); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	var su1 *pool.Status
+	for i := range sbody.Accounts {
+		if sbody.Accounts[i].UID == "u1" {
+			su1 = &sbody.Accounts[i]
+			break
+		}
+	}
+	if su1 == nil {
+		t.Fatal("u1 不在 /status accounts 里")
+	}
+	if len(su1.RateLimitedModels) != 1 {
+		t.Fatalf("u1 rate_limited_models=%v want 1 行", su1.RateLimitedModels)
+	}
+	row := su1.RateLimitedModels[0]
+	if row.Model != "glm-5.2" {
+		t.Errorf("model=%q want glm-5.2", row.Model)
+	}
+	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("reset_at=%v want ~35m 后=%v", row.ResetAt, reset)
+	}
+	if !row.Until.Equal(su1.Until) {
+		t.Errorf("until=%v want Status.Until=%v", row.Until, su1.Until)
+	}
+	// 未命中测试账号（u2 也被限流）也会带台账——但只断言 u1（被选中的号）即验证端到端。
+}
+
 // TestHealthzEmptyPool 空池（healthy=0）→ 503，表示暂不可服务。
 func TestHealthzEmptyPool(t *testing.T) {
 	h := NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New()})

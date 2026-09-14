@@ -27,27 +27,44 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID             string    `json:"uid"`
-	Realm           string    `json:"realm,omitempty"`
-	Nickname        string    `json:"nickname,omitempty"`
-	Credits         int64     `json:"credits"`
-	Cooling         bool      `json:"cooling"`
-	CoolKind        string    `json:"cool_kind,omitempty"`
-	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
-	Until           time.Time `json:"until,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
-	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
-	Disabled        bool      `json:"disabled"`
-	DisabledReason  string    `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
-	SuccessCount    int64     `json:"success_count,omitempty"`
-	ErrTotal        int64     `json:"err_total,omitempty"`
-	LastSuccessTime time.Time `json:"last_success,omitempty"`
-	LastErrTime     time.Time `json:"last_err,omitempty"`
+	UID           string    `json:"uid"`
+	Realm         string    `json:"realm,omitempty"`
+	Nickname      string    `json:"nickname,omitempty"`
+	Credits       int64     `json:"credits"`
+	Cooling       bool      `json:"cooling"`
+	CoolKind      string    `json:"cool_kind,omitempty"`
+	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
+	Until         time.Time `json:"until,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
+	// 仅「带解析时间 6004」触发的模型级软冷却仍生效时非空（softRateModel 非空且未到期）；
+	// 运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
+	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+	Disabled          bool               `json:"disabled"`
+	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	SuccessCount      int64              `json:"success_count,omitempty"`
+	ErrTotal          int64              `json:"err_total,omitempty"`
+	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
+	LastErrTime       time.Time          `json:"last_err,omitempty"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
+
+// RateLimitedModel 单个被限流模型的台账行（issue #36）。
+type RateLimitedModel struct {
+	Model string `json:"model"`
+	// Until 冷却到期时刻 = entry.until 截断后的下游可挑选截止（与 Status.Until 同值）。
+	Until time.Time `json:"until,omitempty"`
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断，跟 softRateReset）；
+	// 截断后 Until==ResetAt，省略 ResetAt 让台账自然减少一列。
+	ResetAt time.Time `json:"reset_at,omitempty"`
+	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
+	Reason string `json:"reason,omitempty"`
+}
+
 type entry struct {
 	a            *auth.Auth
 	credits      int64
@@ -75,6 +92,11 @@ type entry struct {
 	// 仅当冷却由「带解析时间的 6004」触发时记录；空 = 普通软冷却（不豁免）。
 	// 运行态语义（不持久化）：重启清零，退化为现状。
 	softRateModel string
+	// softRateReset 上游「将在 … 重置」解析出的原始墙钟（与 softRateModel 同生同灭）。
+	// 与 until 的区别：until 可能被 soft_rate_max 截断，本字段记录未经截断的上游权威
+	// 重置时刻（issue #36 限额台账，运维按真实恢复时刻观察）。零值 = 无上游重置信息。
+	// 运行态语义（不持久化），重启清零。
+	softRateReset time.Time
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
 	// 运行态语义（不持久化，与 inFlight 同语义）：重启清零可接受——重启后首个 keepalive
