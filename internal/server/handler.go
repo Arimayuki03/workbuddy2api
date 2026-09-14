@@ -39,7 +39,7 @@ type Config struct {
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
-	// PromptMode "custom"（网关用自有提示词替换 system）/ "passthrough"（透传）。
+	// PromptMode "passthrough"（默认，透传客户端原始 system）/ "custom"（网关替换）。
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
@@ -81,7 +81,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	if cfg.PromptMode == "" {
-		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
+		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB

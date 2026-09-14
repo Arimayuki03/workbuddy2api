@@ -97,8 +97,8 @@ type Config struct {
 	} `json:"features"`
 
 	Prompt struct {
-		// Mode custom（默认）= 网关用自有系统提示词替换客户端 system/developer；
-		// passthrough = 透传客户端原始 system（降级重试仍会切到 Degraded）。
+		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
+		// custom = 网关用自有系统提示词替换客户端 system/developer（显式配置仍可覆盖回替换）。
 		Mode string `json:"mode"` // "custom" / "passthrough"
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
@@ -167,7 +167,7 @@ func Default() *Config {
 	// 显式 client_name="SaaS" 还原旧行为。
 	c.Upstream.ClientName = "WorkBuddy"
 	c.Features.SanitizeBlacklistFingerprints = true
-	c.Prompt.Mode = "custom" // 缺省 custom：网关自有提示词从源头消灭 system 指纹误报
+	c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system；显式配置 custom 仍可覆盖回替换
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -355,10 +355,10 @@ func (c *Config) normalize() error {
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
-	case "", "custom":
+	case "", "passthrough":
+		c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system
+	case "custom":
 		c.Prompt.Mode = "custom"
-	case "passthrough":
-		c.Prompt.Mode = "passthrough"
 	default:
 		return fmt.Errorf("prompt.mode: %q 不是合法值（custom / passthrough）", c.Prompt.Mode)
 	}

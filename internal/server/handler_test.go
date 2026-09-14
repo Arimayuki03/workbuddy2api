@@ -2070,3 +2070,63 @@ func TestHealthzRealmServable(t *testing.T) {
 		t.Errorf("realm_servable.global=%v want false", resp.RealmServable["global"])
 	}
 }
+
+// TestNewHandlerPromptDefaultPassthrough 端到端：未注入 PromptMode 时兜底为 passthrough——
+// 客户端原始 system 原样透传（出站 body 中 system 内容逐字保留，网关不注入自有提示词）。
+func TestNewHandlerPromptDefaultPassthrough(t *testing.T) {
+	var sentBody []byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			sentBody = raw
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 PromptMode（缺省 passthrough）
+
+	const sys = "You are a helpful assistant in a test harness."
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"glm-5.2",
+		"stream":true,
+		"messages":[
+			{"role":"system","content":"`+sys+`"},
+			{"role":"user","content":"hello"}
+		]
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	out := string(sentBody)
+	if !strings.Contains(out, sys) {
+		t.Errorf("default passthrough should keep client system verbatim: %s", out)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(sentBody, &obj); err != nil {
+		t.Fatalf("out body not json: %v %s", err, out)
+	}
+	msgs, _ := obj["messages"].([]any)
+	if len(msgs) < 2 {
+		t.Fatalf("expected >=2 messages (system kept + user kept), got %d: %s", len(msgs), out)
+	}
+	sysCount := 0
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		if mm["role"] == "system" {
+			sysCount++
+			if mm["content"] != sys {
+				t.Errorf("system content=%v want %q (no rewrite in default mode)", mm["content"], sys)
+			}
+		}
+	}
+	if sysCount != 1 {
+		t.Errorf("system count=%d want 1 (passthrough keeps client system exactly once)", sysCount)
+	}
+}
