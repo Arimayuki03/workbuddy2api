@@ -403,6 +403,49 @@ func TestStreamNormalizesFrames(t *testing.T) {
 	}
 }
 
+// TestStreamFirstIdPassthrough 帧混合（首帧有 id / 中间帧无 id / 空串 id）：输出每帧 id
+// 必须连续一致（取首帧真实值），不再一律 chatcmpl-wb2api（issue #35 后台聚合：透传流里
+// 每帧同 id 才能按消息归并）。
+func TestStreamFirstIdPassthrough(t *testing.T) {
+	raw := "data: {\"id\":\"chatcmpl-upstream-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
+		// 中间帧无 id：应复用首帧 id。
+		"data: {\"object\":\"chat.completion.chunk\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n" +
+		// 中间帧 id 为空串：同样复用首帧 id。
+		"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("frames=%d want 3", len(frames))
+	}
+	for i, fr := range frames {
+		if got := fr["id"]; got != "chatcmpl-upstream-9" {
+			t.Errorf("frame %d id=%v want chatcmpl-upstream-9 (首帧真实 id 续传)", i, got)
+		}
+	}
+}
+
+// TestStreamNoIdFallsBackToSentinel 全流无任何真实 id → 兜底 chatcmpl-wb2api
+// （整流无 id 时的既有哨兵，帧与帧之间仍一惯性存在）。
+func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
+	raw := "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{}," +
+		"\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	frames, _ := streamFrames(t, raw)
+	if len(frames) != 2 {
+		t.Fatalf("frames=%d want 2", len(frames))
+	}
+	for i, fr := range frames {
+		if got := fr["id"]; got != "chatcmpl-wb2api" {
+			t.Errorf("frame %d id=%v want sentinel chatcmpl-wb2api (无真实 id)", i, got)
+		}
+	}
+}
+
 func TestStreamDoneFallback(t *testing.T) {
 	// 上游流在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
 	rec := httptest.NewRecorder()

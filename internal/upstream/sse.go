@@ -341,6 +341,11 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	// 供逐 chunk 透传时回填被上游清空的 name（hawklithm/workbuddy2api issue#2）。
 	toolCallNames := map[int]string{}
 
+	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
+	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
+	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
+	firstID := ""
+
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
 	writeFrame := func(payload string) (int, error) {
@@ -349,6 +354,17 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		if json.Unmarshal([]byte(payload), &obj) == nil {
 			// 先按 index 回填 tool_calls name（上游后续 chunk 常缺省/置空），再规范化透传。
 			backfillToolCallNames(obj, toolCallNames)
+			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
+			// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
+			if firstID == "" {
+				if v, ok := obj["id"].(string); ok && v != "" {
+					firstID = v
+				}
+			} else {
+				if v, ok := obj["id"].(string); !ok || v == "" {
+					obj["id"] = firstID
+				}
+			}
 			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
 				payload = string(raw)
 			}
