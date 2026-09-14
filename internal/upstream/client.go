@@ -61,6 +61,61 @@ func (k ErrKind) String() string {
 	}
 }
 
+// matchMode 描述错误分类 marker 的匹配通道。6 组词表 + 文案分类共用同一匹配器，
+// 消除「小写 Contains + 原文 Contains 双通道」在 Classification 各分支的手写循环重复。
+type matchMode uint8
+
+const (
+	// matchFold 大小写不敏感：lower(body) 含 lower(pat) 或 body 原字串含 pat。
+	// 双通道与历史手写循环逐字等价（小写比较 + 中文原文比较）。
+	matchFold matchMode = iota
+	// matchExact 大小写敏感的字面包含。
+	matchExact
+	// matchLower 在 lower(body) 上做包含匹配（pat 须已小写）。
+	matchLower
+)
+
+// errorRule 一条错误分类规则：命中 patterns 中任一 marker 即归类为 kind。
+type errorRule struct {
+	kind     ErrKind
+	mode     matchMode
+	patterns []string
+}
+
+// matchPattern 报告 body 是否命中单个 marker pattern。
+func matchPattern(p string, mode matchMode, body, lower string) bool {
+	switch mode {
+	case matchFold:
+		return strings.Contains(lower, strings.ToLower(p)) || strings.Contains(body, p)
+	case matchExact:
+		return strings.Contains(body, p)
+	case matchLower:
+		return strings.Contains(lower, p)
+	default:
+		return false
+	}
+}
+
+// hit 报告 rule 是否命中 body（任一 marker 命中即真）。
+func (r errorRule) hit(body, lower string) bool {
+	for _, p := range r.patterns {
+		if matchPattern(p, r.mode, body, lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstHit 返回第一条命中的 marker 原文（供「哪个词命中」的场景）；无命中返回 ""。
+func (r errorRule) firstHit(body, lower string) string {
+	for _, p := range r.patterns {
+		if matchPattern(p, r.mode, body, lower) {
+			return p
+		}
+	}
+	return ""
+}
+
 // Error 带分类的上游错误。
 type Error struct {
 	Kind   ErrKind
@@ -72,15 +127,15 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
 }
 
-// hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
-var hardMarkers = []string{
+// hardRule 余额不足关键词（大小写不敏感 + 中文原文双通道）。
+var hardRule = errorRule{kind: ErrHardCredit, mode: matchFold, patterns: []string{
 	"insufficient credit", "no credit", "credit exhausted", "out of credit",
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
-}
+}}
 
-// softRateMarkers 限流/节流关键词（小写比较 + 中文原文比较双通道）。
+// softRateRule 限流/节流关键词（小写比较 + 中文原文比较双通道）。
 // 上游在状态码非 429 时也会返回限流语义（如 200 + code 11140
 // "The model provider is rate-limiting requests."、400 + "rate limit"），
 // 此类响应若不识别，账号既不被冷却也不喂熔断，下次请求仍会被选中（issue #28）。
@@ -89,7 +144,7 @@ var hardMarkers = []string{
 // 连字符形式（rate-limiting / rate-limited）需单列——Contains 不跨 '-'。
 // "too many" 会命中 "too many tokens" 这类客户端参数错误，代价是该号被软冷却
 // 一个 SoftCooldown（默认 60s）后自愈，远小于漏判限流导致反复选中同一号的代价。
-var softRateMarkers = []string{
+var softRateRule = errorRule{kind: ErrSoftRate, mode: matchFold, patterns: []string{
 	"rate limit", // rate limit / rate limits / rate limiting
 	"rate-limiting",
 	"rate-limited",
@@ -97,21 +152,21 @@ var softRateMarkers = []string{
 	"too many",
 	"usage limit", // usage limit reached / model usage limit exceeded（用量节流，非计费余额）
 	"请求过于频繁", "限流",
-}
+}}
 
-var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
+var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns: []string{"Offline user session not found", "12153"}}
 
-// contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
+// contentBlockedRule 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
 // 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
 // 注入指令）触发 HTTP 400 + 以下文案。这是「误报」（合法流量被审核误杀），
 // 非账号问题——该账号余额健康、未限流、session 未死，故 ErrContentBlocked
 // 在 applyErrorPolicy 中不罚账号（无冷却/熔断/NoteError），改由网关降级重试。
-var contentBlockedMarkers = []string{
+var contentBlockedRule = errorRule{kind: ErrContentBlocked, mode: matchLower, patterns: []string{
 	"blocked by security policy",
 	"unapproved channel",
 	"illegal api invocation",
-}
+}}
 
 // contentBlockedClientMsg 内容拦截返回给调用方的固定文案。
 // [关键词] 填分类词（色情 / nsfw / 暴力 等），绝不填业务 code、账号、冷却、upstream 前缀。
@@ -146,25 +201,27 @@ func contentBlockedKeyword(body string) string {
 	}
 	lower := strings.ToLower(text)
 	for _, kw := range contentBlockedKeywords {
-		if strings.Contains(lower, strings.ToLower(kw)) {
+		if strings.Contains(lower, kw) {
 			return kw
 		}
 	}
 	return contentBlockedFallbackKeyword
 }
 
-// badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
+// badParamsRule 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
-var badParamsMarkerMsg = "Unmarshal chat params failed"
-var badParamsMarkerCode = `"code":11101`
+var badParamsRule = errorRule{kind: ErrBadParams, mode: matchExact, patterns: []string{
+	"Unmarshal chat params failed",
+	`"code":11101`,
+}}
 
-// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
+// alreadyCheckinRule "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
-var alreadyCheckinMarkers = []string{"已签到", "already"}
+var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签到", "already"}}
 
-// accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
+// accountFaultRule 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
 // 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
@@ -175,14 +232,14 @@ var alreadyCheckinMarkers = []string{"已签到", "already"}
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
 // 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateMarkers
+// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateRule
 // 先命中）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案），
 // 120 与 private 均落同一分类。14017 文案唯一（无软限流歧义），可安全收录。
-var accountFaultMarkers = []string{
+var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, patterns: []string{
 	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
-}
+}}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -235,20 +292,20 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
-//  1. 402 / hardMarkers —— 计费额度耗尽，最严、最不可自愈，必须最先判。
+//  1. 402 / hardRule —— 计费额度耗尽，最严、最不可自愈，必须最先判。
 //     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
 //     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
-//  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
+//  2. sessionDeadRule —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
 //     比限流层的大范围子串更具体，具体优先于宽泛。
-//  3. accountFaultMarkers —— 账号级授权/配额故障（11140 request illegal auth 风控、
+//  3. accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
 //     先于 softRate/status429 判定：14017 常带 429 状态码，若落到 status==429 兜底
 //     会误归 soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
-//     落到 softRateMarkers 层，不受影响。
-//  4. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     落到 softRateRule 层，不受影响。
+//  4. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
 //     结果同为 soft_rate，与下一层一致。
 //  5. status==429 —— body 无文案时的兜底识别。
@@ -258,25 +315,17 @@ func Classify(status int, body string) ErrKind {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrHardCredit
-		}
+	if hardRule.hit(body, lower) {
+		return ErrHardCredit
 	}
-	for _, m := range sessionDeadMarkers {
-		if strings.Contains(body, m) {
-			return ErrSessionDead
-		}
+	if sessionDeadRule.hit(body, lower) {
+		return ErrSessionDead
 	}
-	for _, m := range accountFaultMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrAccountFault
-		}
+	if accountFaultRule.hit(body, lower) {
+		return ErrAccountFault
 	}
-	for _, m := range softRateMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrSoftRate
-		}
+	if softRateRule.hit(body, lower) {
+		return ErrSoftRate
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
@@ -289,23 +338,21 @@ func Classify(status int, body string) ErrKind {
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
+	// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+	// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
+	// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
+	// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
+	// 模型权限，值得再试一次）。
 	if status >= 400 {
-		for _, m := range contentBlockedMarkers {
-			if strings.Contains(lower, m) {
-				return ErrContentBlocked
-			}
+		if contentBlockedRule.hit(body, lower) {
+			return ErrContentBlocked
 		}
-		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
-		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
-		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-		// 模型权限，值得再试一次）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		if badParamsRule.hit(body, lower) {
 			return ErrBadParams
 		}
 		return ErrClient
 	}
-	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
+	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardRule 捕获。
 	return ErrNone
 }
 
@@ -1099,12 +1146,7 @@ func IsAlreadyCheckin(err error) bool {
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
-		}
-	}
-	return false
+	return alreadyCheckinRule.hit(ue.Msg, strings.ToLower(ue.Msg))
 }
 
 // UsageRec 一条积分消耗明细（按请求）。
