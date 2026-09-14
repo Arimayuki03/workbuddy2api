@@ -383,6 +383,11 @@ type Client struct {
 	effortsMu sync.RWMutex
 	efforts   map[string]map[string][]string
 
+	// defaultEfforts 缓存各模型 reasoning.defaultEffort（FetchModels 刷新），供
+	// thinking.go 补档：缺显式 effort 时优先用模型声明默认档，空串回退硬编码 high。
+	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
+	defaultEfforts map[string]map[string]string
+
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
@@ -514,7 +519,8 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
 // body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
-	body = PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(realm))
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints,
+		c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm))
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -530,6 +536,22 @@ func (c *Client) effortsSnapshot(realm string) map[string][]string {
 		return nil
 	}
 	cp := make(map[string][]string, len(bucket))
+	for k, v := range bucket {
+		cp[k] = v
+	}
+	return cp
+}
+
+// defaultEffortsSnapshot 返回指定 realm 的模型 defaultEffort 缓存副本；
+// 该域无探测或无声明默认档 → nil（thinking.go 回退硬编码 high）。
+func (c *Client) defaultEffortsSnapshot(realm string) map[string]string {
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	bucket, ok := c.defaultEfforts[realmKey(realm)]
+	if !ok || len(bucket) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(bucket))
 	for k, v := range bucket {
 		cp[k] = v
 	}
@@ -939,12 +961,16 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
 	cache := make(map[string][]string, len(out))
+	defCache := make(map[string]string, len(out))
 	for _, mi := range out {
 		if len(mi.Efforts) > 0 {
 			cache[mi.ID] = mi.Efforts
 		}
+		if mi.DefaultEffort != "" {
+			defCache[mi.ID] = mi.DefaultEffort
+		}
 	}
-	if len(cache) == 0 {
+	if len(cache) == 0 && len(defCache) == 0 {
 		return out, nil
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
@@ -952,7 +978,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if c.efforts == nil {
 		c.efforts = make(map[string]map[string][]string)
 	}
+	if c.defaultEfforts == nil {
+		c.defaultEfforts = make(map[string]map[string]string)
+	}
 	c.efforts[realmKey(a.Realm())] = cache
+	c.defaultEfforts[realmKey(a.Realm())] = defCache
 	c.effortsMu.Unlock()
 	return out, nil
 }
