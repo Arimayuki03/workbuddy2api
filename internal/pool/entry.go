@@ -172,15 +172,20 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if e.disabled {
+	// 优先级：全账号冷却 > 模型独立冷却。
+	// 全账号冷却（disabled/until/breakerUntil）了就不必再查模型级——该账号整体不可用。
+	if !e.healthy(now) {
+		// 全账号未冷却时不会走到这；若账号级 healthy 但该模型有 6004 独立冷却，下面再判。
+		// 但 healthy 已包含 disabled 判定，所以这里不会再走到模型冷却。
+		// 特殊豁免：全账号 until 冷却但由 6004 触发（旧 modelExempt 语义）时，
+		// 其他模型仍可用——但现在 6004 不再写 until，所以不存在这种豁免。
 		return false
 	}
+	// 账号级健康 → 查该模型是否有 6004 独立冷却。
 	if e.modelCooled(now, reqModel) {
-		// 该模型在 6004 独立冷却中 → 不可选。
 		return false
 	}
-	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
-	return e.healthy(now)
+	return true
 }
 
 // pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
