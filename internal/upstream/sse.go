@@ -198,12 +198,22 @@ func sortInts(a []int) {
 	}
 }
 
-// backfillToolCallNames 维护跨帧的 tool_calls name 缓存并回填：
-// 上游流式分片中，首 chunk 带 function.name，后续 chunk 常缺省或置空 ""，
-// 逐 chunk 消费的客户端会把工具名清空导致 tool call 卡死（hawklithm/workbuddy2api issue#2）。
-// 按 delta.tool_calls 的 index 缓存首现的非空 name，后续分片缺 name 时回填；
-// 只动 tool_calls 的 function.name 字段，其余透传不变。
-func backfillToolCallNames(obj map[string]any, names map[int]string) {
+// stripToolCallNames 收敛流式 tool_calls 的 name 语义为「每个 index 只出现一次」：
+// 首片保留 function.name，同一 index 后续分片里的 name 键一律删除（无论上游是
+// 空串还是重复非空串）。这是 OpenAI 官方流的真实形态——首帧带 name，后续帧只带
+// arguments 片段、不再出现 name 键——因此是累加型与覆盖型客户端的共同祖先行为。
+//
+// 两类消费模型在该形态下同时正确：
+//   - 累加型（官方 WorkBuddy/CodeBuddy `name += tc_function?.name || ""`）：
+//     后续分片 name 键缺失 → 追加空串，累积 name 保持唯一，不再拼成 Bash×帧数（issue #82）。
+//   - 覆盖型（hawklithm#2 / Grok Build `name ?? state.name` 或 `if (name) state.name = name`）：
+//     后续分片 name 键缺失 → 保留已建好的首帧 name，不被空串意外清空。
+//     键缺失是比空串更安全的形态：`??` 与 truthy 守卫对缺失键必然保留旧值，
+//     而对空串，`??` 会误判为重设并清空工具名。
+//
+// seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
+// 只动 function.name 键，id/type/arguments 原样透传。
+func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
@@ -224,26 +234,16 @@ func backfillToolCallNames(obj map[string]any, names map[int]string) {
 			if v, ok := tc["index"].(float64); ok {
 				idx = int(v)
 			}
-			fn, _ := tc["function"].(map[string]any)
-			name := ""
-			if fn != nil {
-				if v, ok := fn["name"].(string); ok {
-					name = v
+			if seen[idx] {
+				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
+				if fn, _ := tc["function"].(map[string]any); fn != nil {
+					delete(fn, "name")
 				}
-			}
-			if name != "" {
-				// 缓存：后续分片以本次为准（覆盖旧值，允许上游中途改名）。
-				names[idx] = name
 				continue
 			}
-			// 缺/空 name：从缓存回填（首现分片已缓存，这里命中同 index 的后续分片）。
-			if cached, ok := names[idx]; ok {
-				if fn == nil {
-					fn = map[string]any{}
-					tc["function"] = fn
-				}
-				fn["name"] = cached
-			}
+			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
+			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
+			seen[idx] = true
 		}
 	}
 }
@@ -337,9 +337,9 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
-	// toolCallNames 跨帧维护 delta.tool_calls[index] → function.name，
-	// 供逐 chunk 透传时回填被上游清空的 name（hawklithm/workbuddy2api issue#2）。
-	toolCallNames := map[int]string{}
+	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
+	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
+	toolCallSeen := map[int]bool{}
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
@@ -352,8 +352,8 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		var obj map[string]any
 		valid := 0
 		if json.Unmarshal([]byte(payload), &obj) == nil {
-			// 先按 index 回填 tool_calls name（上游后续 chunk 常缺省/置空），再规范化透传。
-			backfillToolCallNames(obj, toolCallNames)
+			// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
+			stripToolCallNames(obj, toolCallSeen)
 			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
 			// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
 			if firstID == "" {

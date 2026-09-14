@@ -148,10 +148,10 @@ data: [DONE]
 	}
 }
 
-// TestBackfillToolCallNames 直测跨帧 name 缓存：首 chunk 带 name 时建缓存，
-// 后续 chunk 缺省/置空 name 时从缓存回填（hawklithm/workbuddy2api issue#2）。
-func TestBackfillToolCallNames(t *testing.T) {
-	mkFrame := func(name, args string) map[string]any {
+// TestStripToolCallNames 直测跨帧 name 收敛：首片保留 name、同 index 后续分片删除
+// name 键（空串或重复非空串都删），不同 index 互不串扰，非 tool_calls 帧零影响。
+func TestStripToolCallNames(t *testing.T) {
+	mkFrame := func(idx float64, name, args string) map[string]any {
 		fn := map[string]any{}
 		if name != "" {
 			fn["name"] = name
@@ -161,110 +161,218 @@ func TestBackfillToolCallNames(t *testing.T) {
 		}
 		return map[string]any{"choices": []any{
 			map[string]any{"delta": map[string]any{"tool_calls": []any{
-				map[string]any{"index": 0.0, "function": fn},
+				map[string]any{"index": idx, "function": fn},
 			}}},
 		}}
 	}
-	names := map[int]string{}
-
-	// 首 chunk 带 name：缓存建好
-	f0 := mkFrame("lookup", "")
-	backfillToolCallNames(f0, names)
-	if names[0] != "lookup" {
-		t.Fatalf("cache after first chunk=%v want lookup", names)
+	getFn := func(f map[string]any) map[string]any {
+		return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	}
+	seen := map[int]bool{}
 
-	// 后续 chunk name 为空串：回填 "lookup"
-	f1 := mkFrame("", `{"term":"x"}`)
-	backfillToolCallNames(f1, names)
-	fn1 := f1["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	if fn1["name"] != "lookup" {
-		t.Errorf("empty name not backfilled: %v", fn1["name"])
+	// 首片带 name：保留，seen 建立
+	f0 := mkFrame(0, "lookup", "")
+	stripToolCallNames(f0, seen)
+	if !seen[0] {
+		t.Fatal("index 0 should be marked seen after first chunk")
+	}
+	if getFn(f0)["name"] != "lookup" {
+		t.Errorf("first chunk name=%v want lookup", getFn(f0)["name"])
 	}
 
-	// 后续 chunk 缺省 name（function 仅 arguments）：同样回填
-	f2 := map[string]any{"choices": []any{
-		map[string]any{"delta": map[string]any{"tool_calls": []any{
-			map[string]any{"index": 0.0, "function": map[string]any{"arguments": "y"}},
-		}}},
-	}}
-	backfillToolCallNames(f2, names)
-	fn2 := f2["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	if fn2["name"] != "lookup" {
-		t.Errorf("missing name not backfilled: %v", fn2["name"])
+	// 后续 chunk name 为空串：删除 name 键
+	f1 := mkFrame(0, "", `{"term":"x"}`)
+	stripToolCallNames(f1, seen)
+	if _, ok := getFn(f1)["name"]; ok {
+		t.Errorf("subsequent empty name should be stripped: %#v", getFn(f1))
+	}
+	if getFn(f1)["arguments"] != `{"term":"x"}` {
+		t.Errorf("arguments altered: %#v", getFn(f1)["arguments"])
 	}
 
-	// 不同 index 互不串扰
-	f3 := map[string]any{"choices": []any{
-		map[string]any{"delta": map[string]any{"tool_calls": []any{
-			map[string]any{"index": 1.0, "function": map[string]any{}},
-		}}},
-	}}
-	backfillToolCallNames(f3, names)
-	if _, ok := names[1]; ok {
-		t.Error("index 1 should not get a cached name")
+	// 后续 chunk 重复非空 name（上游噪声）：同样删除，arguments 原样
+	f2 := mkFrame(0, "lookup", "y")
+	stripToolCallNames(f2, seen)
+	if _, ok := getFn(f2)["name"]; ok {
+		t.Errorf("subsequent duplicate non-empty name should be stripped: %#v", getFn(f2))
 	}
-	f3call := f3["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
-	if _, hasFn := f3call["function"]; !hasFn {
-		t.Error("index 1 with no cache should leave function empty (no phantom name)")
+	if getFn(f2)["arguments"] != "y" {
+		t.Errorf("arguments altered: %#v", getFn(f2)["arguments"])
 	}
 
-	// 无缓存未命中：原帧原样不动
-	names2 := map[int]string{}
-	f4 := mkFrame("", `{"z":"1"}`)
-	backfillToolCallNames(f4, names2)
-	if json, _ := json.Marshal(f4); strings.Contains(string(json), "name") {
-		t.Errorf("uncached frame should not gain a name: %s", json)
+	// 不同 index 互不串扰：index 1 首片保留 name
+	f3 := mkFrame(1, "other", "")
+	stripToolCallNames(f3, seen)
+	if getFn(f3)["name"] != "other" {
+		t.Errorf("index 1 first name=%v want other", getFn(f3)["name"])
 	}
+	if !seen[1] {
+		t.Error("index 1 should be marked seen")
+	}
+
 	// 非 tool_calls 帧（content only）零影响
-	f5 := map[string]any{"choices": []any{
+	f4 := map[string]any{"choices": []any{
 		map[string]any{"delta": map[string]any{"content": "hi"}},
 	}}
-	backfillToolCallNames(f5, names)
-	if got := f5["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any); len(got) != 1 || got["content"] != "hi" {
+	stripToolCallNames(f4, seen)
+	if got := f4["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any); len(got) != 1 || got["content"] != "hi" {
 		t.Errorf("content-only frame altered: %#v", got)
 	}
 }
 
-// TestStreamBackfillsToolCallName 端到端：SSE 流首 chunk 带 name，后续 chunk name 被置空，
-// 逐帧透传后每个工具分片都必须回填 name（hawklithm/workbuddy2api issue#2）。
-func TestStreamBackfillsToolCallName(t *testing.T) {
-	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"term\\\":\"}}]}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\\\"北京\\\"}\"}}]}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"total_tokens\":9}}\n\n" +
+// TestStreamToolCallNameOnce 11 帧 tool_call：首帧 name=Bash，后续 10 帧不得携带
+// name 键，arguments 逐帧原样透传（issue #82：累加型客户端把每个分片 name 拼接成
+// Bash×帧数；正确行为是 name 只在首帧出现一次）。
+func TestStreamToolCallNameOnce(t *testing.T) {
+	const nFrames = 11
+	var sb strings.Builder
+	for i := 0; i < nFrames; i++ {
+		sb.WriteString(`data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"arg` + string(rune('0'+i)) + `"}}]}}]}`)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("data: [DONE]\n\n")
+
+	frames, done := streamFrames(t, sb.String())
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != nFrames {
+		t.Fatalf("frames=%d want %d", len(frames), nFrames)
+	}
+	gotName := 0
+	for i, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		if len(tcs) != 1 {
+			t.Fatalf("frame %d tool_calls len=%d want 1", i, len(tcs))
+		}
+		fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+		if _, ok := fn["name"]; ok {
+			gotName++
+			if i != 0 || fn["name"] != "Bash" {
+				t.Errorf("frame %d unexpected name=%v (name 只能出现在首帧且为 Bash)", i, fn["name"])
+			}
+		}
+		if want := "arg" + string(rune('0'+i)); fn["arguments"] != want {
+			t.Errorf("frame %d arguments=%v want %q", i, fn["arguments"], want)
+		}
+	}
+	if gotName != 1 {
+		t.Errorf("name 出现帧数=%d want 1", gotName)
+	}
+}
+
+// TestStreamToolCallParallelFragments 多 tool_call（index 0 与 1 并行分片交错下发）：
+// 每个 index 只保留自己的首帧 name，后续分片互不串扰、arguments 各自原样。
+func TestStreamToolCallParallelFragments(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"a0\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"Read\",\"arguments\":\"a1\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 		"data: [DONE]\n\n"
 
 	frames, done := streamFrames(t, raw)
 	if done != 1 {
 		t.Fatalf("done=%d want 1", done)
 	}
-	if len(frames) != 4 {
-		t.Fatalf("frames=%d want 4", len(frames))
-	}
-	// 每个含 tool_calls 的分片 name 都必须是 lookup（首 chunk 直通，后续 chunk 被回填）
-	for i, fr := range frames {
-		chs, ok := fr["choices"].([]any)
-		if !ok {
-			t.Fatalf("frame %d choices missing", i)
-		}
+
+	argByIndex := map[int]string{}
+	nameCount := map[int]int{}
+	for _, fr := range frames {
+		chs, _ := fr["choices"].([]any)
 		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
-		tcs, ok := d["tool_calls"].([]any)
-		if !ok {
-			continue // 末帧只有 finish_reason，无 tool_calls 属正常
-		}
-		if len(tcs) != 1 {
-			t.Fatalf("frame %d tool_calls len=%d want 1", i, len(tcs))
-		}
-		fn, ok := tcs[0].(map[string]any)["function"].(map[string]any)
-		if !ok || fn["name"] != "lookup" {
-			t.Errorf("frame %d tool_calls name=%v want lookup", i, fn["name"])
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			idx := int(tc["index"].(float64))
+			fn, _ := tc["function"].(map[string]any)
+			if _, ok := fn["name"]; ok {
+				nameCount[idx]++
+			}
+			if a, _ := fn["arguments"].(string); a != "" {
+				argByIndex[idx] = a
+			}
 		}
 	}
-	// arguments 必须跨 chunk 完整保流（回填只动 name，不动其余字段）
-	f1 := frames[1]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	if f1["arguments"] != `{"term":` {
-		t.Errorf("frame 2 arguments=%q", f1["arguments"])
+	// 每个 index 恰好出现一次 name，arguments 逐片原样（a0/a1 各自保留）
+	if nameCount[0] != 1 || nameCount[1] != 1 {
+		t.Errorf("name 出现次数 index0=%d index1=%d，各 want 1", nameCount[0], nameCount[1])
+	}
+	if argByIndex[0] != "a0" || argByIndex[1] != "a1" {
+		t.Errorf("arguments index0=%q index1=%q want a0/a1", argByIndex[0], argByIndex[1])
+	}
+}
+
+// TestStreamToolCallNoiseEmptyName 上游后续帧带空串 name（噪声形态）→ 输出帧无 name 键。
+// 键缺失是比空串更安全的形态，客户端「键缺失则保留旧值」不会清空工具名。
+func TestStreamToolCallNoiseEmptyName(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg1\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg2\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	for i, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			fn, _ := tc["function"].(map[string]any)
+			if i == 0 {
+				if fn["name"] != "lookup" {
+					t.Errorf("frame 0 name=%v want lookup", fn["name"])
+				}
+				continue
+			}
+			if _, ok := fn["name"]; ok {
+				t.Errorf("frame %d: 空串 name 应被剥离为键缺失, got %#v", i, fn)
+			}
+		}
+	}
+}
+
+// TestStreamToolCallOverwriteClientSemantics 覆盖型语义验证：模拟「键缺失则保留旧值」
+// 的覆盖型客户端（name ?? state.name / if (name) state.name = name），在输出流上逐帧
+// 重建 name，最终必须收敛为 Bash——证明键缺失形态不会清空工具名。
+func TestStreamToolCallOverwriteClientSemantics(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	state := map[int]string{}
+	reconstructed := map[int]string{}
+	for _, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			idx := int(tc["index"].(float64))
+			fn, _ := tc["function"].(map[string]any)
+			// 覆盖型语义：键缺失 → ?? 保留旧值；非空 name → 覆盖。
+			if name, ok := fn["name"]; ok {
+				state[idx] = name.(string)
+			}
+			if state[idx] != "" {
+				reconstructed[idx] = state[idx]
+			}
+		}
+	}
+	// 覆盖型客户端重建后最终 name 必须是 Bash（首帧建立，后续空/重复分片均不破坏）。
+	if len(reconstructed) != 1 || reconstructed[0] != "Bash" {
+		t.Errorf("覆盖型重建 name=%v want map[0:Bash]", reconstructed)
 	}
 }
 
