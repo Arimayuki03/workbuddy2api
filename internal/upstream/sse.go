@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -131,7 +132,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolOrder) > 0 {
-		sortInts(toolOrder)
+		sort.Ints(toolOrder)
 		calls := make([]map[string]any, 0, len(toolOrder))
 		for _, idx := range toolOrder {
 			calls = append(calls, toolCalls[idx])
@@ -183,17 +184,6 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 			mf["arguments"] = prev + v
 		} else {
 			mf["arguments"] = v
-		}
-	}
-}
-
-// sortInts 升序排序（避免引 sort 包只为三行）。
-func sortInts(a []int) {
-	for i := 0; i < len(a)-1; i++ {
-		for j := i + 1; j < len(a); j++ {
-			if a[j] < a[i] {
-				a[i], a[j] = a[j], a[i]
-			}
 		}
 	}
 }
