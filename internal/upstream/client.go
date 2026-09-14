@@ -364,8 +364,9 @@ type Client struct {
 	DeviceTokenFile string
 
 	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
-	// 空 = 旧行为：X-Product="SaaS"，不设 X-IDE-*（向后兼容，不突变归因）。
-	// 非空（如 "WorkBuddy"）则四头跟随，对齐官方桌面端 client 识别。
+	// 空（默认）= "WorkBuddy"：伪造官方桌面端指纹（X-IDE-* 四头 + X-Agent-Purpose，
+	// 见 injectAttribution / attributionClientName）。显式配 "SaaS" 还原旧行为
+	// （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
 	ClientName string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + B 段的
@@ -394,6 +395,12 @@ type Client struct {
 	// false 即显式逃生门：即使用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
+
+	// UsageBaseCN / UsageBaseGlobal 积分消耗明细（get-user-request-usage）所在主机：
+	// 官网 usercenter 同源，与 billing base 不同（CN 实测仅在 www.workbuddy.cn 提供，
+	// codebuddy.cn 同路径 404/400）。空 = 回落默认。
+	UsageBaseCN     string
+	UsageBaseGlobal string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -411,6 +418,7 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
+		UsageBaseCN:          "https://www.workbuddy.cn",
 	}
 }
 
@@ -1007,6 +1015,76 @@ func IsAlreadyCheckin(err error) bool {
 		}
 	}
 	return false
+}
+
+// UsageRec 一条积分消耗明细（按请求）。
+type UsageRec struct {
+	RequestTime string  // "2006-01-02 15:04:05"（上游本地 = CST）
+	Credit      float64 // 本次扣减积分（如 0.12）
+	Model       string
+}
+
+// UsageRecords 拉取账号在 [begin, end] 内的按请求积分消耗明细
+// （POST /billing/meter/get-user-request-usage，官网「积分消耗明细」同源；
+// 注意在 UsageBaseCN 主机、无 /v2 前缀，与 get-user-resource 的 /v2 路径不同）。
+// 带分页与上限保护：单账号/区间最多 maxUsagePages×pageSize 条，超出截断（趋势聚合仍成样）。
+func (c *Client) UsageRecords(a *auth.Auth, begin, end time.Time) ([]UsageRec, error) {
+	const (
+		pageSize     = 100
+		maxUsagePage = 10 // 1000 条/账号/区间封顶；响应含提示词快照，控制带宽
+	)
+	var out []UsageRec
+	total := 0
+	for page := 1; page <= maxUsagePage; page++ {
+		body := map[string]any{
+			"startTime": begin.Format("2006-01-02") + " 00:00:00",
+			"endTime":   end.Format("2006-01-02") + " 23:59:59",
+			"pageNum":   page,
+			"pageSize":  pageSize,
+		}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.UsageBaseCN+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		c.BillingHeaders(req, a)
+		data, err := c.doJSON(req)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		var shape struct {
+			Total int `json:"total"`
+			Data  []struct {
+				RequestTime string      `json:"requestTime"`
+				Credit      json.Number `json:"credit"`
+				Model       string      `json:"model"`
+			} `json:"data"`
+		}
+		err = json.Unmarshal(data, &shape)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("request usage parse: %w", err)
+		}
+		total = shape.Total
+		for _, r := range shape.Data {
+			v, err := r.Credit.Float64()
+			if err != nil {
+				continue
+			}
+			out = append(out, UsageRec{RequestTime: r.RequestTime, Credit: v, Model: r.Model})
+		}
+		if len(shape.Data) == 0 || len(out) >= total {
+			break
+		}
+	}
+	return out, nil
 }
 
 func truncate(s string, n int) string {

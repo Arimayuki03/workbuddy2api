@@ -82,8 +82,9 @@ type Config struct {
 		// 读取频率限 5 分钟一次缓存，>1KB 或读失败则忽略（优雅降级不注入）。
 		DeviceTokenFile string `json:"device_token_file"`
 		// ClientName 用量归属头 X-Product/X-IDE-Name/X-IDE-Type 的取值。
-		// 空（缺省）= 旧行为：X-Product="SaaS"，不设 X-IDE-*（避免行为突变）。
-		// 配 "WorkBuddy" 则三头跟随该值，匹配官方桌面端用量归因。
+		// 空（缺省）= "WorkBuddy"：伪造官方桌面端指纹（X-IDE-* 四头 + X-Agent-Purpose，
+		// 上游用量归因不再出现 client/agentPurpose 为空的网关特征）。
+		// 显式配 "SaaS" 还原旧行为（仅 X-Product="SaaS"，不设 X-IDE-*）。
 		ClientName string `json:"client_name"`
 		// PassthroughIP 是否透传客户端 IP（X-Forwarded-For/X-Real-IP 首段）给上游。
 		// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）；true 才透传。
@@ -157,6 +158,10 @@ func Default() *Config {
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
+	// 出站指纹默认伪造官方 WorkBuddy 桌面端：UA 三段式 + X-IDE-* 头组
+	// （upstream.Client 的 attributionClientName 空值也回落 WorkBuddy，双保险）；
+	// 显式 client_name="SaaS" 还原旧行为。
+	c.Upstream.ClientName = "WorkBuddy"
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "custom" // 缺省 custom：网关自有提示词从源头消灭 system 指纹误报
 	c.Pool.MaxInFlight = 3

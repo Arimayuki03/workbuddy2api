@@ -84,18 +84,37 @@ func TestAttributionIncludesIDEVersion(t *testing.T) {
 	if got := h2.Get("X-IDE-Version"); got != "5.5.4" {
 		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.5.4")
 	}
-	// ClientName 空时 X-IDE-Version 不设（保持旧行为：只有 X-Product=SaaS）。
-	c3 := &Client{}
+	// 显式 ClientName="SaaS" 时 X-IDE-Version 不设（还原旧行为：只有 X-Product=SaaS）。
+	c3 := &Client{ClientName: "SaaS"}
 	h3 := chatHeadersReq(t, c3, a, "")
 	if got := h3.Get("X-IDE-Version"); got != "" {
-		t.Errorf("X-IDE-Version = %q want empty (client_name unset)", got)
+		t.Errorf("X-IDE-Version = %q want empty (client_name=SaaS)", got)
 	}
 }
 
-// TestProductDefaultSaaS ClientName 空（缺省）时 X-Product=SaaS 且不设 X-IDE-*（旧行为）。
-func TestProductDefaultSaaS(t *testing.T) {
+// TestProductDefaultWorkBuddyFingerprint ClientName 空（缺省）时伪造官方桌面端指纹：
+// X-Product=WorkBuddy 且 X-IDE-* / X-Agent-Purpose 四头齐全（本 PR 核心变更）。
+func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	c := &Client{} // ClientName 空
+	c := &Client{} // ClientName 空 → 默认 WorkBuddy 指纹
+	h := chatHeadersReq(t, c, a, "")
+	for hdr, want := range map[string]string{
+		"X-Product":       "WorkBuddy",
+		"X-IDE-Name":      "WorkBuddy",
+		"X-IDE-Type":      "WorkBuddy",
+		"X-IDE-Version":   "5.5.4",
+		"X-Agent-Purpose": "conversation",
+	} {
+		if got := h.Get(hdr); got != want {
+			t.Errorf("%s = %q want %q (default fingerprint)", hdr, got, want)
+		}
+	}
+}
+
+// TestProductSaaSOptOut 显式 ClientName="SaaS" 时 X-Product=SaaS 且不设 X-IDE-*（还原旧行为）。
+func TestProductSaaSOptOut(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{ClientName: "SaaS"} // 显式退出指纹伪造
 	h := chatHeadersReq(t, c, a, "")
 	if got := h.Get("X-Product"); got != "SaaS" {
 		t.Errorf("X-Product = %q want %q", got, "SaaS")
@@ -103,7 +122,7 @@ func TestProductDefaultSaaS(t *testing.T) {
 	// X-IDE-Name/Type 不应被设置。
 	for _, hdr := range []string{"X-IDE-Name", "X-IDE-Type", "X-Agent-Purpose"} {
 		if got := h.Get(hdr); got != "" {
-			t.Errorf("%s = %q want empty (not set in SaaS default)", hdr, got)
+			t.Errorf("%s = %q want empty (SaaS opt-out)", hdr, got)
 		}
 	}
 }
