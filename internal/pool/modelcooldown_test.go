@@ -349,6 +349,139 @@ func TestServableNowModelCooldownStillServable(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// healthyForModel 优先级（全账号级先判，模型级 6004 后判）
+// ---------------------------------------------------------------------------
+
+// TestHealthyForModelAccountCooledBeatsModelNotCooled 全账号冷却（until）优先于模型
+// 独立冷却：账号级 until 未到期的账号，即使该模型没有 6004 独立冷却也不可选
+// （旧实现先查 modelCooled 再查 healthy，逻辑上等价的短路位置不同；锁死新语义：
+// 全账号冷却优先）。
+func TestHealthyForModelAccountCooledBeatsModelNotCooled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit") // 全账号级 until 冷却，无 modelCooldowns
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	p.mu.RUnlock()
+
+	if e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Fatal("全账号 until 冷却中且模型无独立冷却：该模型也不可选（全账号冷却优先）")
+	}
+	if e.healthyForModel(time.Now(), "") {
+		t.Fatal("空模型名同样不可选（等价 healthy 短路到全账号冷却）")
+	}
+}
+
+// TestHealthyForModelAccountCooledWithModelCooldownStillBlocked 全账号冷却 + 该模型
+// 也有 6004 独立冷却 → 不可选（无论哪条拦截都一致，优先级短路不误放行）。
+func TestHealthyForModelAccountCooledWithModelCooldownStillBlocked(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	p.mu.RUnlock()
+	if e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Fatal("全账号冷却 + 模型独立冷却双拦截，仍应不可选")
+	}
+}
+
+// TestHealthyForModelDisabledBeatsModelNotCooled disabled 是全账号级的最强冷却：
+// 即使模型没有独立冷却也永不可选（disabled > 模型级）。
+func TestHealthyForModelDisabledBeatsModelNotCooled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	p.mu.RUnlock()
+	if e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Fatal("disabled 账号即使模型无独立冷却也不可选")
+	}
+}
+
+// TestHealthyForModelBreakerBeatsModelNotCooled 熔断（breakerUntil）是全账号级的
+// 冷却：熔断期内即使模型没有独立冷却也不可选。
+func TestHealthyForModelBreakerBeatsModelNotCooled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 触发熔断
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	bt := e.breakerUntil
+	p.mu.RUnlock()
+	if bt.IsZero() {
+		t.Fatal("precondition: breaker should be open")
+	}
+	if e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Fatal("熔断期内即使模型无独立冷却也不可选")
+	}
+}
+
+// TestHealthyForModelHealthyAccountNoModelCooldown 全账号健康 + 无任何模型独立冷却 →
+// 所有模型都可选（基线）。
+func TestHealthyForModelHealthyAccountNoModelCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	p.mu.RUnlock()
+	for _, m := range []string{"glm-5.3", "hy3-x", ""} {
+		if !e.healthyForModel(time.Now(), m) {
+			t.Errorf("健康账号对模型 %q 应可选", m)
+		}
+	}
+}
+
+// TestHealthyForModelAccountCooledAllowsNothingAfterUntil 优先级锁死的另一端：
+// 全账号 until 冷却到期后，模型无独立冷却的请求恢复正常（模型级判定接管）。
+func TestHealthyForModelAccountCooledAllowsNothingAfterUntil(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	p.mu.RUnlock()
+	// until 尚未到期：不可选（优先级：全账号级先判）。
+	if e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Fatal("until 冷却内不可选")
+	}
+	// 等 until 过期：模型无独立冷却 → 恢复可选。
+	time.Sleep(10 * time.Millisecond)
+	if !e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Fatal("until 过期后应恢复可选")
+	}
+}
+
+// TestHealthyForModelPriorityViaPick 端到端：全账号冷却中的账号即使对某模型无独立冷却
+// 也不被选出；健康 + 仅该模型 6004 的账号走模型豁免（同一账号对不同模型口径分离）。
+func TestHealthyForModelPriorityViaPick(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "cooled"})
+	p.Add(&auth.Auth{UID: "exempt"})
+	p.SetCredits("cooled", 100)
+	p.SetCredits("exempt", 50)
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 cooled
+	p.Cooldown("cooled", CoolSoft, time.Hour, "429")    // 全账号级冷却，无模型级记录
+	p.CooldownSoftForModel("exempt", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+
+	// 请求 other：cooled 被全账号冷却拦截（即使无模型独立冷却），exempt 模型豁免
+	// （6004 只锁 glm-5.3）→ 唯一候选 exempt。
+	if got := p.PickExcludingForModel(nil, "other"); got == nil || got.UID != "exempt" {
+		t.Fatalf("other 模型请求应豁免 exempt（全账号冷却的 cooled 仍拦截），got %+v", got)
+	}
+	// 请求 glm-5.3：cooled 全账号冷却拦截；exempt 自身 6004 拦截 → 无健康候选 →
+	// 全冷却兜底只认账号级冷却（exempt 无 until/breakerUntil,expiry 零值被排除），
+	// 选 cooled（软冷却参与兜底）。
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "cooled" {
+		t.Fatalf("glm-5.3 请求：exempt 被自身 6004 拦截，兜底应选全账号冷却的 cooled，got %+v", got)
+	}
+}
+
 // TestModelCooldownsNotPersisted modelCooldowns 运行态、不持久化（重启清零）。
 func TestModelCooldownsNotPersisted(t *testing.T) {
 	dir := t.TempDir()

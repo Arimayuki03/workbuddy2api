@@ -332,9 +332,15 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 // 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
 //
 // 模型级豁免（issue #31 的探活侧补齐）：6004 模型级软冷却中的账号（modelExempt 形态）
-// 对触发模型不可用、对其他模型仍可选——chat 的 healthyForModel 已按此放行切模型请求，
-// 探活必须同口径，否则"全号被 v4.1 限流但 glm 可用"时 chat 实际 200 而 /healthz 误报 503。
-// /healthz 无请求模型上下文，取"存在可服务模型"的存在性语义（与 chat 可达性等价）。
+// 对触发模型不可用、对其他模型仍可选，探活与 chat 必须同口径，否则"全号被某模型限流
+// 但换模型可用"时 chat 实际 200 而 /healthz 误报 503。chat 侧按请求模型细粒度判定
+// （healthyForModel：全账号健康且该模型不在独立冷却内才放行，模型豁免作用于选号），
+// 探活侧没有请求模型上下文，取「存在豁免形态」的存在性语义——豁免账号（未禁用、
+// 未熔断、存在模型级冷却条目）至少还剩触发模型之外的模型可用，ServableNow 计入。
+// 注意与 chat 判定在"账号级 until 冷却 + 模型豁免并存"时并不完全重合：modelExempt
+// 不检查 until，而 healthyForModel 会先判 until 再查模型冷却；该混合形态现实中不可达
+// （plain Cooldown 会清空 modelCooldowns，6004 不写 until），此处仅为探活存在性语义，
+// 不构成 chat 选号路径。
 func (p *Pool) ServableNow() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
