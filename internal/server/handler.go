@@ -236,6 +236,9 @@ func (h *Handler) modelList() []map[string]any {
 			if mi.ContextWindow == 0 {
 				entry["context_length"] = 131072 // 兜底
 			}
+			if mi.SupportsImages {
+				entry["supports_images"] = true // P1：多模态能力透出
+			}
 			out = append(out, entry)
 		}
 	} else {

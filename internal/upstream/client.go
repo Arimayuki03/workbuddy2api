@@ -783,11 +783,13 @@ func (c *Client) chatPaths(a *auth.Auth) []string {
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
 type ModelInfo struct {
-	ID            string
-	Name          string
-	ContextWindow int64    // = maxInputTokens
-	MaxTokens     int64    // = maxOutputTokens
-	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
+	ID             string
+	Name           string
+	ContextWindow  int64    // = maxInputTokens
+	MaxTokens      int64    // = maxOutputTokens
+	Efforts        []string // reasoning.supportedEfforts（空=未知/固定档）
+	DefaultEffort  string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
+	SupportsImages bool    // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 }
 
 // 模型目录端点路径常量（按 realm 切）：
@@ -808,6 +810,29 @@ func (c *Client) modelsPath(a *auth.Auth) string {
 		return globalModelsPath
 	}
 	return cnModelsPath
+}
+
+// nonChatModel 判定是否非对话模型（应从模型列表过滤掉）。
+// 来源：harness buddy.ts:547-555。三类规则：
+//   - id 前缀 nes-/completion-/codewise-：嵌入/补全/代码专用模型，选了报 code=11102。
+//   - maxOutputTokens ≤ 256：tiny 输出非对话模型。
+//   - tags 含 text-to-image：图片生成模型，非本网关用途。
+func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
+		if strings.HasPrefix(id, p) {
+			return true
+		}
+	}
+	if maxOutputTokens > 0 && maxOutputTokens <= 256 {
+		return true
+	}
+	for _, t := range tags {
+		if t == "text-to-image" {
+			return true
+		}
+	}
+	return false
 }
 
 // FetchModels 调上游动态模型接口。
@@ -833,13 +858,16 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		Code int `json:"code"`
 		Data struct {
 			Models []struct {
-				ID              string `json:"id"`
-				Name            string `json:"name"`
-				MaxInputTokens  int64  `json:"maxInputTokens"`
-				MaxOutputTokens int64  `json:"maxOutputTokens"`
-				Disabled        bool   `json:"disabled"`
+				ID              string   `json:"id"`
+				Name            string   `json:"name"`
+				MaxInputTokens  int64    `json:"maxInputTokens"`
+				MaxOutputTokens int64    `json:"maxOutputTokens"`
+				Disabled        bool     `json:"disabled"`
+				SupportsImages  bool     `json:"supportsImages"`
+				Tags            []string `json:"tags"`
 				Reasoning       struct {
 					Effort           string   `json:"effort"`
+					DefaultEffort    string   `json:"defaultEffort"`
 					SupportedEfforts []string `json:"supportedEfforts"`
 				} `json:"reasoning"`
 			} `json:"models"`
@@ -865,23 +893,30 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(cliIDs) == 0 {
 		return nil, fmt.Errorf("no cli agent models found")
 	}
-	dynMap := make(map[string]struct {
+	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
+	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
+	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
+	type dynEntry struct {
 		ID              string
 		Name            string
 		MaxInputTokens  int64
 		MaxOutputTokens int64
 		Disabled        bool
 		Efforts         []string
-	}, len(env.Data.Models))
+		DefaultEffort   string
+		SupportsImages  bool
+	}
+	dynMap := make(map[string]dynEntry, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
-			ID              string
-			Name            string
-			MaxInputTokens  int64
-			MaxOutputTokens int64
-			Disabled        bool
-			Efforts         []string
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
+		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
+			continue
+		}
+		dynMap[m.ID] = dynEntry{
+			ID: m.ID, Name: m.Name,
+			MaxInputTokens: m.MaxInputTokens, MaxOutputTokens: m.MaxOutputTokens,
+			Disabled: m.Disabled, Efforts: m.Reasoning.SupportedEfforts,
+			DefaultEffort: m.Reasoning.DefaultEffort, SupportsImages: m.SupportsImages,
+		}
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
@@ -890,17 +925,19 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			continue
 		}
 		out = append(out, ModelInfo{
-			ID:            m.ID,
-			Name:          m.Name,
-			ContextWindow: m.MaxInputTokens,
-			MaxTokens:     m.MaxOutputTokens,
-			Efforts:       m.Efforts,
+			ID:             m.ID,
+			Name:           m.Name,
+			ContextWindow:  m.MaxInputTokens,
+			MaxTokens:       m.MaxOutputTokens,
+			Efforts:         m.Efforts,
+			DefaultEffort:   m.DefaultEffort,
+			SupportsImages: m.SupportsImages,
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
+	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
 	cache := make(map[string][]string, len(out))
 	for _, mi := range out {
 		if len(mi.Efforts) > 0 {
