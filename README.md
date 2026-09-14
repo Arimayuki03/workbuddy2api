@@ -29,6 +29,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ``
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 ```CodeBuddy``` 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
+📖 完整文档见 [GitHub Wiki](https://github.com/Sliverkiss/workbuddy2api/wiki)。
+
 ## 核心能力
 
 ### 账号池治理
