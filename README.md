@@ -209,9 +209,20 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 如果这个项目对你有帮助，欢迎请我喝杯咖啡～
 
-**Solana**：`AZAKF74rTu7UFVSNRzsKV4HHpTwarax6cG8KAh4fP5rQ`
-**Ethereum**：`0x1d418627aD6B043900CBE11fe439759bDF2b5170`
-**Bitcoin**：`bc1q9w7h4j9msyd9q6lhl0398n4s3g8h4vchpqvc2k`
+<table>
+  <tr>
+    <td align="center"><b>💰 Solana</b></td>
+    <td><code>AZAKF74rTu7UFVSNRzsKV4HHpTwarax6cG8KAh4fP5rQ</code></td>
+  </tr>
+  <tr>
+    <td align="center"><b>💎 Ethereum</b></td>
+    <td><code>0x1d418627aD6B043900CBE11fe439759bDF2b5170</code></td>
+  </tr>
+  <tr>
+    <td align="center"><b>₿ Bitcoin</b></td>
+    <td><code>bc1q9w7h4j9msyd9q6lhl0398n4s3g8h4vchpqvc2k</code></td>
+  </tr>
+</table>
 
 ## License
 
