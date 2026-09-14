@@ -34,3 +34,16 @@ func TestCommonHeadersCodeBuddyRequest(t *testing.T) {
 		t.Errorf("refresh X-CodeBuddy-Request = %q want %q", got, "1")
 	}
 }
+
+// TestRefreshHeadersAuthRefreshSource refresh 出站 X-Auth-Refresh-Source 对齐
+// 官方客户端 refresh 渠道标识为 "plugin"（D3，原值 "workbuddy" 与官方不一致）。
+func TestRefreshHeadersAuthRefreshSource(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1", RefreshToken: "rt"}
+	req := mustRequest(t)
+	c := &Client{}
+	c.RefreshHeaders(req, a)
+
+	if got := req.Header.Get("X-Auth-Refresh-Source"); got != "plugin" {
+		t.Errorf("X-Auth-Refresh-Source = %q want %q", got, "plugin")
+	}
+}

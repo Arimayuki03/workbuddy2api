@@ -365,5 +365,6 @@ func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}
-	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 }
