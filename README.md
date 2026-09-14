@@ -215,11 +215,14 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN 凭证不带该键 → 自动按空值回落 CN，零迁移。
 
-**`--realm=global` 登录后自动注册激活 + trial 领取**：token 落盘后 login.sh 会依次执行两步（失败只提示不阻断登录，token 已落盘）：
+**`--realm=global` 登录后自动注册激活 + trial 领取**：token 落盘后 login.sh 会依次执行（失败只提示不阻断登录，token 已落盘）：
 
 1. **注册激活**：`GET https://www.workbuddy.ai/auth/realms/copilot/overseas/user/register?userId=<uid>`
    - `code=200`：成功（已激活 / 新激活，幂等）
-   - `code=500 "register region required"`：提示用户打开 `https://www.workbuddy.ai/login/register/user/complete` 完善注册地区后重跑 `./login.sh --realm=global`
+   - `code=500 "register region required"`：**自动完善注册地区**（无需打开网页）——终端列出可选地区（内置国际版白名单 `香港/澳门/新加坡/泰国/菲律宾/马来西亚/印尼`，若检测到当前地区则高亮），用户输入编号后自动提交：
+     - 拉地区列表：`POST /billing/area/get-country-code`
+     - 提交地区：`POST /console/login/account`（body `{attributes:{countryCode, countryFullName, countryName}}`）
+     - 重新 `register` 验证 `code=200`
 2. **trial 领取**：`POST https://www.workbuddy.ai/billing/ide/trial`
    - `code=14051` = 已领取过（幂等，不算失败）；成功输出「国际版 trial 已激活，可以开始对话」
 
