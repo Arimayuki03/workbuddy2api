@@ -33,6 +33,11 @@ type Config struct {
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
 
+	// ExpiringSoonWindow 快过期积分窗口：签到查余额时，把到期时间 <= now+window 的
+	// 套餐余额标记为"快过期"（pool 据此优先消耗，见 entry.creditsExpiring）。
+	// <=0 时禁用分桶（全部归长期，行为与引入前一致）。默认建议 7*24h。
+	ExpiringSoonWindow time.Duration
+
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
 	CheckinDisabled bool
@@ -104,11 +109,11 @@ const (
 
 // CheckinOutcome 单账号签到结果（供手动签到回执与日志汇总）。
 type CheckinOutcome struct {
-	UID      string         `json:"uid"`
-	Nickname string         `json:"nickname,omitempty"`
-	Status   CheckinStatus  `json:"status"`
-	Credits  *int64         `json:"credits,omitempty"` // 签到后余额（余额查询成功才有值）
-	Detail   string         `json:"detail,omitempty"`  // 失败/跳过原因（"已签到"不填）
+	UID      string        `json:"uid"`
+	Nickname string        `json:"nickname,omitempty"`
+	Status   CheckinStatus `json:"status"`
+	Credits  *int64        `json:"credits,omitempty"` // 签到后余额（余额查询成功才有值）
+	Detail   string        `json:"detail,omitempty"`  // 失败/跳过原因（"已签到"不填）
 }
 
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
@@ -317,7 +322,9 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		} else {
 			oc.Status = CheckinOK
 		}
-		remain, err := s.cfg.Upstream.UserResource(a)
+		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗（issue:积分过期）。
+		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
+		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
 			oc.Status = CheckinFail
@@ -327,6 +334,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
 		oc.Credits = &remain
 		switch oc.Status {
 		case CheckinOK:

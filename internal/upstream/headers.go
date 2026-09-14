@@ -90,9 +90,10 @@ func (c *Client) userAgent(a *auth.Auth) string {
 // 语义对齐官方 application-manifest.js:27590-27601（banner 白名单接口显式头组）：
 // 这类接口用单段 `WorkBuddy/<clientVersion>`（不带 CLI 段——官方 banner 显式覆写 UA
 // 为 `WorkBuddy/<pkgVer>`，RestOperations 层的 CLI 扩展段被业务层固化覆盖掉）。
-// 仅当 client_name 配置（非空）才生效；未配保持现状（BillingHeaders 不设 UA，Go 默认 UA）。
+// 默认（client_name 空）即生效（伪造官方桌面端指纹）；
+// 显式 client_name="SaaS" 则不设 UA（还原旧行为，Go 默认 UA）。
 func (c *Client) billingUA() string {
-	if c == nil || c.ClientName == "" {
+	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
 	}
 	return "WorkBuddy/" + c.clientVersion()
@@ -221,8 +222,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	}
 	// 用量归属头：真实桌面端发 X-Agent-Purpose="conversation" + X-IDE-Name/Type/X-Product
 	// 识别 client，避免上游用量统计里 client/agentPurpose 为空。来源 xiaofan6ya/converter.py。
-	// 默认（ClientName 空）保持 X-Product="SaaS" 兼容现状，不设 X-IDE-*（不突变归因）；
-	// 配 ClientName（如 "WorkBuddy"）则四头跟随该值，对齐官方桌面端。
+	// 默认（ClientName 空）即伪造 WorkBuddy 桌面端头组（见 injectAttribution）；
+	// 显式 ClientName="SaaS" 还原旧行为（仅 X-Product="SaaS"）。
 	c.injectAttribution(req)
 	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
 	// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）。
@@ -290,23 +291,34 @@ func validTraceID(s string) bool {
 	return true
 }
 
+// attributionClientName 生效的用量归属名：ClientName 非空取之；
+// 空默认 "WorkBuddy"（伪造官方桌面端指纹；显式配 "SaaS" 可还原旧行为）。
+func (c *Client) attributionClientName() string {
+	if c != nil && c.ClientName != "" {
+		return c.ClientName
+	}
+	return "WorkBuddy"
+}
+
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。
-// 仅在 chat/completions 路径生效（ChatHeaders 调用）。ClientName 非空时全量跟随该值，
-// 空则只保留 X-Product="SaaS"（旧行为，向后兼容）。
+// 仅在 chat/completions 路径生效（ChatHeaders 调用）。
 //
-// B 段对齐官方白名单头组（application-manifest.js:27590-27601）：X-IDE-* 四头齐全且
-// 取值跟随 ClientName（X-IDE-Name/Type/Product = WorkBuddy），X-IDE-Version = 客户端
-// 版本段（config client_version 可覆盖）。与官方 banner 头组完全同形。
+// 默认（ClientName 空）即伪造官方 WorkBuddy 桌面端指纹：X-Agent-Purpose="conversation"
+// + X-IDE-Name/Type/Product="WorkBuddy" + X-IDE-Version=client_version。该头组与官方
+// banner 白名单头组完全同形（application-manifest.js:27590-27601），上游用量归因从此
+// 不再出现 client/agentPurpose 为空的「网关特征」。显式 ClientName="SaaS" 还原旧行为
+// （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
 func (c *Client) injectAttribution(req *http.Request) {
-	if c == nil || c.ClientName == "" {
+	name := c.attributionClientName()
+	if name == "SaaS" {
 		req.Header.Set("X-Product", "SaaS")
 		return
 	}
 	req.Header.Set("X-Agent-Purpose", "conversation")
-	req.Header.Set("X-IDE-Name", c.ClientName)
-	req.Header.Set("X-IDE-Type", c.ClientName)
+	req.Header.Set("X-IDE-Name", name)
+	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", c.clientVersion())
-	req.Header.Set("X-Product", c.ClientName)
+	req.Header.Set("X-Product", name)
 }
 
 // injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游。
@@ -344,11 +356,11 @@ func ExtractClientIP(r *http.Request) string {
 }
 
 // BillingHeaders billing 接口请求头。
-// UA 语义（A 段对齐官方白名单头组，application-manifest.js:27590-27601）：
+// UA 语义（对齐官方白名单头组，application-manifest.js:27590-27601）：
 //  1. 显式配置 c.UserAgent 优先（用户自定义值，全路径生效）；
-//  2. 未配但 client_name 非空 → 单段 `WorkBuddy/<clientVersion>`（官方 banner/check-in
-//     显式覆写 UA 的形态，不带 CLI 段）；
-//  3. 两者皆空 → 保持现状不设置（Go 客户端自带默认 UA）。
+//  2. 未配且归属名非 SaaS（含默认 WorkBuddy）→ 单段 `WorkBuddy/<clientVersion>`
+//     （官方 banner/check-in 显式覆写 UA 的形态，不带 CLI 段）；
+//  3. 显式 client_name="SaaS" → 不设置（Go 客户端自带默认 UA，还原旧行为）。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")

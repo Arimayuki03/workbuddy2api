@@ -82,8 +82,9 @@ type Config struct {
 		// 读取频率限 5 分钟一次缓存，>1KB 或读失败则忽略（优雅降级不注入）。
 		DeviceTokenFile string `json:"device_token_file"`
 		// ClientName 用量归属头 X-Product/X-IDE-Name/X-IDE-Type 的取值。
-		// 空（缺省）= 旧行为：X-Product="SaaS"，不设 X-IDE-*（避免行为突变）。
-		// 配 "WorkBuddy" 则三头跟随该值，匹配官方桌面端用量归因。
+		// 空（缺省）= "WorkBuddy"：伪造官方桌面端指纹（X-IDE-* 四头 + X-Agent-Purpose，
+		// 上游用量归因不再出现 client/agentPurpose 为空的网关特征）。
+		// 显式配 "SaaS" 还原旧行为（仅 X-Product="SaaS"，不设 X-IDE-*）。
 		ClientName string `json:"client_name"`
 		// PassthroughIP 是否透传客户端 IP（X-Forwarded-For/X-Real-IP 首段）给上游。
 		// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）；true 才透传。
@@ -119,6 +120,9 @@ type Config struct {
 		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
+		// 的积分被标记为"快过期"，选号优先消耗（issue:积分过期）。空/0 = 禁用分桶。
+		ExpiringSoon string `json:"expiring_soon"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -134,6 +138,7 @@ type Config struct {
 	BreakerCooldownMaxD time.Duration `json:"-"`
 	SessionTTL          time.Duration `json:"-"`
 	SessionGCInterval   time.Duration `json:"-"`
+	ExpiringSoonDur     time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -157,6 +162,10 @@ func Default() *Config {
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
+	// 出站指纹默认伪造官方 WorkBuddy 桌面端：UA 三段式 + X-IDE-* 头组
+	// （upstream.Client 的 attributionClientName 空值也回落 WorkBuddy，双保险）；
+	// 显式 client_name="SaaS" 还原旧行为。
+	c.Upstream.ClientName = "WorkBuddy"
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "custom" // 缺省 custom：网关自有提示词从源头消灭 system 指纹误报
 	c.Pool.MaxInFlight = 3
@@ -165,6 +174,7 @@ func Default() *Config {
 	c.Pool.BreakerCooldownMax = "6h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
+	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -263,6 +273,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
 		c.Prompt.File = v
 	}
+	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
+		c.Pool.ExpiringSoon = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -302,6 +315,16 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
+	}
+	// 快过期窗口：空值回落默认 168h（Default 已置；此兜底覆盖显式 ""）；显式 "0"/负值 = 禁用分桶。
+	if c.Pool.ExpiringSoon == "" {
+		c.Pool.ExpiringSoon = "168h"
+	}
+	if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
+		return fmt.Errorf("pool.expiring_soon: %w", err)
+	}
+	if c.ExpiringSoonDur < 0 {
+		c.ExpiringSoonDur = 0 // 负值视为禁用，避免 upstream 判定窗口反转
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120

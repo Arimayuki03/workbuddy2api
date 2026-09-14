@@ -38,7 +38,7 @@
     "cli_version": "",
     "device_token": "",
     "device_token_file": "",
-    "client_name": "",
+    "client_name": "WorkBuddy",
     "passthrough_ip": false
   },
   "features": {
@@ -58,7 +58,8 @@
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",
     "idle_weight_per_hour": 0.5,
-    "idle_weight_max": 5.0
+    "idle_weight_max": 5.0,
+    "expiring_soon": "168h"
   },
   "session_sticky": {
     "enabled": true,

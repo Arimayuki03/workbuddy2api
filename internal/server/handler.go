@@ -128,9 +128,9 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
 	writeJSON(w, status, map[string]any{
-		"healthy":       healthy,
-		"total":         total,
-		"service":       ServiceName,
+		"healthy":        healthy,
+		"total":          total,
+		"service":        ServiceName,
 		"realm_servable": realmServable,
 	})
 }
@@ -148,12 +148,12 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":        h.cfg.Pool.List(),
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
+		"accounts":       h.cfg.Pool.List(),
+		"total":          total,
+		"healthy":        healthy,
+		"cooling":        cooling,
+		"disabled":       disabled,
+		"in_flight_full": inFlightFull,
 		"realm_totals": map[string]map[string]int{
 			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
 			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
@@ -543,7 +543,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Upstream.PassthroughIP {
 			clientIP = upstream.ExtractClientIP(r)
 		}
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP, chatMeta)
+		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
+		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。

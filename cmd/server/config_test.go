@@ -626,7 +626,9 @@ func TestPromptFileOverride(t *testing.T) {
 	want := "我的自定义人格入口"
 	os.WriteFile(pf, []byte(want), 0o600)
 	cf := filepath.Join(dir, "c.json")
-	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+pf+`"}}`), 0o600)
+	// 路径写进 JSON 字符串需转义反斜杠：Windows 下 filepath.Join 生成 C:\Users\...，
+	// 原样拼接会让 \U 成为非法 JSON 转义。ToSlash 统一为正斜杠（跨平台可解析）。
+	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+filepath.ToSlash(pf)+`"}}`), 0o600)
 	c, err := Load(cf)
 	if err != nil {
 		t.Fatal(err)

@@ -65,21 +65,40 @@ func (p *Pool) RestoreFromSnapshot() {
 	log.Printf("[pool] 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 }
 
-// Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
-// 必须在成功 Pick 后调用；调用方负责 defer Release。
+// startFlusher 启动后台周期落盘 goroutine（每 flushInterval 检查 dirty 标志）。
+// goroutine 在 p.Close 关闭 stopCh 时退出；此前若无人 Close，goroutine 会持续运行
+// （issue:goroutine 泄漏——New 每调一次泄漏一个，且无停止机制）。
 func (p *Pool) startFlusher() {
 	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
+	p.stopCh = make(chan struct{})
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
-		for range t.C {
-			p.mu.Lock()
-			if p.dirty.Swap(false) {
-				p.saveLocked()
+		for {
+			select {
+			case <-p.stopCh:
+				return
+			case <-t.C:
+				p.mu.Lock()
+				if p.dirty.Swap(false) {
+					p.saveLocked()
+				}
+				p.mu.Unlock()
 			}
-			p.mu.Unlock()
 		}
 	}()
+}
+
+// Close 停止后台落盘 goroutine 并做最后一次落盘（幂等）。
+// 进程退出前应调用（main 的优雅停机路径），替代裸 Flush——既停 goroutine 又补落盘。
+// stateFp 为空（未起 flusher）时仅做一次 Flush。
+func (p *Pool) Close() {
+	p.closeOnce.Do(func() {
+		if p.stopCh != nil {
+			close(p.stopCh)
+		}
+	})
+	p.Flush()
 }
 
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。

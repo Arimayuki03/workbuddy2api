@@ -114,24 +114,51 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now)})
 		}
 	}
-	sort.Slice(ws, func(i, j int) bool {
+	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
+	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
+	// 见 TestPickDeterministicViaSetRandomSource）。权重全等或存在并列时，按字典序
+	// 截断会让 uid 靠后的账号永远进不了 top5（惊群测试 c00 集中 79/100 的根因：
+	// c05..c09 被字典序截断、LRU 兜底又只在 top5 内转）。洗牌用独立的 time-seeded
+	// 源，只在截断边界制造等权重随机次序，不影响加权抽签本身的确定性。
+	if len(ws) > 5 {
+		eq := false
+		for i := 1; i < len(ws); i++ {
+			if ws[i].w == ws[0].w {
+				eq = true
+				break
+			}
+		}
+		if eq {
+			shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
+			shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
+		}
+	}
+	sort.SliceStable(ws, func(i, j int) bool {
 		_, ci := costTier(ws[i].e)
 		_, cj := costTier(ws[j].e)
 		if ci != cj {
-			return ci < cj // 同层且收费时：单价低的在前
+			return ci < cj // 收费层：单价低的在前
 		}
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
-		return ws[i].e.a.UID < ws[j].e.a.UID
+		return ws[i].e.a.UID < ws[j].e.a.UID // 稳定兜底（洗牌后此项几乎不触发）
 	})
 	cands = cands[:0]
 	for _, c := range ws {
 		cands = append(cands, c.e)
 	}
+	// candsAll 保留截断前的全候选（权重降序），供 LRU 兜底在全量范围选最旧者，
+	// 避免 top5 字典序截断把等权重靠后账号饿死（惊群根因之一）。
+	candsAll := cands
 	if len(cands) > 5 {
 		cands = cands[:5]
 	}
+	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
+	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
+	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
+	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入（此前 Acquire 在锁外，
+	// 多个 goroutine 在窗口内同时通过校验造成惊群，TestPickAntiThunderingHerd 实证）。
 	eligible := make([]*entry, 0, len(cands))
 	for _, e := range cands {
 		if now.Sub(e.lastUsed) >= minPickGap {
@@ -140,17 +167,22 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	var e *entry
 	if len(eligible) == 0 {
-		// top5 全部刚被用过：LRU 兜底，维持发散且不 starve 任一候选。
-		e = cands[0]
-		for _, c := range cands[1:] {
-			if c.lastUsed.Before(e.lastUsed) {
+		// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
+		// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
+		// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
+		// candsAll[0] 导致集中。usedSeq 严格全序，与时间精度无关。
+		e = candsAll[0]
+		for _, c := range candsAll[1:] {
+			if c.usedSeq < e.usedSeq {
 				e = c
 			}
 		}
 	} else {
 		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
 	}
-	e.lastUsed = time.Now()
+	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
+	p.pickSeq++
+	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
 	return e.a
 }
 
@@ -205,6 +237,11 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
 
+// expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
+// 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，
+// 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
+const expiringWeight = 8.0
+
 // pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
 //
 //		weight = credits 比例 × 10 + idleWeight + successRate × 3
@@ -229,8 +266,14 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	var total int64
 	for i, e := range cands {
 		w := p.weightOf(e, maxCredits, now)
-		weights[i] = int64(w * scale)
-		total += weights[i]
+		// 四舍五入并保底权重 ≥1：向零截断会让 w<1/scale 的低权重号权重归零，
+		// 彻底失去被抽中机会（候选少时加剧选号集中，惊群测试的放大因子之一）。
+		wi := int64(w*scale + 0.5)
+		if wi < 1 {
+			wi = 1
+		}
+		weights[i] = wi
+		total += wi
 	}
 	rnd := rand.Int64N
 	if p.randInt64N != nil {
@@ -256,6 +299,13 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
 	if maxCredits > 0 {
 		w += float64(e.credits) / float64(maxCredits) * 10
+	}
+	// 1b. 快过期积分加成（issue:积分过期）：官方活动赠送的奖励积分按批过期，
+	// 不用就作废。creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期
+	// 占比"作为一个独立的强权重项（×expiringWeight），让快过期积分多的号优先选。
+	// 与成本分层（costTier 优先免费）正交：那是按"实测扣费"分层，这是按"过期紧迫度"。
+	if e.credits > 0 && e.creditsExpiring > 0 {
+		w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {

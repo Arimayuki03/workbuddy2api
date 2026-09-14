@@ -19,9 +19,9 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return jsonResp(200, `{"code":0}`), nil
 }
 
-// TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
+// TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent 未配）行为：
 // chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
-// 不设 UA 头（保持现状，Go 客户端自带默认 UA）。
+// UA=单段 `WorkBuddy/<clientVersion>`（client_name 缺省即伪造官方桌面端指纹）。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -47,7 +47,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "",
+			wantUA: billingUAWorkBuddy, // client_name 缺省 → 伪造官方单段 UA
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -294,9 +294,9 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	}
 }
 
-// TestBillingUA_WhenClientNameEmpty client_name 空 = 保持现状：不设 UA（Go 默认 UA），
-// 即使 version 配置了也不上 UA。
-func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
+// TestBillingUA_WhenClientNameSaaS 显式 client_name="SaaS" = 还原旧行为：不设 UA
+// （Go 默认 UA），即使 version 配置了也不上 UA。
+func TestBillingUA_WhenClientNameSaaS(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	var ua string
 	const fullResp = `{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`
@@ -307,13 +307,14 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 		})},
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
-		ClientVersion: "6.0.0", // 配置了版本但 client_name 空 → 仍不设 UA
+		ClientName:    "SaaS",  // 显式退出指纹伪造
+		ClientVersion: "6.0.0", // 配置了版本但 client_name=SaaS → 仍不设 UA
 	}
 	if _, err := c.UserResource(a); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
 	if ua != "" {
-		t.Errorf("billing UA = %q want empty (client_name unset)", ua)
+		t.Errorf("billing UA = %q want empty (client_name=SaaS)", ua)
 	}
 	if got := c.billingUA(); got != "" {
 		t.Errorf("billingUA() = %q want empty", got)
