@@ -26,6 +26,11 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	obj["stream"] = true
+	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
+	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
+	if _, has := obj["stream_options"]; !has {
+		obj["stream_options"] = map[string]any{"include_usage": true}
+	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
