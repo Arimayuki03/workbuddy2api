@@ -523,7 +523,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// 12153 一次失败不杀号（临时触发会误杀）：与 scheduler keepalive/checkin
+					// 同口径走连续计数，达到 sessionDeadThreshold 才禁用。
+					h.cfg.Pool.NoteSessionDead(acct.UID)
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -629,12 +631,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	msg := "all accounts unavailable (cooling/disabled)"
-	if lastErr != nil {
-		msg += ": " + lastErr.Error()
+	// 末端错误规范化（疑点 5 修正）：不再把上游原始错误文本透传给用户——原始 body 可能
+	// 泄露账号 UID 与上游内部错误码（11128 / 12153 / 6004 后台措辞）。全部账号不可用时
+	// 按 lastErr 的权威分类映射为 OpenAI 风格错误：
+	//
+	//   - ErrSoftRate → 429 rate_limit_exceeded（限流语义，用户应等待+重试）。
+	//     这是症状根因：此前把 200/400 + 11140 rate-limiting 原文原样 503 透传。
+	//   - ErrBadParams → 白名单透传上游 11101 解析失败原文（客户端请求体错误，
+	//     用户需要原文定位参数，且不涉及账号语义）。
+	//   - 其余（hard_credit / session_dead / not_found / server / account_fault /
+	//     client / transport error）→ 固定 503 no_healthy_account 文案，不拼接
+	//     lastErr（避免泄露账号与内部错误码）。
+	status := http.StatusServiceUnavailable
+	code := "no_healthy_account"
+	msg := "all accounts are temporarily unavailable, please retry later"
+	var ue *upstream.Error
+	if errors.As(lastErr, &ue) {
+		switch ue.Kind {
+		case upstream.ErrSoftRate:
+			status = http.StatusTooManyRequests
+			code = "rate_limit_exceeded"
+			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+		case upstream.ErrBadParams:
+			// 白名单透传：保留上游 11101 原文（客户端参数错误，帮助用户定位）。
+			msg = "upstream rejected request params: " + ue.Msg
+		}
 	}
-	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
-	st.status = http.StatusServiceUnavailable
+	writeOpenAIError(w, status, code, msg)
+	st.status = status
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

@@ -1427,9 +1427,17 @@ func TestStatusRateLimitedModelsLedger(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	// 双号都被 6004 → 全部换完仍 503（无健康号），但换号过程已把 u1 冷却。
-	if rec.Code != 503 {
-		t.Fatalf("code=%d want 503 body=%s", rec.Code, rec.Body)
+	// 双号都被 6004 → 全部换完仍限流。末端错误已规范化（冷启动重构）：限流语义
+	// 映射为 429 rate_limit_exceeded（不再原样 503 透传上游原文），换号过程已把 u1 冷却。
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429 body=%s", rec.Code, rec.Body)
+	}
+	var e map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if errObj, _ := e["error"].(map[string]any); errObj == nil || errObj["code"] != "rate_limit_exceeded" {
+		t.Fatalf("want rate_limit_exceeded envelope: %s", rec.Body)
 	}
 	// u1 被选中过（已冷却 + 有台账）。
 	st, ok := p.Status("u1")
@@ -1479,6 +1487,50 @@ func TestStatusRateLimitedModelsLedger(t *testing.T) {
 		t.Errorf("until=%v want ~35m 后=%v", row.Until, reset)
 	}
 	// 未命中测试账号（u2 也被限流）也会带台账——但只断言 u1（被选中的号）即验证端到端。
+}
+
+// TestChatAllRateLimitedNormalizes429 端到端回归本次重构根因症状：全部账号都命中上游
+// 限流（200/400 + 速限文案，非 429 状态码）时，末端错误必须是规范化的 OpenAI 风格
+// 429 rate_limit_exceeded，而不是 503 + 原样透传上游原文
+// "The model provider is rate-limiting requests..."（不应泄露账号/上游内部措辞，也不应
+// 误报 503 让客户端以为网关挂了，错误应为"限流→等待重试"语义）。
+func TestChatAllRateLimitedNormalizes429(t *testing.T) {
+	const raw = `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, raw, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s (want 429 rate_limit_exceeded)", rec.Code, rec.Body)
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if e.Error.Code != "rate_limit_exceeded" {
+		t.Errorf("code=%q want rate_limit_exceeded", e.Error.Code)
+	}
+	if strings.Contains(rec.Body.String(), "rate-limiting requests") || strings.Contains(rec.Body.String(), "11140") {
+		t.Errorf("normalized error must not leak upstream raw body: %s", rec.Body)
+	}
+	// 两个号都被限流冷却（换号过程完整跑完仍无健康号）。
+	for _, uid := range []string{"u1", "u2"} {
+		if st, _ := p.Status(uid); !st.Cooling || st.CoolKind != "soft_rate" {
+			t.Errorf("%s should be soft_rate cooling: %+v", uid, st)
+		}
+	}
 }
 
 // TestHealthzEmptyPool 空池（healthy=0）→ 503，表示暂不可服务。
