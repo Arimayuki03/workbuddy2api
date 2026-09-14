@@ -133,6 +133,14 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Referer", origin+"/")
 	// User-Agent 按账号 realm 切换品牌段（global → `WorkBuddy AI`，见 defaultWorkBuddyUAFor）。
 	req.Header.Set("User-Agent", c.userAgent(a))
+	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
+	req.Header.Set("X-CodeBuddy-Request", "1")
+}
+
+// injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
+// billing 域未走 CommonHeaders，单独注入保证全出站覆盖。
+func (c *Client) injectCodeBuddyRequest(req *http.Request) {
+	req.Header.Set("X-CodeBuddy-Request", "1")
 }
 
 // injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
@@ -330,6 +338,7 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	c.injectCodeBuddyRequest(req)
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	} else if ua := c.billingUA(); ua != "" {
