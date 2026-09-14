@@ -413,12 +413,13 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	}
 }
 
-// TestChatAccountFault11140Rotates 账号级授权故障（11140 request illegal，实测为
-// global 账号 auth_forbidden 风控）必须纳入轮换：坏号被冷却、同一请求换到下一个号、
-// 坏号冷却期内不再被选中。
+// TestChatAccountFault11140Disables 账号级授权封禁（11140 request illegal，实测为
+// global 账号 auth_forbidden 风控）：软冷却到期也不会自动恢复（需重新 OAuth 登录），
+// 到期后重新选号只会再撞 403 浪费轮换——故**硬禁用**（不在池中参与选号），同一请求
+// 轮换到下一个号、后续请求直接跳过。
 // 修复前 Classify 对 403+request illegal 归 ErrClient → applyErrorPolicy 走 default
-// 只换号不罚，坏号留在可用池，每个新请求都会被再次选中（无限重试刷风控）。
-func TestChatAccountFault11140Rotates(t *testing.T) {
+// 只换号不罚，坏号留在可用池反复被选中刷风控；软冷却列后来只是临时止血，到期复发。
+func TestChatAccountFault11140Disables(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls[authz]++
@@ -442,19 +443,23 @@ func TestChatAccountFault11140Rotates(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	// 坏号只打一次即被冷却并轮换到 good：无无限重试。
+	// 坏号只打一次即被禁用并轮换到 good：无无限重试。
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却（账号级故障纳入轮换）: %+v", st)
+	if !st.Disabled {
+		t.Fatalf("bad 应被硬禁用（11140 封禁需重登，不可自愈）: %+v", st)
 	}
-	if st.Reason == "" {
-		t.Errorf("bad 冷却 reason 应为空到具体原因: %+v", st)
+	wantReason := "account banned by upstream (11140 request illegal), re-login required"
+	if st.DisabledReason != wantReason {
+		t.Errorf("disabled_reason=%q want %q", st.DisabledReason, wantReason)
+	}
+	if st.Cooling {
+		t.Errorf("硬禁用由 disabled 表达，不应叠加冷却状态: %+v", st)
 	}
 
-	// 冷却生效：同一账号在冷却期内不得再被选中（选号跳过）。
+	// 禁用生效：后续请求（冷却早过期）也不再选中 bad（不再刷上游风控）。
 	before := calls["Bearer at-bad"]
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
@@ -462,12 +467,14 @@ func TestChatAccountFault11140Rotates(t *testing.T) {
 		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
 	}
 	if calls["Bearer at-bad"] != before {
-		t.Errorf("冷却中的账号不应再次被选中: calls=%v", calls)
+		t.Errorf("禁用的账号不应被选中: calls=%v", calls)
 	}
 }
 
 // TestChatAccountFault14017Rotates 配额未激活（14017 trial not activated，实测 global
 // 新账号 register 未完成）同样纳入轮换：坏号冷却、轮换到下一号、不再被重复选中。
+// 与 11140（硬禁用）区分的关键：14017 属于 register 未完成，完善 register 后可能
+// 自动恢复——所以**保持软冷却**，不禁用（禁用会让用户补完 register 后仍无法用）。
 func TestChatAccountFault14017Rotates(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -495,6 +502,15 @@ func TestChatAccountFault14017Rotates(t *testing.T) {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
 
+	// 14017 保持软冷却（软 45s），不得硬禁用——register 完善后自动恢复（区别于 11140）。
+	st, _ := p.Status("bad")
+	if st.Disabled {
+		t.Fatalf("bad 不应被禁用（14017 trial 未激活可能自愈）: %+v", st)
+	}
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Errorf("bad 应进入 soft_rate 冷却（14017 软冷却，非禁用）: %+v", st)
+	}
+
 	// 冷却生效：同一账号在冷却期内不得再被选中。
 	before := calls["Bearer at-bad"]
 	rec2 := httptest.NewRecorder()
@@ -505,6 +521,49 @@ func TestChatAccountFault14017Rotates(t *testing.T) {
 	if calls["Bearer at-bad"] != before {
 		t.Errorf("冷却中的账号不应再次被选中: calls=%v", calls)
 	}
+}
+
+// TestApplyErrorPolicyAccountFaultSplit applyErrorPolicy 层直接回归：同一 ErrAccountFault
+// 分类下按 msg 分野——"request illegal"(11140) → 硬禁用；"trial"(14017) → 软冷却不禁用。
+// 端到端接线由上方 TestChatAccountFault11140Disables / TestChatAccountFault14017Rotates 覆盖。
+func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
+	const why11140 = "account banned by upstream (11140 request illegal), re-login required"
+
+	t.Run("11140 request illegal disables", func(t *testing.T) {
+		p := pool.New("")
+		p.Add(&auth.Auth{UID: "u1"})
+		h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "glm-5.2")
+		st, _ := p.Status("u1")
+		if !st.Disabled {
+			t.Fatalf("11140 应硬禁用: %+v", st)
+		}
+		if st.DisabledReason != why11140 {
+			t.Errorf("disabled_reason=%q want %q", st.DisabledReason, why11140)
+		}
+		if st.Cooling {
+			t.Errorf("11140 禁用不应叠加冷却: %+v", st)
+		}
+	})
+
+	t.Run("14017 trial stays soft cool", func(t *testing.T) {
+		p := pool.New("")
+		p.Add(&auth.Auth{UID: "u1"})
+		h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated"}}}`, "glm-5.2")
+		st, _ := p.Status("u1")
+		if st.Disabled {
+			t.Fatalf("14017 不应禁用: %+v", st)
+		}
+		if !st.Cooling || st.CoolKind != "soft_rate" {
+			t.Errorf("14017 应 soft_rate 软冷却: %+v", st)
+		}
+		if st.Reason == "" {
+			t.Errorf("14017 冷却 reason 不应为空: %+v", st)
+		}
+	})
 }
 
 // TestApplyErrorPolicySoftRateExponentialBackoff handler 层回归：同一账号连续被限流，
