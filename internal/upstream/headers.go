@@ -126,7 +126,9 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
+	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
+	// chat 路径在 ChatHeaders 覆盖为流式 event-stream。
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
@@ -186,6 +188,8 @@ type ChatMeta struct {
 // meta 为会话头族元数据（CN/global 同构，纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
+	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	if a.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	} else {

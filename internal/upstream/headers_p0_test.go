@@ -83,3 +83,32 @@ func TestCommonHeadersAcceptLanguageByRealm(t *testing.T) {
 		t.Errorf("global refresh Accept-Language = %q want %q", got, "en-US")
 	}
 }
+
+// TestAcceptHeaderStreamVsNonStream Accept 头分流式/非流式（D6）：
+// chat 出站带 text/event-stream（流式），billing/refresh 出站仅 application/json
+// （去掉宽松的 text/plain, */*）。
+func TestAcceptHeaderStreamVsNonStream(t *testing.T) {
+	c := &Client{}
+	a := &auth.Auth{AccessToken: "at", UID: "u1", RefreshToken: "rt"}
+
+	// chat 流式：application/json, text/event-stream
+	chatReq := mustRequest(t)
+	c.ChatHeaders(chatReq, a, "", ChatMeta{})
+	if got := chatReq.Header.Get("Accept"); got != "application/json, text/event-stream" {
+		t.Errorf("chat Accept = %q want %q", got, "application/json, text/event-stream")
+	}
+
+	// billing 非流式：application/json
+	bReq := mustRequest(t)
+	c.BillingHeaders(bReq, a)
+	if got := bReq.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("billing Accept = %q want %q", got, "application/json")
+	}
+
+	// refresh 非流式：application/json
+	rReq := mustRequest(t)
+	c.RefreshHeaders(rReq, a)
+	if got := rReq.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("refresh Accept = %q want %q", got, "application/json")
+	}
+}
