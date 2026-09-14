@@ -120,6 +120,25 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	return p
 }
 
+// assertJSONErrorCode 断言响应体是 OpenAI 风格 error 信封且 code 精确等于 want。
+func assertJSONErrorCode(t *testing.T, body, want string) bool {
+	t.Helper()
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("not openai error json: %v body=%s", err, body)
+		return false
+	}
+	if envelope.Error.Code != want {
+		t.Errorf("error code=%q want %q body=%s", envelope.Error.Code, want, body)
+		return false
+	}
+	return true
+}
+
 // TestChatBodyLimitExactAllowed 恰好等于上限的请求体正常放行到上游（不被 413 误伤）。
 func TestChatBodyLimitExactAllowed(t *testing.T) {
 	var calls int
@@ -1584,7 +1603,7 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 }
 
 // TestContentBlockedCustomModeDoesNotDegrade custom 模式不触发降级重试
-// （custom 已用自有提示词替换，不应再有 system 来源误报；若仍 400 走既有错误路径）。
+// （custom 已用自有提示词替换，不应再有 system 来源误报；若仍拦则回 400 content_blocked）。
 func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
@@ -1595,16 +1614,29 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`)))
-	// custom 模式下 400 直接返回 503（所有账号轮转失败），不降级重试。
-	if rec.Code != 503 {
-		t.Fatalf("code=%d want 503 (custom does not degrade)", rec.Code)
+	// custom 模式下内容拦截直接回 400 content_blocked，不降级重试、不轮转、不暴露账号语义。
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400 (custom does not degrade)", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"content_blocked"`) {
+		t.Errorf("want content_blocked code: %s", body)
+	}
+	if !strings.Contains(body, "触发网站风控违禁词") || !strings.Contains(body, "规则[违禁词]") {
+		t.Errorf("want firewall message with keyword, not error code: %s", body)
+	}
+	for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "no_healthy"} {
+		if strings.Contains(strings.ToLower(body), leak) {
+			t.Errorf("must not leak %q: %s", leak, body)
+		}
 	}
 	if h.degrade.Active() {
 		t.Error("degrade should NOT be active in custom mode")
 	}
 }
 
-// TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError）。
+// TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError），
+// 且 passthrough 降级重试后第二次仍拦 → 立即 400 content_blocked（不轮转、不泄露上游错误码）。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
@@ -1618,9 +1650,116 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
 
+	// passthrough 首遇（无原始 system，实际无降级重试）→ 内容拦截直接回 400 content_blocked。
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"content_blocked"`) {
+		t.Errorf("passthrough retry-still-blocked should return content_blocked: %s", rec.Body)
+	}
+
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
 		t.Fatalf("ErrContentBlocked should not penalize account: %+v", st)
+	}
+}
+
+// TestContentBlockedSecondHitReturns400 passthrough 首遇降级重试、第二次仍拦 → 立即 400
+// content_blocked：**不轮转**（多账号池也只打一次）、**不罚账号**、防火墙文案不含账号/错误码。
+func TestContentBlockedSecondHitReturns400(t *testing.T) {
+	calls := 0
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: 400,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":11128,"msg":"blocked by security policy"}`)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`)))
+
+	// passthrough 首遇（body 含原始 system）→ 降级重试一次；第二次仍拦 → 立即 400，不轮转。
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	if calls != 2 {
+		t.Errorf("want exactly 2 upstream calls (first 400 + one degraded retry, then stop), got %d", calls)
+	}
+	body := rec.Body.String()
+	if !assertJSONErrorCode(t, body, "content_blocked") {
+		return
+	}
+	for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy"} {
+		if strings.Contains(strings.ToLower(body), leak) {
+			t.Errorf("must not leak %q: %s", leak, body)
+		}
+	}
+	// 不轮转 ⇒ 两个账号都未被施加任何处罚（无冷却/禁用/熔断计数）。
+	for _, uid := range []string{"u1", "u2"} {
+		st, _ := p.Status(uid)
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 {
+			t.Fatalf("content_blocked must not penalize any account: uid=%s status=%+v", uid, st)
+		}
+	}
+}
+
+// TestContentBlockedReturnsFirewallMessage 内容拦截最终失败时回 400 content_blocked，
+// 文案为网关防火墙口径（含分类关键词），不含账号/冷却/upstream/错误码前缀。
+func TestContentBlockedReturnsFirewallMessage(t *testing.T) {
+	calls := 0
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, `{"code":11128,"msg":"blocked by security policy: content contains NSFW material"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: "SYS"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	// custom 模式不走降级，因此只应打一次上游（不轮转第二个账号）。
+	if calls != 1 {
+		t.Errorf("content_blocked must not rotate accounts, calls=%d", calls)
+	}
+
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("not openai error json: %v body=%s", err, rec.Body)
+	}
+	if envelope.Error.Code != "content_blocked" {
+		t.Errorf("code=%q want content_blocked", envelope.Error.Code)
+	}
+	want := "触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[nsfw]，已被拦截。请修改内容后重试。"
+	if envelope.Error.Message != want {
+		t.Errorf("message=%q want %q", envelope.Error.Message, want)
+	}
+	for _, leak := range []string{"account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy", "11128"} {
+		if strings.Contains(strings.ToLower(rec.Body.String()), leak) {
+			t.Errorf("must not leak %q: %s", leak, rec.Body)
+		}
 	}
 }
 
