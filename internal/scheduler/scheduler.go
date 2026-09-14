@@ -323,6 +323,8 @@ func joinDetail(existing, add string) string {
 
 // RunActivityNow 立即对池内所有可用账号执行对话活跃上报。
 // 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
+// CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 可用）；单账号失败
+// 只记 WARN 不影响遍历。
 //
 // 每号上报 N 条（ActivityReportCount，默认 5）：N 条共用同一 conversationId
 // （wb2api-<ms>），模拟同一会话内 N 轮对话——这是领养猫（buddy/first）对话量
@@ -346,9 +348,9 @@ func (s *Scheduler) RunActivityNow() {
 		if a == nil || a.AccessToken == "" {
 			continue
 		}
-		if a.IsGlobal() {
-			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
-		}
+		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
+		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
+		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
 		if !first {
 			time.Sleep(activityAccountDelay)
 		}

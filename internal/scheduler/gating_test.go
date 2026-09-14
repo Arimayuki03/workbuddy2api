@@ -11,12 +11,13 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-// TestGlobalAccountsSkipCheckinTravelActivity 门控核心：池内 global 账号在
-// checkin/travel/activity 三类循环中**零上游调用**；CN 账号照常。
+// TestGlobalAccountsSkipCheckinTravel gating（活动已放开，见下方两个 activity 用例）：
+// 池内 global 账号在 checkin/travel 两类循环中**零上游调用**；activity 已不再跳过
+// global（PR #45 实测 /v2/report 在 workbuddy.ai code=0 OK）。
 //
 // fake upstream 全路径统计调用数：global 账号若被误放行，会打到 fake server
-// 的 /daily-checkin /buddy/info /v2/report 等任意路径，调用数即 >0。
-func TestGlobalAccountsSkipCheckinTravelActivity(t *testing.T) {
+// 的 /daily-checkin /buddy/info 等任意路径，调用数即 >0。
+func TestGlobalAccountsSkipCheckinTravel(t *testing.T) {
 	fastTravel(t)
 	fastActivity(t)
 
@@ -31,16 +32,15 @@ func TestGlobalAccountsSkipCheckinTravelActivity(t *testing.T) {
 	// 显式 realm=global（下行 Domain 兜底场景在 auth 包单测覆盖，这里直接构造 global）。
 	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
 		Domain: "www.workbuddy.ai"})
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, GlobalEnabled: true}
 	s := New(Config{Pool: p, Upstream: up})
 
-	// 三类循环各跑一趟：global 账号不应发起任何上游调用。
+	// 签到/旅行循环：global 账号不应发起任何上游调用。
 	s.CheckinAll()
-	s.RunActivityNow()
 	s.RunTravelNow()
 
 	if n := calls.Load(); n != 0 {
-		t.Errorf("global account upstream calls=%d want 0（checkin/travel/activity 均跳过）", n)
+		t.Errorf("global account checkin/travel upstream calls=%d want 0（checkin/travel 仍跳过）", n)
 	}
 }
 
@@ -81,16 +81,16 @@ func TestGlobalAccountSkippedListedWithStatus(t *testing.T) {
 	}
 }
 
-// TestGlobalAndCNMixedPoolOnlyCNServed 混池：global 账号被跳过、CN 账号照常跑。
-// 一次 fake upstream 同时统计两类账号真正打到的请求——区隔"零调用"不是池空、
-// 而是全局跳过逻辑生效。
-func TestGlobalAndCNMixedPoolOnlyCNServed(t *testing.T) {
+// TestGlobalAndCNMixedPoolServed 混池：activity **两类都上报**（global 不再跳过，
+// PR #45 实测 workbuddy.ai /v2/report code=0 OK）；travel 仍只服务 CN（global 跳过）。
+// 一次 fake upstream 同时统计两类账号真正打到的请求——区隔"放行"不是池空。
+func TestGlobalAndCNMixedPoolServed(t *testing.T) {
 	fastTravel(t)
 	fastActivity(t)
 
 	stub := &reportStub{} // /v2/report 统计 + X-User-Id 判定
 	growth := &travelStub{buddy: "null"}
-	// 合并 growth/billing 端点：activity 的 report + travel 的 buddy 都要能被 CN 打到。
+	// 合并 growth/billing 端点：activity 的 report + travel 的 buddy 都要能被两类账号打到。
 	both := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/report" {
 			stub.handler().ServeHTTP(w, r)
@@ -104,21 +104,101 @@ func TestGlobalAndCNMixedPoolOnlyCNServed(t *testing.T) {
 	p.Add(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
 		Domain: "www.workbuddy.ai"})
-	up := &upstream.Client{HTTP: both.Client(), ChatBaseCN: both.URL, BillingBaseCN: both.URL}
+	up := &upstream.Client{HTTP: both.Client(), ChatBaseCN: both.URL, BillingBaseCN: both.URL,
+		BillingBaseGlobal: both.URL, GlobalEnabled: true}
 	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
 
 	s.RunActivityNow()
-	if n := stub.calls.Load(); n != 1 {
-		t.Errorf("CN activity report calls=%d want 1（仅 CN 账号上报）", n)
+	// CN + global 各上报一次（global 不再跳过）。
+	if n := stub.calls.Load(); n != 2 {
+		t.Errorf("activity report calls=%d want 2（CN + global 各 1）", n)
 	}
 	// activity 阶段会顺带领猫（travelAdoptForce），把 buddy/info 计数打进快照；
-	// 旅行检验只数 RunTravelNow 这段的增量。
+	// 旅行检验只数 RunTravelNow 这段的增量（global 被 travel 跳过，只有 CN 走）。
 	infoBefore := growth.infoCalls.Load()
 
 	s.RunTravelNow()
 	infoDelta := growth.infoCalls.Load() - infoBefore
 	if infoDelta != 1 {
 		t.Errorf("CN travel buddy-info delta=%d want 1（仅 CN 账号旅行）", infoDelta)
+	}
+}
+
+// TestRunActivityNowReportsGlobalAccounts 核心验收：global 账号的 report 上报**不再跳过**
+// （PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK）。fake upstream 断言
+// global 账号真的发出 /v2/report 请求；且按 realm 路由到 global billing base。
+func TestRunActivityNowReportsGlobalAccounts(t *testing.T) {
+	fastActivity(t)
+
+	var globalCalls, cnCalls atomic.Int32
+	reportOK := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/report" {
+			t.Errorf("path=%s want /v2/report", r.URL.Path)
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	})
+	globalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		globalCalls.Add(1)
+		reportOK.ServeHTTP(w, r)
+	}))
+	defer globalSrv.Close()
+	cnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cnCalls.Add(1)
+		reportOK.ServeHTTP(w, r)
+	}))
+	defer cnSrv.Close()
+
+	p := pool.New("")
+	// 纯 global 池：若 report 仍被 IsGlobal() 跳过，globalSrv 计数保持 0。
+	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
+		Domain: "www.workbuddy.ai"})
+	up := &upstream.Client{HTTP: globalSrv.Client(), ChatBaseCN: cnSrv.URL, BillingBaseCN: cnSrv.URL,
+		BillingBaseGlobal: globalSrv.URL, GlobalEnabled: true}
+	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
+
+	s.RunActivityNow()
+
+	if n := globalCalls.Load(); n != 1 {
+		t.Errorf("global account report calls=%d want 1（global 上报不再跳过）", n)
+	}
+	if n := cnCalls.Load(); n != 0 {
+		t.Errorf("global account 不应打到 CN base: cn_calls=%d", n)
+	}
+}
+
+// TestRunActivityNowGlobalReportFailWarnsButOthersProceed global report 失败（如上游
+// 不认 /v2/report）→ 记 WARN 不影响其他账号：同一趟里 CN 账号照常上报。
+func TestRunActivityNowGlobalReportFailWarnsButOthersProceed(t *testing.T) {
+	fastActivity(t)
+
+	var cnCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/report":
+			uid := r.Header.Get("X-User-Id")
+			if uid == "g1" {
+				http.Error(w, "no such report endpoint on global", 404)
+				return
+			}
+			cnCalls.Add(1)
+			w.Write([]byte(`{"code":0,"msg":"OK"}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
+		Domain: "www.workbuddy.ai"})
+	p.Add(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, GlobalEnabled: true}
+	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
+
+	s.RunActivityNow() // 不应 panic，g1 的 report 失败只记 WARN
+
+	if n := cnCalls.Load(); n != 1 {
+		t.Errorf("CN account report calls=%d want 1（global 失败不影响 CN）", n)
 	}
 }
 
