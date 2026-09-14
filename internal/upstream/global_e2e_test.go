@@ -551,14 +551,14 @@ func TestGlobalE2EErrorCodeSemantics(t *testing.T) {
 // 8/9/10. 网关侧验证（调本地 :7863）
 // ============================================================================
 
-// gatewayConfig 从 config.json 读 listen/api_key（读失败回落默认 :7863 / tistzach）。
+// gatewayConfig 从 config.json 读 listen/api_key（读失败回落默认 :7863 / test-key）。
 type gatewayConfig struct {
 	Listen string `json:"listen"`
 	APIKey string `json:"api_key"`
 }
 
 func loadGatewayConfig() gatewayConfig {
-	gc := gatewayConfig{Listen: ":7863", APIKey: "tistzach"}
+	gc := gatewayConfig{Listen: ":7863", APIKey: "test-key"}
 	for _, cand := range []string{"config.json", "../config.json", "../../config.json", "/root/workbuddy2api/config.json"} {
 		if raw, err := os.ReadFile(cand); err == nil {
 			if err := json.Unmarshal(raw, &gc); err == nil {
@@ -694,5 +694,5 @@ func TestGlobalE2EGatewayChat(t *testing.T) {
 		}
 		t.Logf("  非 2xx body: %s", bodyStr)
 	}
-	t.Logf("  注#10: 选号/出站域/日志见容器 docker logs（uid 应为 bfb03c91-153d-4de2-a2b3-aaa1e51660ed，host workbuddy.ai）")
+	t.Logf("  注#10: 选号/出站域/日志见容器 docker logs（uid 见 auths/ 下 global 账号，host workbuddy.ai）")
 }

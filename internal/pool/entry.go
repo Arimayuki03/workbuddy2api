@@ -162,27 +162,24 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	return !mc.Until.IsZero() && now.Before(mc.Until)
 }
 
-// healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
-//   - disabled → 永不可选（最高优先级）；
-//   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
-//     （多模型限流时各自独立，互不影响——这是本次 issue 的核心）；
-//   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
+// healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）。
 //
-// 对比旧实现（softRateModel 单字段豁免"仅锁一个模型、其他豁免"），新语义天然支持
-// 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
-// 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
+// 优先级（全账号级先判，模型级后判）：
+//   - 全账号不可用（disabled / 账号级 until / breakerUntil，见 healthy）→ 永不可选；
+//     账号整体不可用时查该模型的独立冷却没有意义，直接短路返回 false。
+//   - 仅全账号健康时，才查该模型是否正处 6004 独立冷却
+//     （modelCooldowns[reqModel] 未过期）→ 不可选；
+//   - 否则可选。
+//
+// 模型级维度只锁定触发模型：多模型同时 6004 时各自独立，被 B 限流的账号对 A 请求
+// 仍可选（A 不在 modelCooldowns 拦截且账号级 healthy 成立）。空 reqModel /
+// 未记录模型 → 等价 healthy。6004 从不写账号级 until（见 CooldownSoftForModel），
+// 因此不存在「账号级冷却因病 6004 而起、应豁免其他模型」的形态。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	// 优先级：全账号冷却 > 模型独立冷却。
-	// 全账号冷却（disabled/until/breakerUntil）了就不必再查模型级——该账号整体不可用。
-	if !e.healthy(now) {
-		// 全账号未冷却时不会走到这；若账号级 healthy 但该模型有 6004 独立冷却，下面再判。
-		// 但 healthy 已包含 disabled 判定，所以这里不会再走到模型冷却。
-		// 特殊豁免：全账号 until 冷却但由 6004 触发（旧 modelExempt 语义）时，
-		// 其他模型仍可用——但现在 6004 不再写 until，所以不存在这种豁免。
+	if !e.healthy(now) { // 全账号级（disabled/until/breakerUntil）先判
 		return false
 	}
-	// 账号级健康 → 查该模型是否有 6004 独立冷却。
-	if e.modelCooled(now, reqModel) {
+	if e.modelCooled(now, reqModel) { // 全账号健康时再查该模型的 6004 独立冷却
 		return false
 	}
 	return true
