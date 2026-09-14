@@ -51,7 +51,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ``
 
 - **流式 + 非流式** — 出站强制 `stream:true`；SSE 帧按 OpenAI 规范白名单重建；非流式由本地聚合为单响应
 - **DeepSeek 思维链注入** — 出站请求体注入 `thinking.type=enabled` + 默认档位，`reasoning_content` 多轮回填，`reasoning_effort` 按模型档位自动降级
-- **系统提示词体系** — 网关自有提示词替换客户端 system（`custom` 模式，默认），从源头消除模板句误报；`passthrough` 模式遇拦截自动降级中性提示词重试
+- **系统提示词体系** — 默认透传客户端原始 system（`passthrough` 模式，缺省），仅自定义配置 `custom` 时网关用自有提示词替换客户端 system/developer（从源头消除模板句误报）；`passthrough` 模式遇拦截自动降级中性提示词重试
 - **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传 · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）
 - **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可开关），与提示词体系两层叠加
 
