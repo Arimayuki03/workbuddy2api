@@ -38,7 +38,10 @@ func withChatLog(t *testing.T) {
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {
-	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	// 起点回拨 1ms：内存流（strings.Reader）瞬时返回，用 time.Now() 作起点会让
+	// ttfb=time.Since(start) 在同一时钟滴答内测得 0（Windows 精度 ~0.5ms 尤甚）。
+	// 生产 SSE 是网络流 ttfb 必然 >0；此处回拨起点模拟"已过一段时间"的可分辨测量。
+	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now().Add(-time.Millisecond))
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		t.Fatalf("copy: %v", err)
 	}

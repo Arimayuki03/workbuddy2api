@@ -67,17 +67,28 @@ type RateLimitedModel struct {
 }
 
 type entry struct {
-	a            *auth.Auth
-	credits      int64
-	successCount int64     // 累计成功
-	errTotal     int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr      time.Time // 最近一次错误时间
-	lastSuccess  time.Time // 最近一次成功时间
-	coolKind     CoolKind
-	until        time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled     bool
-	reason       string
-	lastUsed     time.Time // 最近被选中时刻（防并发撞号）
+	a       *auth.Auth
+	credits int64
+	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
+	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
+	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
+	// （issue:积分过期）。运行态，签到刷新，不单独持久化（credits 仍持总量）。
+	creditsExpiring int64
+	successCount    int64     // 累计成功
+	errTotal        int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr         time.Time // 最近一次错误时间
+	lastSuccess     time.Time // 最近一次成功时间
+	coolKind        CoolKind
+	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled        bool
+	reason          string
+	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
+	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
+	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效（高并发/低精度时钟下：
+	// lastUsed 全等 → LRU Before 全 false → 恒选 candsAll[0] → 集中单号）。
+	// usedSeq 提供严格全序，与时间精度无关。运行态，不持久化。
+	usedSeq uint64
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。

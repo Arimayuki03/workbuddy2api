@@ -501,8 +501,8 @@ func (c *Client) billingBase(a *auth.Auth) string {
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
 // 统一走 billingJSON 发请求。
 const (
-	billingMeterPath  = "/billing/meter/get-user-resource"  // global 首选（R9：国际版无 /v2 前缀）
-	dailyCheckinPath  = "/billing/meter/daily-checkin"      // global 首选
+	billingMeterPath   = "/billing/meter/get-user-resource"    // global 首选（R9：国际版无 /v2 前缀）
+	dailyCheckinPath   = "/billing/meter/daily-checkin"        // global 首选
 	billingMeterPathV2 = "/v2/billing/meter/get-user-resource" // CN 现状 / global fallback
 	dailyCheckinPathV2 = "/v2/billing/meter/daily-checkin"
 )
@@ -552,20 +552,54 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
+// refreshIOTimeout 单次 refresh 网络调用的总时长上限。
+// 远小于 HTTP.Client.Timeout(120s)：refresh 持锁窗口内做网络 I/O，超时越短，
+// 单账号 hang 对该账号相关操作的阻塞越短（issue:持锁 120s I/O → 池级停滞）。
+const refreshIOTimeout = 30 * time.Second
+
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
-// 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
+// 调用方负责 SaveAtomic。
+//
+// 并发安全模型（两段式，缩小持锁窗口）：
+//   - 锁内仅做「读 refreshToken 快照」与「校验未变后写回新 token」两小段内存操作；
+//   - 网络 I/O（doJSON）在**锁外**执行，带 30s ctx 超时——避免上游 hang 时长时间
+//     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
+//   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
+//     已变），本次结果直接采用（新 token 已生效），不再重复写回。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	// 第 1 段（锁内）：读快照。
 	a.Lock()
-	defer a.Unlock()
-	if strings.TrimSpace(a.RefreshToken) == "" {
+	rtSnapshot := a.RefreshToken
+	atBefore := a.AccessToken
+	a.Unlock()
+	if strings.TrimSpace(rtSnapshot) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
+
 	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return err
 	}
-	c.RefreshHeaders(req, a)
+	// RefreshHeaders 读取 a 的字段（domain/uid 等）注入请求头——需在锁内取快照值，
+	// 用一个显式逐字段拷贝的临时 auth 构造头（不拷贝 sync.Mutex，避免 vet copies-lock）。
+	a.Lock()
+	hdrSnapshot := auth.Auth{
+		AccessToken:  a.AccessToken,
+		RefreshToken: rtSnapshot,
+		ExpiresAt:    a.ExpiresAt,
+		Domain:       a.Domain,
+		UID:          a.UID,
+		EnterpriseID: a.EnterpriseID,
+		Nickname:     a.Nickname,
+		DeviceToken:  a.DeviceToken,
+	}
+	a.Unlock()
+	c.RefreshHeaders(req, &hdrSnapshot)
+
+	// 网络 I/O（锁外，30s 上限）。
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -578,6 +612,16 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	}
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
+	}
+
+	// 第 2 段（锁内）：校验快照一致后写回。
+	a.Lock()
+	defer a.Unlock()
+	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
+		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
+		// （两个并发刷新拿到的新 token 都有效，后写会覆盖先写，但二者等价可用；
+		// 提前返回避免无意义覆盖与 ExpiresAt 抖动）。
+		return nil
 	}
 	a.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
@@ -613,16 +657,22 @@ const (
 func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
-// clientIP 为本次请求的客户端 IP（PassthroughIP=true 时注入；空串表示不透传）。
-// 按**请求传递**而非读共享字段：避免并发请求交叉污染对方 IP（issue：ClientIP 竞态）。
-// meta 为会话头族（issue #35）：同一次 user send 的换号/重试/降级复用同一
-// conversationRequestID，后台按它聚合（handler 轮转循环外生成，循环内原样传）。
-// 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
-// 只有传输层失败才返回 err。
+// 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
+// 新调用方应优先用 ChatStreamContext 传入请求 ctx（客户端断连即中断在途调用、释放租约）。
 //
 // global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
 // （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
+}
+
+// ChatStreamContext 同 ChatStream，但从 ctx 派生请求 context：调用方（handler）传入
+// r.Context() 后，客户端断连/请求取消会立即中断在途上游调用、释放连接与账号在途名额，
+// 不再空转到 IdleTimeout。ctx 为 nil 时回落 Background。
+func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var cancel context.CancelFunc
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
@@ -637,8 +687,10 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
-		ctx, cancel := context.WithCancel(context.Background())
-		req = req.WithContext(ctx)
+		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
+		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
+		reqCtx, cancel := context.WithCancel(ctx)
+		req = req.WithContext(reqCtx)
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {
 			cancel()
@@ -660,7 +712,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 		}
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
-		// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
+		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
 		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
 	cancel()
@@ -836,24 +888,51 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, b
 
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
+	remain, _, err = c.UserResourceDetailed(a, 0)
+	return remain, err
+}
+
+// CreditBuckets 按到期紧迫度拆分的积分余额（供 pool 优先消耗快过期积分）。
+// 背景（issue:积分过期）：套餐/奖励积分按 PackageEndTime 分批过期，总量口径的
+// remain 会让"明天就作废"的积分与"30 天后才过期"的积分被无差别选号，
+// 导致快过期积分没优先用掉、白白作废。拆桶后选号可优先消耗 Expiring。
+type CreditBuckets struct {
+	// Expiring 在 soon 窗口内（<= now+soon）即将过期的可用积分。
+	Expiring int64
+	// Stable 其余有效积分（到期时间更远或无到期时间）。
+	Stable int64
+}
+
+// Total 返回两桶合计可用积分（= UserResource 的 remain 口径）。
+func (b CreditBuckets) Total() int64 { return b.Expiring + b.Stable }
+
+// packageEndLayout 上游 PackageEndTime 的时间格式（与请求体过滤串同口径）。
+const packageEndLayout = "2006-01-02 15:04:05"
+
+// UserResourceDetailed 同 UserResource，但按到期时间把余额拆成 CreditBuckets。
+// soon>0 时把到期时间 <= now+soon 的套餐余额计入 Expiring；soon<=0 时全部归 Stable。
+// PackageEndTime 解析失败/缺失的套餐保守归入 Stable（不误标为快过期而插队）。
+// 单套餐取数口径（Cycle* 优先）与 UserResource 完全一致，保证向后兼容。
+func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain int64, buckets CreditBuckets, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
 		"ProductCode":              "p_tcaca",
 		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
+		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
+		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
 	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
-		return 0, err
+		return 0, CreditBuckets{}, err
 	}
 	var resp struct {
 		Response struct {
 			Data struct {
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
+					PackageEndTime      string `json:"PackageEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
 					CapacityUsed        int64  `json:"CapacityUsed"`
@@ -865,7 +944,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("resource parse: %w", err)
+		return 0, CreditBuckets{}, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		var r int64
@@ -881,8 +960,19 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 			r = 0
 		}
 		remain += r
+		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → Expiring。
+		if soon > 0 && r > 0 && acct.PackageEndTime != "" {
+			// 上游时间为 UTC+8 墙钟（与 softRateResetLoc 同口径，官网展示时区）。
+			if end, perr := time.ParseInLocation(packageEndLayout, acct.PackageEndTime, softRateResetLoc); perr == nil {
+				if !end.After(now.Add(soon)) {
+					buckets.Expiring += r
+					continue
+				}
+			}
+		}
+		buckets.Stable += r
 	}
-	return remain, nil
+	return remain, buckets, nil
 }
 
 // ResourceSummary 查询账号积分套餐的完整聚合口径（remain=剩余可花积分、used=已用、
