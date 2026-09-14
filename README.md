@@ -25,26 +25,26 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 - 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（`login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
 - 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；
+- 同时适配**国内版（CN，`copilot.tencent.com` / `www.codebuddy.cn`）与国际版（Global，`www.workbuddy.ai`）**账号，共享同一账号池，由账号 `realm` 或请求模型名前缀决定路由；
 - 对客户端只暴露 OpenAI 兼容接口，现有 SDK / 前端 / 工具 **零改造接入**。
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
 ## 核心能力
 
-| 能力 | 说明 |
-|---|---|
-| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |
-| 🔄 **多账号池** | 三因子加权随机选号（积分占比 ×10 + 闲置补偿 + 成功率 ×3），Top-5 候选 + 防惊群 |
-| 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
-| 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失；**按模型判定可用性**——该模型被 6004 限额时立即重分配 |
-| 💰 **成本优先选号** | 按每次响应的实测扣费（`usage.credit`）记账 `(账号, 模型)`，选号时免费 / 便宜的号优先——同一模型自动优先走仍在限免期的号 |
-| ⏰ **定时任务** | 签到（09/21 点）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
-| ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
-| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
-| 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
-| 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
-| 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
-| 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
+- 🔑 **OAuth 设备授权** — `login.sh` 免密登录一次完成（取授权 URL → 轮询 token → 落盘凭证 → 重启加载），支持多账号连续添加
+- 🔄 **多账号池调度** — 三因子加权随机选号（积分占比 ×10 + 闲置补偿 + 成功率 ×3）、Top-5 候选短名单、防惊群、在途租约限流
+- 🛡️ **分级熔断与冷却** — 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 浅冷却、402 硬冷却至次日 04:00、连续失败熔断、6004 模型级独立冷却
+- 🧲 **会话粘性** — 同一会话尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失；**按模型判定可用性**——模型被 6004 限额时立即重分配
+- 💰 **成本优先选号** — 按每次响应的实测扣费（`usage.credit`）记账 `(账号, 模型)`，免费 / 便宜的号优先（同模型自动优先令免期号）
+- ⏰ **定时任务调度** — 签到（09/21 点）+ 对话活跃上报（10 点，点亮连登 / 解锁领养）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关
+- ⚡ **流式 + 非流式** — 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应
+- 🧠 **推理模型兼容** — DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级
+- 💬 **系统提示词体系** — 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试
+- 🗑️ **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加
+- 🌐 **国际版兼容（Global Realm）** — `--realm=global` 登录、注册激活 + region 完善、trial 领取；`[realm:]model` 前缀路由；分池选号
+- 📊 **可观测** — 每请求一行表格日志（TTFB / token 速率 / uid）；`/status` 透出 `realm_totals` / `rate_limited_models` / `disabled_reason`；`/healthz` 带 `realm_servable`
+- 💾 **状态持久化** — 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复
 
 ## 架构总览
 
@@ -55,7 +55,7 @@ flowchart LR
     subgraph GWI["WorkBuddy2API 网关 :7863"]
         H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
         H --> S
-        P["账号池\n三因子加权 · 熔断 · 冷却 · 租约"] --> U
+        P["账号池\nrealm 过滤 · 三因子加权 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
         T["定时调度\n签到 09/21 · 旅行 09/21 · 活跃 10 · 保活 22"] --> P
         U["上游 Client\nChatHTTP 流式 · 短 RPC"]
@@ -63,11 +63,12 @@ flowchart LR
 
     P -. "读凭证 (0600)" .-> AUTH[("auths/*.json")]
     P -. "状态镜像" .-> REDIS[("Upstash Redis\n可选")]
-    U -->|"chat/completions (SSE)"| CB["CodeBuddy\ncopilot.tencent.com"]
-    U -->|"billing / auth / growth"| CB
+    U -->|"chat/completions (SSE)"| CN["CodeBuddy\ncopilot.tencent.com"]
+    U -->|"/console|/v2 chat, /billing/*"| GL["WorkBuddy\nwww.workbuddy.ai"]
+    U -->|"billing / auth / growth"| CN
 ```
 
-上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
+上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。国际版（`realm=global`）出站走 `www.workbuddy.ai`：聊天 `/console/chat/completions`（404/405 回落 `/v2/chat/completions`），billing 域 `/billing/meter/*`（404 回落 `/v2/billing/meter/*`）。
 
 ## 快速开始
 
@@ -88,7 +89,7 @@ cp config.example.json config.json
 编辑 `config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置）。示例中的 `test_key` 等均为占位符，`config.example.json` 不含任何真实密钥。
 
 ```bash
-# 登录添加账号（重复执行可加多号）
+# 登录添加账号（重复执行可加多号；交互式选择国内版 / 国际版）
 ./login.sh
 
 # 启动服务
@@ -96,10 +97,12 @@ docker compose up -d --build
 
 # 健康检查（无可用账号时 503）；service 字段用于确认打到的是本网关
 curl -s http://localhost:7863/healthz
-# {"healthy":2,"total":3,"service":"workbuddy2api"}
+# {"healthy":2,"total":3,"service":"workbuddy2api","realm_servable":{"cn":true,"global":false}}
 ```
 
 `login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + `auths/workbuddy-<uid>.json` 落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
+
+`--realm=global` 登录国际版账号时，`login.sh` 自动执行**注册激活 + trial 领取**（见[国际版账号](#国际版账号global-realm)），失败只提示不阻断登录。
 
 ### 源码构建
 
@@ -122,10 +125,10 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ### 验证
 
 ```bash
-# 模型列表
+# 模型列表（CN 模型带 cn: 前缀，Global 模型带 global: 前缀）
 curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
 
-# 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason）
+# 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason；realm_totals 按域分组的汇总）
 curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
 
 # 流式聊天
@@ -155,10 +158,11 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
-| `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
+| `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶（6004 模型级冷却的 reset 墙钟也按此封顶） |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
 | `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖） |
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
+| `schedule.activity_report_count` | `5` | 每号每次活跃上报的条数（同会话 5 连发刷满 `chat_5`，领猫前置；`0` = 旧行为每号每天 1 条） |
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `schedule.checkin_enabled` | `true` | 签到总开关；`false` 真正关闭 |
 | `schedule.travel_enabled` | `true` | 猫猫旅行总开关（独立于签到） |
@@ -169,7 +173,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.user_agent` / `client_version` / `cli_version` / `client_name` | 空 | 出站 UA / 版本段 / 客户端名覆盖（空 = 内置默认）。官网「使用端」列按出站 UA 服务端归因 |
+| `upstream.device_token` / `device_token_file` | 空 | 设备指纹 token 覆盖（空 = 由网关生成并持久化） |
+| `upstream.passthrough_ip` | `false` | 透传客户端真实 IP（`X-Forwarded-For` 等）到上游 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
@@ -196,13 +202,15 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 环境变量覆盖
 
-加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
+加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）。当前支持的完整清单：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_DEVICE_TOKEN` · `WB2A_DEVICE_TOKEN_FILE` · `WB2A_CLIENT_NAME` · `WB2A_CLIENT_VERSION` · `WB2A_CLI_VERSION` · `WB2A_PASSTHROUGH_IP`(bool) · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+
+> `schedule.*` 由 `internal/config` 统一管理默认值（签到 / 旅行 / 活跃 / 保活时刻与开关），当前不可经 env 覆盖，一律走 `config.json`。另有调试开关 `WB2A_DUMP_REQ`（非配置字段）：置 1 时把超上游的请求体转储到 `/app/data/last_request.json`。
 
 ## 国际版账号（Global Realm）
 
-网关同时支持国内版（CN，`copilot.tencent.com` / `www.codebuddy.cn`）与国际版（Global，`www.workbuddy.ai`）账号。两条轨道共享同一个账号池，由账号的 `realm` 或请求的模型名前缀决定路由。
+网关同时适配国内版（CN，`copilot.tencent.com` / `www.codebuddy.cn`）与国际版（Global，`www.workbuddy.ai`）账号。两条轨道共享同一个账号池，由账号的 `realm` 或请求的模型名前缀决定路由。
 
 ### 登录：交互式选域
 
@@ -248,7 +256,8 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 
 | 行为 | CN 账号 | Global 账号 |
 |---|---|---|
-| 定时签到 / 活跃上报 / 猫猫旅行 | 照常 | **全部跳过**（无签到体系 / 任务中心；调度器直接过滤，不发起任何上游调用，避免风控） |
+| 定时签到 / 猫猫旅行 | 照常 | **跳过**（无签到体系 / 任务中心；调度器直接过滤，不发起任何上游调用，避免风控） |
+| 对话活跃上报 | 照常 | **照常上报**（`/v2/report` 在 workbuddy.ai 上 code=0 OK，同步点亮连登；realm 路由与头按 realm 切换） |
 | token 保活 | 刷新 | **照常刷新**（Global 的 refresh 端点存在） |
 | 积分增益 | 签到 + 旅行 + 活跃 + 任务中心 | 仅一次性 **trial 加油包**（见下） |
 | 模型目录 | 动态拉取 + 静态表 | `fetchGlobalModels` 探测（console → `/v2/models` 家族）+ 内置名单兜底，只产模型名不产倍率 |
@@ -292,7 +301,7 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 
 ### 错误分类与账号处置
 
-上游错误由 `Classify` 统一分类（判定优先级：余额耗尽 → session 失效 → 限流文案 → 状态码兜底），账号处置如下：
+上游错误由 `Classify` 统一分类（判定优先级：余额耗尽 → session 失效 → 账号级故障 → 限流文案 → 状态码兜底），账号处置如下：
 
 | 分类 | 触发条件 | 账号处置 | 恢复 |
 |---|---|---|---|
@@ -301,7 +310,8 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 | Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
-| 账号级故障 | HTTP 403 + `request illegal`（11140）/ `trial not activated`（14017） | 软冷却 `soft_rate`（与 429 同路径，账号级授权/配额故障：11140 = auth 风控需重登，14017 = register 未完成试用未激活） | 到期自动恢复 / 重新 OAuth 登录 |
+| 账号级故障 | HTTP 403 + `request illegal`（11140） | **硬禁用并透出 `disabled_reason`**（`account banned by upstream (11140 request illegal), re-login required`）——软冷却到期也不会自愈，到期后重新选号只会再撞 403 浪费一次轮换 | **重新 OAuth 登录**（`login.sh`）后复活 |
+| 试用未激活 | HTTP 403/429 + `trial not activated`（14017） | **保持软冷却**（register 未完成，补完 register 后可能自愈；禁用会让补完 register 后仍无法用） | 自动恢复 / 补完 register 激活 trial |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
@@ -348,8 +358,8 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 
 | 任务 | 开关（默认 true） | 时刻（默认） | 行为 |
 |---|---|---|---|
-| 签到 | `schedule.checkin_enabled` | `checkin_hours` `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号。**Global 账号跳过**（无签到体系，见「国际版账号」） |
-| 活跃上报 | `schedule.activity_enabled` | `activity_hours` `[10]` 整点 | 对话活跃上报（`chat_request_send` 事件，必须含 `userId`）；点亮连登 + 解锁 `first_buddy`；每号每天 1 次。**Global 账号跳过** |
+| 签到 | `schedule.checkin_enabled` | `checkin_hours` `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号。**Global 账号跳过**（无签到体系，见「Global 账号行为差异」） |
+| 活跃上报 | `schedule.activity_enabled` | `activity_hours` `[10]` 整点 | 每号 5 连发对话活跃上报（`chat_request_send` 事件，必须含 `userId`；同会话共用 `conversationId`）点亮连登 + 解锁 `first_buddy`；CN 与 **Global 均上报** |
 | 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖。**Global 账号跳过** |
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token（Global 账号照常）；session 失效**连续 3 次**才自动禁用 |
 
@@ -361,14 +371,14 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 
 #### 活跃上报（独立排程）
 
-对池内每个可用账号在 `activity_hours`（默认 `[10]` 整点）发送一条对话活跃上报（事件 `chat_request_send`，body 为数组，事件必须含 `userId`）：
+对池内每个可用账号在 `activity_hours`（默认 `[10]` 整点）发送**连发对话活跃上报**（事件 `chat_request_send`，body 为数组，事件必须含 `userId`）：
 
-- 一条上报同时点亮 growth 连登 + 解锁 `first_buddy` 任务（领养前置）
-- 每号每天 1 次即可（单时点）：日活跃奖励按天去重，重复上报无额外收益
+- **默认每次 5 连发**（`schedule.activity_report_count`，显式配 `0` / 负数 = 旧行为 1 条）：5 条共用同一 `conversationId`，`requestId` 各自独立；账号内间隔 1.5s，账号间间隔 800ms
+- 一条 / 一组上报同时点亮 growth 连登 + 解锁 `first_buddy` 任务（领养前置）
 - `conversationId` 由网关生成（`wb2api-<ms>`），无需真实会话
-- 限速：账号间间隔 800ms（与旅行同口径）
-- **streak 自检**：上报成功后回读连登天数（只读 oracle），日志每号一行可 grep：`activity <uid>: streak days=N`。`days=0` 记 **warn**（`report OK but streak.days=0 (silent drop?)`，对应上游「200 但静默丢弃」）；回读失败记 warn 但不影响主流程（上报按天幂等，不重试，只观测）
-- 手动诊断 / 补跑用 `python3 scripts/task_runner.py`（成长任务一体机：查询/完成/领奖；默认 dry-run，写操作需 `--yes`）
+- **streak 自检**：全部 N 条上报成功后回读连登天数（只读 oracle），日志每号一行可 grep：`activity <uid>: streak days=N`。`days=0` 记 **warn**（`report OK but streak.days=0 (silent drop?)`）；回读失败记 warn 但不影响主流程（上报按天幂等，不重试，只观测）
+- **领养联动**：5 连发刷满 `chat_5` 后对无猫账号立即重试领养（豁免每日防抖）
+- 手动诊断 / 补跑用镜像内置 `/app/activity_bin`（等价 `cmd/activity`）或 `python3 scripts/task_runner.py`（成长任务一体机：查询/完成/领奖；默认 dry-run，写操作需 `--yes`）
 
 > **`scripts/` 任务脚本仅适用 CN 账号**：`task_runner.py` / `school_open_day_2026.py` / `school_open_day_cron.sh`
 > 面向国内版任务中心/开学季活动，端点为 `copilot.tencent.com` / `codebuddy.cn`。一旦 `auths/` 混入
@@ -398,8 +408,8 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式 / 非流式；请求体上限 `server.max_body_mb`（默认 8 MB） |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
-| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分 / 冷却 / 熔断 / 在途 / 粘性；disabled 账号透出 `disabled_reason`）；顶层 `realm_totals` 按域（`cn`/`global`）分组的计数汇总 |
+| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）；CN / Global 模型分别带 `cn:` / `global:` 前缀 |
+| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分 / 冷却 / 熔断 / 在途 / 粘性；disabled 账号透出 `disabled_reason`）；顶层 `realm_totals` 按域（`cn`/`global`）分组的计数汇总；被 6004 限流的账号透出 `rate_limited_models` 台账 |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识与外层由 `realm_servable` 独立暴露的 CN/global 可达性（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
@@ -418,6 +428,16 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 {"realm_totals": {"cn": {"total": 5, "healthy": 4, "cooling": 1, "disabled": 0, "in_flight_full": 0}, "global": {"total": 3, "healthy": 1, "cooling": 2, "disabled": 0, "in_flight_full": 1}}}
 ```
 
+`/status` 的 `rate_limited_models` 台账（仅「带解析时间 6004」触发的模型级独立冷却未到期时非空；每模型一行，到期即消失）：
+
+```json
+{"accounts":[{"uid":"...","rate_limited_models":[{"model":"deepseek-v4-flash","until":"2026-09-14T20:00:00+08:00","reset_at":"2026-09-14T20:00:00+08:00","reason":"6004 model rate limit"}]}]}
+```
+
+- `until` = **截断后**的模型级冷却到期时刻（已封顶 `soft_rate_max`，例如 2h）
+- `reset_at` = 上游「将在 … 重置」的**原始墙钟**（未经截断；截断后 `until == reset_at` 时省略字段让台账少一列）
+- 该台账由 `Pool.CooldownSoftForModel` 写入（`modelCooldowns` 独立于账号级 `until`），同账号其他模型不受影响
+
 **宿主健康探测指引**：强校验（推荐）用 `/status` + `api_key`——只有持有正确 `api_key` 的本网关返回 200，其他服务返回 401 / 404；弱校验（不适合持 key 的负载均衡器）用 `/healthz` + `service` 字段判据（`/healthz` 恒无鉴权，`service == "workbuddy2api"` 才算命中本网关）。容器自带 `HEALTHCHECK` 用的就是弱校验（仅进程内自检，够用）。
 
 ### 流式行为细节
@@ -426,9 +446,9 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`
 - 非流式请求由本地聚合完整 SSE 流为单 `chat.completion` 响应（含 `reasoning_content` / `tool_calls`）
 
-### 上游端点
+### 上游接口适配
 
-上游接口均为 CodeBuddy 官方 CLI / 插件使用的**非公开 / 逆向接口**，未见公开 API 文档；路径及 Host 以代码内常量为准（见文末出处表）。两类 base：
+网关适配 CodeBuddy 官方客户端所使用的接口（对接的路径及 Host 以代码内常量为准，见文末出处表）。两类 base：
 
 - **`copilot.tencent.com`**：聊天补全（SSE）、token 刷新、OAuth、模型列表、growth 域（旅行 / streak）
 - **`www.codebuddy.cn`**：每日签到、余额查询、活跃上报
@@ -436,7 +456,8 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 | 相对路径（绝对路径见出处表） | 方法 | 用途 |
 |---|---|---|
 | `chat/completions` | POST | 聊天补全（SSE） |
-| `console/enterprises/personal/models` | GET | 动态模型列表 |
+| `console/enterprises/personal/models` | GET | 动态模型列表（CN） |
+| `/v2/enterprises/personal/models`（回落 `/console/...`） | GET | 动态模型列表（Global 探测） |
 | `plugin/auth/token/refresh` | POST | token 刷新 |
 | `billing/meter/daily-checkin` | POST | 每日签到 |
 | `billing/meter/get-user-resource` | POST | 余额查询 |
@@ -452,10 +473,12 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 | `activity/growth/buddy/travel/claim` | POST | 猫猫旅行：领奖 |
 | `activity/growth/streak` | GET | 连登天数（只读 oracle，活跃自检用） |
 | `billing/ide/trial` | POST | 国际版一次性 trial 加油包（仅 global 账号；`14051`=已领幂等） |
+| `auth/realms/copilot/overseas/user/register` | GET | 国际版注册激活（幂等） |
+| `billing/area/get-country-code` | POST | 国际版拉地区列表（region 自动完善） |
 
 国际版（`realm=global`）出站走 `https://www.workbuddy.ai`（可被 `global.chat_base` / `global.billing_base` 覆盖）：聊天用 `/console/chat/completions`（404/405 回落 `/v2/chat/completions`），billing 用 `/billing/meter/*`（404 回落 `/v2/billing/meter/*`）。
 
-出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。
+出站请求统一携带内置 UA（`WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`；可被 `upstream.user_agent` 覆盖，适用段见字段速查）；聊天请求带账号头（`X-User-Id` 等），international 版附加 `X-No-Enterprise-Id:1` 与 `X-Domain: www.workbuddy.ai`，**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。
 
 ## 请求级日志
 
@@ -474,7 +497,7 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 | `200` | 状态码 |
 | `uid=0851ce35` | 账号 UID 前 8 位 |
 | `TTFB` | 流式首帧耗时（非流式为 `-`） |
-| `tok` / `tok/s` / `total` | 输出 token 数 / 速率 / 总时长 |
+| `tok` / `tok/s` / `total` | 输出 token 数 / 速率 / 总时长（token 数取上游 `usage` 精确值，缺失为 `-`） |
 
 **敏感度**：日志不含任何 token 明文（详见[安全与合规](#安全与合规)），无落盘日志文件。
 
@@ -482,9 +505,9 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 
 ### Docker 镜像
 
-多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
+多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部二进制并随镜像分发：
 
-- **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh`）
+- **wb2api**（主服务）、**signin_bin**、**login**、**credit**、**trial_bin**、**activity_bin** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `trial.sh`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
 - 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
@@ -495,7 +518,7 @@ auth 文件落盘时写入 `realm` 键（嵌套形 `auth.realm`）；历史 CN �
 
 | 脚本 | 用途 |
 |---|---|
-| `./login.sh [--realm=cn\|global]` | OAuth 登录（无参数交互式选域）→ 落盘 auth → 重启容器 |
+| `./login.sh [--realm=cn\|global]` | OAuth 登录（无参数交互式选域）→ 落盘 auth → 重启容器；global 自动注册激活 + trial |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新；「已签到 / 未开启 / 已过期 / inactive」判幂等不算失败） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON）；realm 感知——global 账号查积分走 `workbuddy.ai`（`/billing/meter/*` 404 回落 `/v2`），CN 账号维持 `codebuddy.cn` |
 | `./trial.sh [auths_dir]` | 国际版 trial 加油包领取（仅 global 账号；`14051`=已领幂等）；镜像内置 `/app/trial_bin`，容器内零 go 构建直接跑（见下「容器内工具」） |
@@ -524,7 +547,7 @@ docker exec -w /app workbuddy2api /app/activity_bin   # 活跃上报一次性触
 ### 1. 凭据管理（auths）
 
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
-- **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
+- **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname` / `realm`）
 - **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
 
@@ -557,6 +580,7 @@ docker exec -w /app workbuddy2api /app/activity_bin   # 活跃上报一次性触
 - **冷却到上游重置时间**：msg 带「将在 … 重置」时，账号冷却 `until` 精确等于该墙钟（按 UTC+8 解释），并封顶 `soft_rate_max`（默认 2h）
 - **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
 - **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
+- **运维台账**：`/status` 该账号下的 `rate_limited_models` 每模型一条（`until` 截断后到期时刻 / `reset_at` 上游原始墙钟 / `reason`），到期自动消失
 
 ### 多图会话请求体超限怎么办？
 
@@ -581,13 +605,13 @@ docker exec -w /app workbuddy2api /app/activity_bin   # 活跃上报一次性触
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
-官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
+官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent`（或环境变量 `WB2A_USER_AGENT`，配合 `client_version` / `cli_version` / `client_name`）即可改写全部出站请求的 UA；默认保持内置 `WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>` 形态（指纹净化考虑，可配而非改死）。
 
 ## 关键断言 ↔ 代码出处
 
 | 断言 | 出处 |
 |---|---|
-| `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
+| `prompt.mode` 默认 `custom` | `cmd/server/config.go:148`（`Default`） |
 | 请求体上限默认 8 MB | `cmd/server/config.go:132`；413 判定与返回 `internal/server/handler.go:246-254` |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
@@ -596,19 +620,26 @@ docker exec -w /app workbuddy2api /app/activity_bin   # 活跃上报一次性触
 | Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
-| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
-| 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
+| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:674-678` |
+| 11140 硬禁用（`request illegal`）| `internal/server/handler.go:662`（`Disable`）；分类 `internal/upstream/client.go:181` |
+| 14017 软冷却（`trial not activated`）| `internal/server/handler.go:665`（`Cooldown`） |
+| 出站 UA 表单（多段 / 可覆盖）| `internal/upstream/headers.go:64-93`；接线 `cmd/server/config.go:56-91` |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
 | `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
-| disabled 账号透出 `disabled_reason` | `internal/pool/pool.go:1162-1165` |
+| disabled 账号透出 `disabled_reason` | `internal/pool/state.go:420-423` |
 | 硬冷却至次日 04:00 | `internal/pool/pool.go:882`（`CooldownUntilTomorrow4AM`） |
 | 软冷却退避封顶 2h | `internal/pool/pool.go:247`（`defaultSoftRateMax`） |
+| 6004 模型级独立冷却 | `internal/pool/cooldown.go:63`（`CooldownSoftForModel`）；台账 `internal/pool/state.go:439-469` |
 | Top-5 候选短名单 | `internal/pool/pool.go:584` |
-| `activity_hours` 默认 `[10]` | `cmd/server/config.go:135` |
-| 活跃自检回读 streak | `internal/scheduler/scheduler.go:227`（`checkActivityStreak`） |
+| 三因子权重（credits ×10 + idle + success ×3）| `internal/pool/pick.go:254`（`weightOf`） |
+| `activity_report_count` 默认 5 | `internal/config/schedule.go:55` |
+| 活跃自检回读 streak | `internal/scheduler/scheduler.go:388`（`checkActivityStreak`） |
 | streak 端点 `activity/growth/streak` | `internal/upstream/travel.go:24`（常量）、`:139`（`GrowthStreak`） |
 | Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go:21` |
-| 静态模型表含 `deepseek-v4-flash` 等 | `internal/server/handler.go:146` |
+| 静态模型表含 `deepseek-v4-flash` 等 | `internal/server/handler.go:181-192`（`staticModels`） |
+| Global 模型探测与静态名单 | `internal/upstream/global_models.go:80`（`FetchGlobalModels`）、`:22`（`GlobalModelNames`） |
+| `/status` realm 分组汇总 | `internal/server/handler.go:146-164`（`realm_totals`） |
+| `/healthz` `realm_servable` | `internal/server/handler.go:118-135` |
 
 ## 问题反馈与 Issue 规范
 
@@ -641,7 +672,25 @@ docker exec -w /app workbuddy2api /app/activity_bin   # 活跃上报一次性触
 
 ## 免责声明
 
-本项目仅供学习和研究使用。使用者需遵守 CodeBuddy 服务条款，自行承担使用风险（包括账号封禁、条款违约等）。作者不对任何因使用本项目产生的直接或间接损失负责。
+- 项目内所涉及脚本、LOGO 仅为资源共享、学习参考之目的，不保证其合法性、正当性、准确性；切勿使用项目做任何商业用途或牟利；
+- 遵循避风港原则，若有图片和内容侵权，请在 Issues 告知，核实后删除，其版权均归原作者及其网站所有；
+- 本人不对任何内容承担任何责任，包括但不限于任何内容错误导致的任何损失、损害；
+- 其它人通过任何方式登陆本网站或直接、间接使用项目相关资源，均应仔细阅读本声明，一旦使用、转载项目任何相关教程或资源，即被视为您已接受本免责声明。
+- 本项目内所有资源文件，禁止任何公众号、自媒体进行任何形式的转载、发布。
+- 本项目涉及的数据由使用的个人或组织自行填写，本项目不对数据内容负责，包括但不限于数据的真实性、准确性、合法性。使用本项目所造成的一切后果，与本项目的所有贡献者无关，由使用的个人或组织完全承担。
+- 本项目中涉及的第三方硬件、软件等，与本项目没有任何直接或间接的关系。本项目仅对部署和使用过程进行客观描述，不代表支持使用任何第三方硬件、软件。使用任何第三方硬件、软件，所造成的一切后果由使用的个人或组织承担，与本项目无关。
+- 本项目中所有内容只供学习和研究使用，不得将本项目中任何内容用于违反国家/地区/组织等的法律法规或相关规定的其他用途。
+- 所有基于本项目源代码，进行的任何修改，为其他个人或组织的自发行为，与本项目没有任何直接或间接的关系，所造成的一切后果亦与本项目无关。
+- 所有直接或间接使用本项目的个人和组织，应24小时内完成学习和研究，并及时删除本项目中的所有内容。如对本项目的功能有需求，应自行开发相关功能。
+- 本项目保留随时对免责声明进行补充或更改的权利，直接或间接使用本项目内容的个人或组织，视为接受本项目的特别声明。
+
+## ☕ Coffee
+
+如果这个项目对你有帮助，欢迎请我喝杯咖啡～
+
+**Solana**：`AZAKF74rTu7UFVSNRzsKV4HHpTwarax6cG8KAh4fP5rQ`
+**Ethereum**：`0x1d418627aD6B043900CBE11fe439759bDF2b5170`
+**Bitcoin**：`bc1q9w7h4j9msyd9q6lhl0398n4s3g8h4vchpqvc2k`
 
 ## License
 
