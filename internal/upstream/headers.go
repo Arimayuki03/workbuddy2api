@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/session"
 )
 
 const (
@@ -148,11 +149,23 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
+// ChatMeta 一次 chat 出站的会话头族元数据（issue #35：后台按 X-Conversation-Request-ID
+// 聚合请求，官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID）。
+// handler 在轮转循环外生成 conversationID / conversationRequestID，循环内每次出站
+// 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
+// messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
+type ChatMeta struct {
+	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
+	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+}
+
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
-func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
+// meta 为会话头族元数据（CN/global 同构，纯新增，不改既有头），见 injectConversationHeaders。
+func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
 	if a.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
@@ -193,6 +206,65 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)
+	// 会话头族（对话/请求/消息/B3 链路）：纯新增，CN/global 同构，见 injectConversationHeaders。
+	c.injectConversationHeaders(req, meta)
+}
+
+// injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
+// 头族分四层，各司其职：
+//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
+//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
+//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
+//   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
+//   - X-Root-Request-ID：= conversationRequestID（根请求追踪）。
+//   - X-Trace-ID：入站透传或 = conversationRequestID。
+//   - X-B3-TraceId / X-B3-SpanId / X-B3-Sampled：链路族。B3 规范只认 16/32 hex
+//     TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId 回落
+//     messageID（恒 32 hex），SpanId 取 messageID[:16]（每消息新）。
+func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+	convReqID := meta.ConversationRequestID
+	if convReqID == "" {
+		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
+		// 本级补一个 32 hex，调用方（handler）已生成稳定的不走到这里。
+		convReqID = session.NewMessageID()
+	}
+	messageID := session.NewMessageID()
+	if meta.ConversationID != "" {
+		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	}
+	req.Header.Set("X-Conversation-Request-ID", convReqID)
+	req.Header.Set("X-Conversation-Message-ID", messageID)
+	req.Header.Set("X-Request-ID", messageID)
+	req.Header.Set("X-Root-Request-ID", convReqID)
+	traceID := meta.TraceID
+	if traceID == "" {
+		traceID = convReqID
+	}
+	req.Header.Set("X-Trace-ID", traceID)
+	b3Trace := convReqID
+	if !validTraceID(b3Trace) {
+		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
+	}
+	req.Header.Set("X-B3-TraceId", b3Trace)
+	req.Header.Set("X-B3-SpanId", messageID[:16])
+	req.Header.Set("X-B3-Sampled", "1")
+}
+
+// validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（全新大小写均可）。
+// 官方客户端生成的 conversationRequestId 是 32 位 hex（UUID 去横线），入站透传值
+// 可能是任意形状（含横线/超长/非 hex），直接塞进 B3 头会破坏链路关联（issue #35）。
+func validTraceID(s string) bool {
+	if len(s) != 16 && len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。

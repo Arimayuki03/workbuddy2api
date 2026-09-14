@@ -24,7 +24,7 @@ func TestChatHeadersGlobalRealm(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"} // global 账号
 	req := mustRequest(t)
 	c := &Client{}
-	c.ChatHeaders(req, a, "")
+	c.ChatHeaders(req, a, "", ChatMeta{})
 
 	if got := req.Header.Get("User-Agent"); got != globalUAString {
 		t.Errorf("global UA = %q want %q", got, globalUAString)
@@ -48,7 +48,7 @@ func TestChatHeadersCNRealm(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "c1", EnterpriseID: "e1"} // CN 企业账号 + 无 domain
 	req := mustRequest(t)
 	c := &Client{}
-	c.ChatHeaders(req, a, "")
+	c.ChatHeaders(req, a, "", ChatMeta{})
 
 	if got := req.Header.Get("User-Agent"); strings.Contains(got, "WorkBuddy AI") {
 		t.Errorf("CN UA = %q must NOT contain WorkBuddy AI (want %q)", got, defaultUAString)
@@ -78,7 +78,7 @@ func TestChatHeadersGlobalStrongOverride(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "g2", EnterpriseID: "should-be-ignored", Domain: "www.workbuddy.ai"}
 	req := mustRequest(t)
 	c := &Client{}
-	c.ChatHeaders(req, a, "")
+	c.ChatHeaders(req, a, "", ChatMeta{})
 
 	if got := req.Header.Get("X-No-Enterprise-Id"); got != "1" {
 		t.Errorf("global(virtual enterprise) X-No-Enterprise-Id = %q want 1", got)
@@ -100,7 +100,7 @@ func TestChatHeadersGlobalWithConfiguredDomain(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "g3", Domain: "login.workbuddy.ai"}
 	req := mustRequest(t)
 	c := &Client{}
-	c.ChatHeaders(req, a, "")
+	c.ChatHeaders(req, a, "", ChatMeta{})
 
 	if got := req.Header.Get("X-Domain"); got != "www.workbuddy.ai" {
 		t.Errorf("global(with custom domain) X-Domain = %q want www.workbuddy.ai", got)
@@ -113,7 +113,7 @@ func TestChatHeadersCNNoEnterpriseZeroRegression(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "c2"}
 	req := mustRequest(t)
 	c := &Client{}
-	c.ChatHeaders(req, a, "")
+	c.ChatHeaders(req, a, "", ChatMeta{})
 
 	if got := req.Header.Get("X-No-Enterprise-Id"); got != "1" {
 		t.Errorf("CN(no enterprise) X-No-Enterprise-Id = %q want 1", got)

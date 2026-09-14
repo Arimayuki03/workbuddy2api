@@ -451,6 +451,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
+	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
+	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
+	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
+	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
+	// RequestID）。
+	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
+	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
+	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
+	//     有自己的对话轮 ID 则以客户端为准），否则按粘性 key 进程内稳定生成（同会话
+	//     恒同值；无会话 key 时本请求级 NewMessageID 兜底——轮转内捕获一次即共享）；
+	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
+	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
+		chatMeta.ConversationRequestID = v
+	} else {
+		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
+	}
+	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -510,7 +529,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Upstream.PassthroughIP {
 			clientIP = upstream.ExtractClientIP(r)
 		}
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP, chatMeta)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。

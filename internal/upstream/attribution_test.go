@@ -29,7 +29,7 @@ func chatHeadersReq(t *testing.T, c *Client, a *auth.Auth, clientIP string) http
 	if err != nil {
 		t.Fatalf("new req: %v", err)
 	}
-	c.ChatHeaders(req, a, clientIP)
+	c.ChatHeaders(req, a, clientIP, ChatMeta{})
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		t.Fatalf("do: %v", err)
@@ -195,7 +195,7 @@ func TestClientIPConcurrentNoCrossTalk(t *testing.T) {
 				return
 			}
 			// 每个请求独立构造头：clientIP 作为参数传入，不存在共享可污染。
-			c.ChatHeaders(req, a, myIP)
+			c.ChatHeaders(req, a, myIP, ChatMeta{})
 			resp, err := c.HTTP.Do(req)
 			if err != nil {
 				t.Errorf("do: %v (ip=%s)", err, myIP)

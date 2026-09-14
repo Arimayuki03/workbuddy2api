@@ -284,7 +284,7 @@ func TestGlobalE2ER2ChatV2(t *testing.T) {
 	// default-model 用 max_tokens=10 足够（最便宜稳定）；gpt-5.4 更贵且要求 ≥100。
 	body := sseChatBody(cl, a, "default-model", 10)
 	status, raw := sseDoProbe(cl, a, http.MethodPost, sseE2EBase+"/v2/chat/completions",
-		func(req *http.Request, ac *auth.Auth) { cl.ChatHeaders(req, ac, "") }, body)
+		func(req *http.Request, ac *auth.Auth) { cl.ChatHeaders(req, ac, "", upstream.ChatMeta{}) }, body)
 	t.Logf("R2 /v2/chat/completions status=%d", status)
 	if status >= 200 && status < 300 {
 		usage, frames, _ := sseReadSummary(io.NopCloser(bytes.NewReader(raw)))

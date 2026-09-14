@@ -607,12 +607,14 @@ func chatFallbackHTTPStatus(status int) bool { return status == 404 || status ==
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // clientIP 为本次请求的客户端 IP（PassthroughIP=true 时注入；空串表示不透传）。
 // 按**请求传递**而非读共享字段：避免并发请求交叉污染对方 IP（issue：ClientIP 竞态）。
+// meta 为会话头族（issue #35）：同一次 user send 的换号/重试/降级复用同一
+// conversationRequestID，后台按它聚合（handler 轮转循环外生成，循环内原样传）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
 //
 // global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
 // （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
-func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	var cancel context.CancelFunc
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
@@ -626,7 +628,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		c.ChatHeaders(req, a, clientIP)
+		c.ChatHeaders(req, a, clientIP, meta)
 		ctx, cancel := context.WithCancel(context.Background())
 		req = req.WithContext(ctx)
 		resp, err := c.chatHTTP().Do(req)

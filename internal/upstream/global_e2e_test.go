@@ -236,7 +236,7 @@ func TestGlobalE2EChatPathOrdering(t *testing.T) {
 	cl := globalE2EClient()
 	a := loadGlobalAcct(t)
 	body := chatProbeBody(cl, a, "gpt-5.4", 1)
-	headers := func(req *http.Request, ac *auth.Auth) { cl.ChatHeaders(req, ac, "") }
+	headers := func(req *http.Request, ac *auth.Auth) { cl.ChatHeaders(req, ac, "", ChatMeta{}) }
 
 	results := map[string]int{}
 	for _, p := range []string{"/console/chat/completions", "/v2/chat/completions"} {
@@ -289,7 +289,7 @@ func TestGlobalE2EProbeChatVariants(t *testing.T) {
 			t.Logf("variant %s: construct %v", v.name, err)
 			continue
 		}
-		cl.ChatHeaders(req, a, "")
+		cl.ChatHeaders(req, a, "", ChatMeta{})
 		if v.extra != nil {
 			v.extra(req)
 		}
@@ -338,7 +338,7 @@ func TestGlobalE2ESSEUsageCredit(t *testing.T) {
 	// 模型候选：gpt-5.4 首选；若上游模型级拒绝则换 default-model 再打一次。
 	for _, model := range []string{"gpt-5.4", "default-model"} {
 		body := chatProbeBody(cl, a, model, 10)
-		rc, status, respBody, err := cl.ChatStream(a, body, "")
+		rc, status, respBody, err := cl.ChatStream(a, body, "", ChatMeta{})
 		if err != nil {
 			t.Logf("R9 尝试 model=%s: transport error: %v", model, err)
 			continue
@@ -522,7 +522,7 @@ func TestGlobalE2EErrorCodeSemantics(t *testing.T) {
 	a := loadGlobalAcct(t)
 	raw, _ := json.Marshal(resourceBody())
 	rawChat := chatProbeBody(cl, a, "gpt-5.4", 1)
-	chatHeaders := func(req *http.Request, ac *auth.Auth) { cl.ChatHeaders(req, ac, "") }
+	chatHeaders := func(req *http.Request, ac *auth.Auth) { cl.ChatHeaders(req, ac, "", ChatMeta{}) }
 	billHeaders := func(req *http.Request, ac *auth.Auth) { cl.BillingHeaders(req, ac) }
 	commonHeaders := func(req *http.Request, ac *auth.Auth) { cl.CommonHeaders(req, ac) }
 

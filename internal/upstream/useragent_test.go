@@ -31,7 +31,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 		{
 			name: "chat",
 			call: func(c *Client) error {
-				rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`), "")
+				rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 				if status != 200 {
 					t.Fatalf("chat status=%d", status)
 				}
@@ -91,7 +91,7 @@ func TestUserAgentOverrideAllOutbound(t *testing.T) {
 		UserAgent:     ua,
 	}
 	// chat
-	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), ""); status != 200 || err != nil {
+	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
 		t.Errorf("chat: status=%d err=%v", status, err)
 	} else if rc != nil {
 		rc.Close()
@@ -170,7 +170,7 @@ func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
 	}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
 	if status != 200 || err != nil {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -205,7 +205,7 @@ func TestUserAgentExplicitOverride(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		UserAgent:     explicitString,
 	}
-	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), ""); status != 200 || err != nil {
+	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
 		t.Errorf("chat: status=%d err=%v", status, err)
 	} else if rc != nil {
 		rc.Close()
@@ -229,7 +229,7 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		ClientVersion: "6.0.0",
 	}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
 	if status != 200 || err != nil {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}

@@ -66,7 +66,7 @@ func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
 
 	c := globalTestClient(t, chatSrv, billSrv)
 	a := globalAcct()
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -110,7 +110,7 @@ func TestGlobalChatFallsBackToV2Path(t *testing.T) {
 	defer billSrv.Close()
 
 	c := globalTestClient(t, chatSrv, billSrv)
-	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "")
+	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat fallback: status=%d err=%v", status, err)
 	}
@@ -200,7 +200,7 @@ func TestCNChatPathUnchanged(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("cn chat: status=%d err=%v", status, err)
 	}
@@ -231,7 +231,7 @@ func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 	defer billSrv.Close()
 
 	c := globalTestClient(t, chatSrv, billSrv)
-	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "")
+	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
 	if err != nil {
 		t.Fatalf("chat 500: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 	}
 
 	// step 2：global 账号同模型名请求 → 不应命中 CN 探测的 supportedEfforts，原样透传 high。
-	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[{"role":"system","content":"s"}]}`), "")
+	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[{"role":"system","content":"s"}]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("global chat: status=%d err=%v", status, err)
 	}
@@ -307,7 +307,7 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 	}
 
 	// step 3：同 Client 的 CN 请求仍按 CN 桶降级（high 不在 [low,medium] → 降至 medium）。
-	rc, status, _, err = c.ChatStream(cn, []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[]}`), "")
+	rc, status, _, err = c.ChatStream(cn, []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("cn chat: status=%d err=%v", status, err)
 	}
