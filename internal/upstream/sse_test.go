@@ -148,6 +148,126 @@ data: [DONE]
 	}
 }
 
+// TestBackfillToolCallNames 直测跨帧 name 缓存：首 chunk 带 name 时建缓存，
+// 后续 chunk 缺省/置空 name 时从缓存回填（hawklithm/workbuddy2api issue#2）。
+func TestBackfillToolCallNames(t *testing.T) {
+	mkFrame := func(name, args string) map[string]any {
+		fn := map[string]any{}
+		if name != "" {
+			fn["name"] = name
+		}
+		if args != "" {
+			fn["arguments"] = args
+		}
+		return map[string]any{"choices": []any{
+			map[string]any{"delta": map[string]any{"tool_calls": []any{
+				map[string]any{"index": 0.0, "function": fn},
+			}}},
+		}}
+	}
+	names := map[int]string{}
+
+	// 首 chunk 带 name：缓存建好
+	f0 := mkFrame("lookup", "")
+	backfillToolCallNames(f0, names)
+	if names[0] != "lookup" {
+		t.Fatalf("cache after first chunk=%v want lookup", names)
+	}
+
+	// 后续 chunk name 为空串：回填 "lookup"
+	f1 := mkFrame("", `{"term":"x"}`)
+	backfillToolCallNames(f1, names)
+	fn1 := f1["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn1["name"] != "lookup" {
+		t.Errorf("empty name not backfilled: %v", fn1["name"])
+	}
+
+	// 后续 chunk 缺省 name（function 仅 arguments）：同样回填
+	f2 := map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{"tool_calls": []any{
+			map[string]any{"index": 0.0, "function": map[string]any{"arguments": "y"}},
+		}}},
+	}}
+	backfillToolCallNames(f2, names)
+	fn2 := f2["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn2["name"] != "lookup" {
+		t.Errorf("missing name not backfilled: %v", fn2["name"])
+	}
+
+	// 不同 index 互不串扰
+	f3 := map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{"tool_calls": []any{
+			map[string]any{"index": 1.0, "function": map[string]any{}},
+		}}},
+	}}
+	backfillToolCallNames(f3, names)
+	if _, ok := names[1]; ok {
+		t.Error("index 1 should not get a cached name")
+	}
+	f3call := f3["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	if _, hasFn := f3call["function"]; !hasFn {
+		t.Error("index 1 with no cache should leave function empty (no phantom name)")
+	}
+
+	// 无缓存未命中：原帧原样不动
+	names2 := map[int]string{}
+	f4 := mkFrame("", `{"z":"1"}`)
+	backfillToolCallNames(f4, names2)
+	if json, _ := json.Marshal(f4); strings.Contains(string(json), "name") {
+		t.Errorf("uncached frame should not gain a name: %s", json)
+	}
+	// 非 tool_calls 帧（content only）零影响
+	f5 := map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{"content": "hi"}},
+	}}
+	backfillToolCallNames(f5, names)
+	if got := f5["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any); len(got) != 1 || got["content"] != "hi" {
+		t.Errorf("content-only frame altered: %#v", got)
+	}
+}
+
+// TestStreamBackfillsToolCallName 端到端：SSE 流首 chunk 带 name，后续 chunk name 被置空，
+// 逐帧透传后每个工具分片都必须回填 name（hawklithm/workbuddy2api issue#2）。
+func TestStreamBackfillsToolCallName(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"term\\\":\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\\\"北京\\\"}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"total_tokens\":9}}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != 4 {
+		t.Fatalf("frames=%d want 4", len(frames))
+	}
+	// 每个含 tool_calls 的分片 name 都必须是 lookup（首 chunk 直通，后续 chunk 被回填）
+	for i, fr := range frames {
+		chs, ok := fr["choices"].([]any)
+		if !ok {
+			t.Fatalf("frame %d choices missing", i)
+		}
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, ok := d["tool_calls"].([]any)
+		if !ok {
+			continue // 末帧只有 finish_reason，无 tool_calls 属正常
+		}
+		if len(tcs) != 1 {
+			t.Fatalf("frame %d tool_calls len=%d want 1", i, len(tcs))
+		}
+		fn, ok := tcs[0].(map[string]any)["function"].(map[string]any)
+		if !ok || fn["name"] != "lookup" {
+			t.Errorf("frame %d tool_calls name=%v want lookup", i, fn["name"])
+		}
+	}
+	// arguments 必须跨 chunk 完整保流（回填只动 name，不动其余字段）
+	f1 := frames[1]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if f1["arguments"] != `{"term":` {
+		t.Errorf("frame 2 arguments=%q", f1["arguments"])
+	}
+}
+
 // streamFrames 把原始 SSE 输入经 Stream 处理后解析出所有 JSON 帧及 [DONE] 计数。
 func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount int) {
 	t.Helper()
