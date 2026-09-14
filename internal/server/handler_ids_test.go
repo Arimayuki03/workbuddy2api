@@ -239,3 +239,88 @@ func isValidB3Trace(s string) bool {
 	}
 	return true
 }
+
+// turnRequestIDForBody 发一次请求并返回出站 X-Conversation-Request-ID（成功路径）。
+// 供轮级兜底用例复用：不同 body 各自独立建池，避免账号冷却互相干扰。
+func turnRequestIDForBody(t *testing.T, body string) string {
+	t.Helper()
+	var captured http.Header
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			captured = r.Header.Clone()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if captured == nil {
+		t.Fatal("no outbound request captured")
+	}
+	return captured.Get("X-Conversation-Request-ID")
+}
+
+// TestChatTurnKeyFallbackForSessionlessClient 无会话键客户端（OpenAI 兼容协议——
+// dsh / Codex / Cherry Studio 等不带 conversationId/metadata）：粘性 key 为空时按
+// 「末条 user 消息」派生轮级聚合键。同一轮同键，换 user 消息换键。
+func TestChatTurnKeyFallbackForSessionlessClient(t *testing.T) {
+	first := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"核查部署文档"}]}`)
+	second := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"核查部署文档"}]}`)
+	if first == "" {
+		t.Fatal("X-Conversation-Request-ID missing on sessionless request")
+	}
+	if first != second {
+		t.Errorf("同一轮（末条 user 消息相同）应复用聚合键: %q vs %q", first, second)
+	}
+	if next := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"继续"}]}`); next == first {
+		t.Errorf("换 user 消息应换聚合键（跨轮不混并）: %q", next)
+	}
+	if len(first) != 32 || !isValidB3Trace(first) {
+		t.Errorf("turn-level id %q want 32 hex", first)
+	}
+}
+
+// TestChatTurnKeyStableAcrossAgentSteps agent 多步（tool call 多轮）：轮内 messages
+// 不断追加 assistant/tool 消息，末条 user 消息不变 → 全部复用同一聚合键。
+func TestChatTurnKeyStableAcrossAgentSteps(t *testing.T) {
+	step1 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"跑一下"}]}`)
+	step2 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[`+
+		`{"role":"user","content":"跑一下"},`+
+		`{"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"pwsh"}}]},`+
+		`{"role":"tool","tool_call_id":"c1","content":"结果"}]}`)
+	step3 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[`+
+		`{"role":"user","content":"跑一下"},`+
+		`{"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"pwsh"}}]},`+
+		`{"role":"tool","tool_call_id":"c1","content":"结果"},`+
+		`{"role":"assistant","tool_calls":[{"id":"c2","function":{"name":"read"}}]},`+
+		`{"role":"tool","tool_call_id":"c2","content":"文件内容"}]}`)
+	if step1 == "" {
+		t.Fatal("X-Conversation-Request-ID missing on sessionless request")
+	}
+	if step1 != step2 || step2 != step3 {
+		t.Errorf("轮内追加消息不应改变聚合键: step1=%q step2=%q step3=%q", step1, step2, step3)
+	}
+}
+
+// TestChatSessionKeyBeatsTurnKey 会话键优先于轮级兜底：带 conversationId 时聚合键是
+// 会话级的（跨轮同键，不随末条 user 消息变化），与无会话键的轮级行为明确区分。
+func TestChatSessionKeyBeatsTurnKey(t *testing.T) {
+	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第一问"}]}`)
+	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第二问"}]}`)
+	if a == "" {
+		t.Fatal("X-Conversation-Request-ID missing")
+	}
+	if a != b {
+		t.Errorf("会话键路径应跨轮稳定（不受末条 user 变化影响）: %q vs %q", a, b)
+	}
+}
