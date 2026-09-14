@@ -511,8 +511,14 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
-func (c *Client) prepareBody(body []byte, realm string) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(realm))
+// conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
+// body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+	body = PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(realm))
+	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
+	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
+	body = InjectPromptCacheKey(body, uid, conversationID)
+	return body
 }
 
 // effortsSnapshot 返回指定 realm 的 effort 能力缓存副本；该域无探测 → nil（透传不降级）。
@@ -723,7 +729,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	var cancel context.CancelFunc
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
-	prepared := c.prepareBody(body, a.Realm())
+	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}

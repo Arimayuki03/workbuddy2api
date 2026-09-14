@@ -126,7 +126,7 @@ func chatProbeBody(cl *Client, a *auth.Auth, model string, maxTokens int) []byte
 			map[string]any{"role": "user", "content": "Reply with the single word 'ok'."},
 		},
 	})
-	prepared := cl.prepareBody(raw, a.Realm())
+	prepared := cl.prepareBody(raw, a.Realm(), a.UID, "")
 	if cl.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
