@@ -37,7 +37,7 @@ func TestPickHighestCredits(t *testing.T) {
 	p.SetCredits("u3", 300)
 	counts := map[string]int{}
 	for i := 0; i < 3000; i++ {
-		counts[p.Pick().UID]++
+		counts[p.Pick("").UID]++
 	}
 	if counts["u2"] <= counts["u1"] || counts["u2"] <= counts["u3"] {
 		t.Errorf("u2 (highest credits) should be picked most: %v", counts)
@@ -53,7 +53,7 @@ func TestPickSkipsCooling(t *testing.T) {
 	p.SetCredits("u1", 100)
 	p.SetCredits("u2", 50)
 	p.Cooldown("u1", CoolHard, time.Hour, "test")
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
 	}
@@ -66,7 +66,7 @@ func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p.SetCredits("u1", 100)
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
 	time.Sleep(5 * time.Millisecond)
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("pick=%+v want u1 after cooldown expiry", got)
 	}
@@ -77,7 +77,7 @@ func TestPickNilWhenAllDisabled(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Disable("u1", "session dead")
-	if got := p.Pick(); got != nil {
+	if got := p.Pick(""); got != nil {
 		t.Fatalf("want nil (all disabled), got %+v", got)
 	}
 }
@@ -89,12 +89,12 @@ func TestPickExcluding(t *testing.T) {
 	p.SetCredits("u1", 100)
 	p.SetCredits("u2", 50)
 	tried := map[string]bool{"u1": true}
-	got := p.PickExcluding(tried)
+	got := p.PickExcludingForRealm(tried, "", "")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
 	}
 	tried["u2"] = true
-	if got := p.PickExcluding(tried); got != nil {
+	if got := p.PickExcludingForRealm(tried, "", ""); got != nil {
 		t.Fatalf("want nil, got %+v", got)
 	}
 }
@@ -109,7 +109,7 @@ func TestPickExcludingStaysWithinHealthy(t *testing.T) {
 	p.SetCredits("u-hot", 1)
 	p.Cooldown("u-cold", CoolHard, time.Hour, "x")
 	for i := 0; i < 20; i++ {
-		got := p.PickExcluding(nil)
+		got := p.PickExcludingForRealm(nil, "", "")
 		if got == nil || got.UID != "u-hot" {
 			t.Fatalf("iter %d: picked %+v, want only healthy u-hot", i, got)
 		}
@@ -127,7 +127,7 @@ func TestPickWeightedSkewTowardHighCredits(t *testing.T) {
 	p.SetCredits("w1", 1000)
 	counts := map[string]int{}
 	for i := 0; i < 5000; i++ {
-		counts[p.Pick().UID]++
+		counts[p.Pick("").UID]++
 	}
 	mx, mxUID := 0, ""
 	for uid, n := range counts {
@@ -149,7 +149,7 @@ func TestPickWeightedUniformWhenAllZero(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for i := 0; i < 30; i++ {
-		seen[p.Pick().UID] = true
+		seen[p.Pick("").UID] = true
 	}
 	if len(seen) != 3 {
 		t.Errorf("uniform fallback should hit all, seen=%v", seen)
@@ -170,7 +170,7 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 	p.SetCredits("a5", 1000)
 	p.SetCredits("a6", 5) // Top5 之外
 	for i := 0; i < 2000; i++ {
-		if got := p.Pick(); got == nil || got.UID == "a6" {
+		if got := p.Pick(""); got == nil || got.UID == "a6" {
 			t.Fatalf("iter %d: picked %+v, a6 must stay outside top-5", i, got)
 		}
 	}
@@ -196,7 +196,7 @@ func TestPickTopFiveBySuccessRateNotCredits(t *testing.T) {
 	p.SetCredits("a6", 90)
 	p.NoteSuccess("a6") // 成功率 100%
 
-	if got := p.Pick(); got == nil || got.UID != "a6" {
+	if got := p.Pick(""); got == nil || got.UID != "a6" {
 		t.Fatalf("pick=%v, want a6 (high-success low-credit must enter top5 by weight)", got)
 	}
 }
@@ -222,7 +222,7 @@ func TestPickTopFiveByIdleNotCredits(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if got := p.Pick(); got == nil || got.UID != "a6" {
+	if got := p.Pick(""); got == nil || got.UID != "a6" {
 		t.Fatalf("pick=%v, want a6 (idle low-credit must enter top5 by weight)", got)
 	}
 }
@@ -237,7 +237,7 @@ func TestPickDeterministicViaSetRandomSource(t *testing.T) {
 	p.SetCredits("u2", 50)
 	// r=0 ∈ [0,50) → 命中 u1。注入源应使选号完全确定。
 	for i := 0; i < 50; i++ {
-		if got := p.Pick(); got == nil || got.UID != "u1" {
+		if got := p.Pick(""); got == nil || got.UID != "u1" {
 			t.Fatalf("iter %d: pick=%+v want u1 (deterministic)", i, got)
 		}
 	}
@@ -258,7 +258,7 @@ func TestPickAntiThunderingHerd(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			if a := p.Pick(); a != nil {
+			if a := p.Pick(""); a != nil {
 				picked[idx] = a.UID
 			}
 		}(i)
@@ -300,7 +300,7 @@ func TestPickLRUFallbackWhenTopAllRecentlyUsed(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil {
 		t.Fatal("pick returned nil")
 	}
@@ -333,7 +333,7 @@ func TestDisablePersists(t *testing.T) {
 	p.Flush()
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
-	if p2.Pick() != nil {
+	if p2.Pick("") != nil {
 		t.Fatal("disabled account picked after reload")
 	}
 	st, _ := p2.Status("u1")
@@ -347,7 +347,7 @@ func TestReenableIfCredits(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.ReenableIfCredits("u1", 500)
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("should reenable, pick=%+v", got)
 	}
@@ -369,7 +369,7 @@ func TestReenableDoesNotTouchDisabled(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Disable("u1", "session dead")
 	p.ReenableIfCredits("u1", 500)
-	if p.Pick() != nil {
+	if p.Pick("") != nil {
 		t.Fatal("disabled must not auto-reenable")
 	}
 }
@@ -640,7 +640,7 @@ func TestCooldownUntilTomorrow4AM(t *testing.T) {
 		t.Errorf("until %v is more than 24h out: %v", st.Until, d)
 	}
 	// 全冷却时余额耗尽（hard）号不参与兜底 → 返回 nil（等签到恢复）。
-	if got := p.Pick(); got != nil {
+	if got := p.Pick(""); got != nil {
 		t.Fatalf("all-hard-cooling should return nil (hard excluded from fallback), got %+v", got)
 	}
 }
@@ -895,7 +895,7 @@ func TestPickExcludingForModelSkipsSoftCoolingSameModel(t *testing.T) {
 	p.SetCredits("u2", 1)
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 u1
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
-	got := p.PickExcludingForModel(nil, "glm-5.3")
+	got := p.PickExcludingForRealm(nil, "glm-5.3", "")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("same-model request must skip cooling u1, got %+v", got)
 	}
@@ -911,7 +911,7 @@ func TestPickExcludingForModelAllowsDifferentModel(t *testing.T) {
 	p.SetCredits("u2", 1)
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 u1
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
-	got := p.PickExcludingForModel(nil, "hy3-x")
+	got := p.PickExcludingForRealm(nil, "hy3-x", "")
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("different-model request should bypass u1 soft cooling, got %+v", got)
 	}
@@ -928,7 +928,7 @@ func TestCooldownSoftWithoutModelRecordsNone(t *testing.T) {
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "", "429 rate limit")
 	// 冷却中 + 不同 model 请求仍跳过 u1（无模型级冷却条目，不豁免）。
-	got := p.PickExcludingForModel(nil, "hy3-x")
+	got := p.PickExcludingForRealm(nil, "hy3-x", "")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("no model recorded → must not bypass, got %+v", got)
 	}
@@ -946,7 +946,7 @@ func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1") // u1 熔断
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
-	got := p.PickExcludingForModel(nil, "hy3-x")
+	got := p.PickExcludingForRealm(nil, "hy3-x", "")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("breaker must still block, got %+v", got)
 	}
@@ -1021,14 +1021,14 @@ func TestModelCooldownsClearedByPlainCooldown(t *testing.T) {
 
 	// 1) 6004 带解析时间 → 记录模型 glm-5.3。
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
-	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u1" {
+	if got := p.PickExcludingForRealm(nil, "hy3-x", ""); got == nil || got.UID != "u1" {
 		t.Fatalf("precondition: different-model should bypass, got %+v", got)
 	}
 	// 2) 账号恢复后经历普通账号级软冷却（无模型语义）。
 	p.NoteSuccess("u1") // 还原 fresh 状态（Cooldown 会重设 until）
 	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
 	// 3) 换模型请求不得再豁免（modelCooldowns 已清空）。
-	got := p.PickExcludingForModel(nil, "hy3-x")
+	got := p.PickExcludingForRealm(nil, "hy3-x", "")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("plain cooldown must clear modelCooldowns (no bypass), got %+v", got)
 	}
@@ -1200,7 +1200,7 @@ func TestRemoveMissingFromDir(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
 	p.SyncToDir([]*auth.Auth{{UID: "u2"}})
-	if p.Pick() == nil || p.Pick().UID != "u2" {
+	if p.Pick("") == nil || p.Pick("").UID != "u2" {
 		t.Fatal("u1 should be removed")
 	}
 	if _, ok := p.Status("u1"); ok {
@@ -1469,7 +1469,7 @@ func TestFallbackPicksEarliestExpiry(t *testing.T) {
 	// 两个都软冷却；early 更早到期 → 兜底选 early。
 	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
 	p.Cooldown("early", CoolSoft, time.Hour, "x")
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil || got.UID != "early" {
 		t.Fatalf("fallback should pick earliest expiry (early), got %+v", got)
 	}
@@ -1481,7 +1481,7 @@ func TestFallbackSkipsDisabled(t *testing.T) {
 	p.Add(&auth.Auth{UID: "dead"})
 	p.Cooldown("cooled", CoolSoft, time.Hour, "x")
 	p.Disable("dead", "session dead") // 禁用不参与兜底
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil || got.UID != "cooled" {
 		t.Fatalf("fallback should skip disabled, got %+v", got)
 	}
@@ -1492,7 +1492,7 @@ func TestFallbackSkipsHardCooldown(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "hard"})
 	p.Cooldown("hard", CoolHard, time.Hour, "余额不足")
-	if got := p.Pick(); got != nil {
+	if got := p.Pick(""); got != nil {
 		t.Fatalf("hard-cooled account must not be fallback-picked, got %+v", got)
 	}
 }
@@ -1504,7 +1504,7 @@ func TestFallbackAllHardReturnsNil(t *testing.T) {
 	p.Add(&auth.Auth{UID: "h2"})
 	p.Cooldown("h1", CoolHard, time.Hour, "x")
 	p.Cooldown("h2", CoolHard, 2*time.Hour, "x")
-	if got := p.Pick(); got != nil {
+	if got := p.Pick(""); got != nil {
 		t.Fatalf("all-hard should return nil, got %+v", got)
 	}
 }
@@ -1518,7 +1518,7 @@ func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
 	p.SetBreaker(2, 5*time.Minute, 5*time.Minute)       // 阈值 2：soft 的 1 次失败不熔断
 	p.NoteError("brk")                                  // brk: fails=1
 	p.NoteError("brk")                                  // brk: 熔断，breakerUntil=5m
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil {
 		t.Fatal("fallback should pick breaker (earliest) account")
 	}
@@ -1531,7 +1531,7 @@ func TestFallbackNilWhenAllDisabled(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Disable("u1", "session dead")
-	if got := p.Pick(); got != nil {
+	if got := p.Pick(""); got != nil {
 		t.Fatalf("want nil when all disabled, got %+v", got)
 	}
 }
@@ -1683,14 +1683,14 @@ func TestPickSkipsInFlightFull(t *testing.T) {
 	p.SetMaxInFlight(1)
 	// full 占满唯一名额 → Pick 应跳过它，选 free（即使 credits 更低）。
 	p.Acquire("full")
-	got := p.Pick()
+	got := p.Pick("")
 	if got == nil || got.UID != "free" {
 		t.Fatalf("pick should skip in-flight-full account, got %+v", got)
 	}
 	p.Release("full")
 	// 释放后可重新被选中（确定性随机源 r=0 → 选 credits 最高的 full）。
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	if got := p.Pick(); got == nil || got.UID != "full" {
+	if got := p.Pick(""); got == nil || got.UID != "full" {
 		t.Fatalf("after release full should be pickable, got %+v", got)
 	}
 	p.Release("full")

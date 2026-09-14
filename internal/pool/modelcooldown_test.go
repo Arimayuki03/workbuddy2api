@@ -206,7 +206,7 @@ func TestModelCooldownsLazyCleanup(t *testing.T) {
 		"old": {Until: time.Now().Add(-time.Minute), ResetAt: time.Now().Add(-time.Minute)},
 	}
 	p.mu.Unlock()
-	got := p.PickExcludingForModel(nil, "fresh")
+	got := p.PickExcludingForRealm(nil, "fresh", "")
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("过期模型冷却不应拦截 u1, got %+v", got)
 	}
@@ -330,10 +330,10 @@ func TestModelCooldownsPickSkipsLimitedModel(t *testing.T) {
 	p.SetCredits("u2", 1)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
-	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "u2" {
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "u2" {
 		t.Fatalf("glm-5.3 请求应跳过 u1, got %+v", got)
 	}
-	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u1" {
+	if got := p.PickExcludingForRealm(nil, "hy3-x", ""); got == nil || got.UID != "u1" {
 		t.Fatalf("hy3-x 请求应豁免 u1, got %+v", got)
 	}
 }
@@ -471,13 +471,13 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 
 	// 请求 other：cooled 被全账号冷却拦截（即使无模型独立冷却），exempt 模型豁免
 	// （6004 只锁 glm-5.3）→ 唯一候选 exempt。
-	if got := p.PickExcludingForModel(nil, "other"); got == nil || got.UID != "exempt" {
+	if got := p.PickExcludingForRealm(nil, "other", ""); got == nil || got.UID != "exempt" {
 		t.Fatalf("other 模型请求应豁免 exempt（全账号冷却的 cooled 仍拦截），got %+v", got)
 	}
 	// 请求 glm-5.3：cooled 全账号冷却拦截；exempt 自身 6004 拦截 → 无健康候选 →
 	// 全冷却兜底只认账号级冷却（exempt 无 until/breakerUntil,expiry 零值被排除），
 	// 选 cooled（软冷却参与兜底）。
-	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "cooled" {
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "cooled" {
 		t.Fatalf("glm-5.3 请求：exempt 被自身 6004 拦截，兜底应选全账号冷却的 cooled，got %+v", got)
 	}
 }

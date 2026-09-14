@@ -850,11 +850,11 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
 	// 不同模型 hy3-x 的请求应豁免冷却选中 bad（最高分）。
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	same := p.PickExcludingForModel(nil, "glm-5.3")
+	same := p.PickExcludingForRealm(nil, "glm-5.3", "")
 	if same == nil || same.UID != "good" {
 		t.Fatalf("same-model pick should skip bad (still cooling), got %+v", same)
 	}
-	diff := p.PickExcludingForModel(nil, "hy3-x")
+	diff := p.PickExcludingForRealm(nil, "hy3-x", "")
 	if diff == nil || diff.UID != "bad" {
 		t.Fatalf("different-model pick should bypass bad soft cooling, got %+v", diff)
 	}

@@ -495,8 +495,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
-			// 模型感知 + realm 感知选号：请求携带 model 时启用 6004 模型级冷却豁免，
-			// realm 谓词过滤跨域账号（PickExcludingForModel 内部 model 空即退化 PickExcluding）。
+			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
+			// （healthyForModel），realm 谓词过滤跨域账号。
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
 		if acct == nil {

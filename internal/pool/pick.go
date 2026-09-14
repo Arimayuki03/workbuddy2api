@@ -11,22 +11,13 @@ import (
 	"workbuddy2api/internal/logfmt"
 )
 
-func (p *Pool) Pick() *auth.Auth {
-	return p.PickExcluding(nil)
-}
-
-// PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
+// Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知）。
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
-func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, "", "")
-}
-
-// PickExcludingForModel 模型感知选号：等同 PickExcluding，但对「6004 模型级冷却中的
-// 账号」进行模型豁免——请求模型与其 trigger 模型不同时视为可用（issue #31）。
-// reqModel 为空时即普通 PickExcluding（不影响既有调用语义）。
-func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *auth.Auth {
-	return p.pick(tried, reqModel, "")
+// model 非空时启用 6004 模型级冷却豁免（healthyForModel）；空则等价账号级 healthy。
+// 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
+func (p *Pool) Pick(model string) *auth.Auth {
+	return p.pick(nil, model, "")
 }
 
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。

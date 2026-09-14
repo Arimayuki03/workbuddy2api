@@ -25,7 +25,7 @@ func TestNoteSessionDeadThresholdNotReached(t *testing.T) {
 		t.Fatalf("连续 2 次 12153 不应禁用: %+v", st)
 	}
 	// 未达阈值时账号仍可选（keepalive 失败不污染选号）。
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
 		t.Fatalf("账号应保持可选, got %+v", got)
 	}
 }
@@ -47,7 +47,7 @@ func TestNoteSessionDeadDisablesAtThird(t *testing.T) {
 		t.Errorf("reason=%q want 12153 session dead", st.Reason)
 	}
 	// 禁用后不再可选。
-	if p.Pick() != nil {
+	if p.Pick("") != nil {
 		t.Fatal("禁用账号不可被选中")
 	}
 }
@@ -104,7 +104,7 @@ func TestReviveDisabled(t *testing.T) {
 	if st.Reason != "" {
 		t.Errorf("reason=%q want 空（revive 清 reason）", st.Reason)
 	}
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
 		t.Fatalf("复活后账号应回到池子, got %+v", got)
 	}
 	// 误判计数一并清零：复活后重新计满 3 次才禁用。
