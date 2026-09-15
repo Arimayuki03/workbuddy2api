@@ -66,11 +66,7 @@ func main() {
 		// refresh 过期 token
 		if a.NeedsRefresh(2 * 3600) {
 			if err := up.RefreshToken(a); err != nil {
-				if ue, ok := err.(*upstream.Error); ok && ue.Kind == upstream.ErrSessionDead {
-					r.status = "AUTH_INVALID"
-				} else {
-					r.status = "FAIL"
-				}
+				r.status = refreshStatusOf(err)
 				r.detail = "refresh: " + short(err.Error())
 				rows = append(rows, r)
 				failN++
@@ -209,6 +205,17 @@ func idempotentMatch(msg string) bool {
 		}
 	}
 	return false
+}
+
+// refreshStatusOf RefreshToken 失败的归一化状态（纯函数，供 main 循环与测试直接断言）：
+// session 失效（401 12153 离线）→ AUTH_INVALID（需人工重登，区别于普通失败）；
+// 其余一律 FAIL。
+func refreshStatusOf(err error) string {
+	var ue *upstream.Error
+	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+		return "AUTH_INVALID"
+	}
+	return "FAIL"
 }
 
 // checkinStatusOf DailyCheckin 结果的归一化状态（纯函数，供 main 循环与测试直接断言）：

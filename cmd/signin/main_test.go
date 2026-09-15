@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -119,5 +120,31 @@ func TestSigninFileGlobViaAuthLoadFiles(t *testing.T) {
 	files, err := auth.LoadAuthFiles(dir)
 	if err != nil || len(files) != 1 {
 		t.Fatalf("LoadAuthFiles: files=%v err=%v want 1", files, err)
+	}
+}
+
+// TestRefreshStatusOfWrappedError (P2-11 RED)：refresh 失败分支此前用
+// err.(*upstream.Error) 类型断言，错误被 %w 包装时漏判 ErrSessionDead →
+// 已死号被标成普通 FAIL 而非 AUTH_INVALID。同文件 isAlready 早已用
+// errors.As 的正确写法，此处对齐。
+func TestRefreshStatusOfWrappedError(t *testing.T) {
+	plain := &upstream.Error{Kind: upstream.ErrSessionDead, Status: 401, Msg: "code=12153"}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"bare session dead", plain, "AUTH_INVALID"},
+		{"wrapped session dead", fmt.Errorf("refresh: %w", plain), "AUTH_INVALID"},
+		{"double wrapped", fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", plain)), "AUTH_INVALID"},
+		{"other upstream error", &upstream.Error{Kind: upstream.ErrServer, Status: 500, Msg: "boom"}, "FAIL"},
+		{"transport error", errors.New("dial tcp: connection refused"), "FAIL"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := refreshStatusOf(c.err); got != c.want {
+				t.Errorf("refreshStatusOf(%v)=%q want %q", c.err, got, c.want)
+			}
+		})
 	}
 }
