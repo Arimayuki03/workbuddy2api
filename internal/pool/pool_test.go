@@ -516,6 +516,12 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 			t.Errorf("state.json missing %s:\n%s", want, raw)
 		}
 	}
+	// 运维可见的运行态字段即使零值也显式写出（去 omitempty）：缺失会被误解为"没记录"。
+	for _, want := range []string{`"soft_streak"`, `"session_dead_fails"`, `"credits_expiring"`, `"error_ema"`, `"success_ema"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("state.json missing %s（零值也应显式写出）:\n%s", want, raw)
+		}
+	}
 	if strings.Contains(string(raw), `"err_count"`) {
 		t.Errorf("state.json should not write legacy err_count:\n%s", raw)
 	}

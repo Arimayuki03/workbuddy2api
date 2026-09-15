@@ -268,7 +268,9 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64     `json:"err_total,omitempty"`
+	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring/
+	// error_ema）不用 omitempty：零值缺失会让人误以为"没记录"，实际是零值被省略。
+	ErrTotal    int64     `json:"err_total"`
 	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
 	LastSuccess time.Time `json:"last_success,omitempty"`
 	LastErr     time.Time `json:"last_err,omitempty"`
@@ -276,14 +278,14 @@ type stateAccount struct {
 	// entry.successEMA）。旧 state.json 缺字段 → 加载时从 successCount/errTotal
 	// 反推初始值（比率归一），向后兼容。
 	SuccessEMA float64 `json:"success_ema,omitempty"`
-	ErrorEMA   float64 `json:"error_ema,omitempty"`
+	ErrorEMA   float64 `json:"error_ema"`
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
-	SoftStreak int `json:"soft_streak,omitempty"`
+	SoftStreak int `json:"soft_streak"`
 	// SessionDeadFails 连续 12153 计数（判定 session 死亡的进度）。持久化以保留
 	// 「重启后连续计数继续累计」——上游持续 session dead 时重启归零会重学 2 次失败。
-	// 零值省略（omitempty）。
-	SessionDeadFails int `json:"session_dead_fails,omitempty"`
+	// 零值也显式写出（运维口径，见 err_total 注释）。
+	SessionDeadFails int `json:"session_dead_fails"`
 
 	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
 	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
@@ -297,7 +299,8 @@ type stateAccount struct {
 	RetryCount int `json:"retry_count,omitempty"`
 	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留第四因子
 	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
-	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
+	// 零值也显式写出（运维口径，见 err_total 注释）。
+	CreditsExpiring int64 `json:"credits_expiring"`
 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
 	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍

@@ -54,8 +54,9 @@ func TestSessionDeadFailsPersistRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSessionDeadFailsPersistOmitZero sessionDeadFails=0 时落盘 omitempty 不写。
-func TestSessionDeadFailsPersistOmitZero(t *testing.T) {
+// TestSessionDeadFailsPersistWritesZero sessionDeadFails=0 时也显式落盘
+// （运维口径：零值缺失会误解为"没记录"，实际是零值省略——stateAccount 去 omitempty）。
+func TestSessionDeadFailsPersistWritesZero(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
@@ -68,8 +69,8 @@ func TestSessionDeadFailsPersistOmitZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "session_dead_fails") {
-		t.Errorf("sessionDeadFails=0 时不应落盘:\n%s", raw)
+	if !strings.Contains(string(raw), `"session_dead_fails": 0`) {
+		t.Errorf("sessionDeadFails=0 时也应显式写出（运维可见）:\n%s", raw)
 	}
 }
 
