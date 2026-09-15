@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -42,8 +43,10 @@ const (
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
-// 登录 state 落盘路径（var 便于测试替换临时文件）
-var stateFile = "/tmp/wb2api-login-state.json"
+// 登录 state 落盘路径（var 便于测试替换临时文件）。
+// 跨平台：os.TempDir() 在 Linux 解析为 /tmp（容器内行为不变），Windows 解析为
+// 系统临时目录，避免硬编码 /tmp 在 Windows 上 "The system cannot find the path"。
+var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
 
 // exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
 var exitFunc = os.Exit
