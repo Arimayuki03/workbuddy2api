@@ -253,8 +253,17 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
+// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
+const softRateResetPattern = `将在 (.+?) 重置`
+
+// 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
+// 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
+// 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
+// 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
+var (
+	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+)
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
@@ -263,8 +272,7 @@ const softRateTimeLayout = "2006-01-02 15:04:05"
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	return re.MatchString(body)
+	return reModelRateLimit.MatchString(body)
 }
 
 // ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
@@ -274,8 +282,7 @@ func IsModelRateLimit(body string) bool {
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
-	re := regexp.MustCompile(softRateResetRe)
-	m := re.FindStringSubmatch(body)
+	m := reSoftRateReset.FindStringSubmatch(body)
 	if len(m) < 2 {
 		return time.Time{}, false
 	}

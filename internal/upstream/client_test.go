@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -632,5 +633,40 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 	})
 	if c.chatHTTP() != c.HTTP {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
+	}
+}
+
+// TestRateRegexesPrecompiledConcurrent 正则预编译为包级 var 后（P2-9，发现 8），
+// 两个限流判定函数在高并发下结果恒定。旧实现（函数体内 MustCompile）在此
+// 测试下同样通过（纯只读），该测试锁的是「预编译不改变语义」+ 并发安全，
+// 防止未来有人把包级 var 改回带状态的调用侧编译。
+func TestRateRegexesPrecompiledConcurrent(t *testing.T) {
+	const bodies = 50
+	const workers = 8
+	rlBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+	resetBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < bodies; i++ {
+				if !IsModelRateLimit(rlBody) {
+					errs <- fmt.Errorf("IsModelRateLimit concurrent miss")
+					return
+				}
+				if _, ok := ParseRateReset(resetBody); !ok {
+					errs <- fmt.Errorf("ParseRateReset concurrent miss")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }
