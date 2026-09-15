@@ -267,14 +267,16 @@ func IsModelRateLimit(body string) bool {
 	return re.MatchString(body)
 }
 
-// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
-// 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
-// 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
-func ParseSoftRateReset(body string) (time.Time, bool) {
-	if !IsModelRateLimit(body) {
-		return time.Time{}, false
-	}
+//
+// 与旧 ParseSoftRateReset 的关键差异：不再被 IsModelRateLimit（6004）门禁。只要是
+// 带「将在 … 重置」的限流文案——6004 模型级、11140 "The model provider is
+// rate-limiting requests." 等任意形态——都提取同一上游权威重置墙钟。是否走模型级
+// 豁免、时日对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
+// IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
+// 的限流也照常由调用方退回有界退避（绝不臆造时间）。
+func ParseRateReset(body string) (time.Time, bool) {
 	re := regexp.MustCompile(softRateResetRe)
 	m := re.FindStringSubmatch(body)
 	if len(m) < 2 {
@@ -287,6 +289,12 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+// ParseSoftRateReset 旧函数名的兼容别名：等价于 ParseRateReset（统一入口）。
+// 保留仅为避免旧调用点/外部引用断裂；新增代码应直接使用 ParseRateReset。
+func ParseSoftRateReset(body string) (time.Time, bool) {
+	return ParseRateReset(body)
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
