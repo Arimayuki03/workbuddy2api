@@ -126,6 +126,7 @@ func (p *Pool) load() {
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+	now := time.Now()
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
@@ -133,7 +134,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
 		}
-		p.byUID[uid] = &entry{
+		e := &entry{
 			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:      s.Credits,
 			disabled:     s.Disabled,
@@ -146,6 +147,25 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			lastSuccess:  s.LastSuccess,
 			softStreak:   s.SoftStreak,
 		}
+		// 恢复 modelCooldowns，惰性过滤已过期条目（Until 在未来才恢复）。
+		// 防止重启后残留已过期的模型级冷却条目（与 pick 路径的 pruneExpiredModelCooldowns 同口径）。
+		if len(s.ModelCooldowns) > 0 {
+			e.modelCooldowns = make(map[string]modelCooldown, len(s.ModelCooldowns))
+			for m, smc := range s.ModelCooldowns {
+				if smc.Until.IsZero() || !now.Before(smc.Until) {
+					continue // 过期/零值丢弃
+				}
+				e.modelCooldowns[m] = modelCooldown{
+					Until:   smc.Until,
+					ResetAt: smc.ResetAt,
+					Reason:  smc.Reason,
+				}
+			}
+			if len(e.modelCooldowns) == 0 {
+				e.modelCooldowns = nil
+			}
+		}
+		p.byUID[uid] = e
 	}
 }
 
@@ -232,19 +252,50 @@ func persistFailDiag(stateFp string) string {
 
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
+	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
+		// 模型级冷却落盘（复用既有落盘循环，不新增遍历）。只写 Until 在未来的条目，
+		// 与恢复时过期过滤同口径——落盘即清理，避免 state.json 残留已过期条目。
+		var mcs map[string]stateModelCooldown
+		if len(e.modelCooldowns) > 0 {
+			mcs = make(map[string]stateModelCooldown, len(e.modelCooldowns))
+			for m, mc := range e.modelCooldowns {
+				if mc.Until.IsZero() || !now.Before(mc.Until) {
+					continue // 已过期：不落盘（惰性清理）
+				}
+				mcs[m] = stateModelCooldown{
+					Until:   mc.Until,
+					ResetAt: mc.ResetAt,
+					Reason:  mc.Reason,
+				}
+			}
+			if len(mcs) == 0 {
+				mcs = nil
+			}
+		}
+		// 惰性清理僵尸 reason：until 为零值或已过期时不写出 cool_kind/reason，
+		// 避免 state.json 残留「until=0001 零值 + reason=6004 model rate limit」
+		// 的不一致快照（模型级冷却不该污染账号级 coolKind/reason 域）。disabled
+		// 账号的 reason 是禁用原因，不在冷却语义内，照常保留。
+		coolKind := e.coolKind
+		reason := e.reason
+		if !e.disabled && (e.until.IsZero() || !now.Before(e.until)) {
+			coolKind = 0
+			reason = ""
+		}
 		sf.Accounts[uid] = stateAccount{
-			Credits:      e.credits,
-			Disabled:     e.disabled,
-			Reason:       e.reason,
-			Until:        e.until,
-			CoolKind:     e.coolKind,
-			SuccessCount: e.successCount,
-			ErrTotal:     e.errTotal,
-			LastSuccess:  e.lastSuccess,
-			LastErr:      e.lastErr,
-			SoftStreak:   e.softStreak,
+			Credits:       e.credits,
+			Disabled:      e.disabled,
+			Reason:        reason,
+			Until:         e.until,
+			CoolKind:      coolKind,
+			SuccessCount:  e.successCount,
+			ErrTotal:      e.errTotal,
+			LastSuccess:   e.lastSuccess,
+			LastErr:       e.lastErr,
+			SoftStreak:    e.softStreak,
+			ModelCooldowns: mcs,
 		}
 	}
 	return sf

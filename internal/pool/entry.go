@@ -104,7 +104,9 @@ type entry struct {
 	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
 	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
 	// 单 until 字段做不到的）。only 6004 触发时记录；空 map = 无模型级限流（不豁免）。
-	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
+	// 持久化语义（stateAccount.ModelCooldowns）：重启后恢复，恢复时惰性过滤已过期
+	// 条目。PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
+	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩 6004 雷区。
 	modelCooldowns map[string]modelCooldown
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
@@ -261,6 +263,19 @@ type stateAccount struct {
 	// ModelCost 实测扣费账本（model → 观测）。仅内存态，重启后重新学习：
 	// 成本会随上游活动（限免期/夜间免费/折扣）变化，持久化旧值反而是脏数据。
 	ModelCost map[string]stateModelCost `json:"-"`
+	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
+	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
+	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
+	// 6004 雷区（选号撞限流号耗尽 MaxRotate → 429）。恢复时惰性过滤已过期条目。
+	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
+}
+
+// stateModelCooldown 单个 (账号, 模型) 的 6004 独立冷却持久化记录，与运行态
+// modelCooldown 同构（Until/ResetAt/Reason 字段名与语义对齐），落盘/恢复往返无损。
+type stateModelCooldown struct {
+	Until   time.Time `json:"until,omitempty"`
+	ResetAt time.Time `json:"reset_at,omitempty"`
+	Reason  string    `json:"reason,omitempty"`
 }
 
 // stateModelCost 单个 (账号, 模型) 的实测成本观测。
