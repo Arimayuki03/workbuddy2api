@@ -68,6 +68,14 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
+		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
+		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
+		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
+		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -121,6 +129,40 @@ func TestIsModelRateLimit(t *testing.T) {
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
 			t.Errorf("IsModelRateLimit(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// TestIsModelBlocked 11102「该后端无此模型」判定：只认 code 精确等于 11102 或 msg 命中
+// 窄短语 "service info not found"，且仅在 400/404 下判。覆盖 reference 报告「11102 撞在
+// ID 上」的坑——requestId 里的 11102 不得误判。
+func TestIsModelBlocked(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		// 顶层 code 字段。
+		{404, `{"code":11102,"msg":"model [x] service info not found"}`, true},
+		// error 子对象 code 字段（OpenAI 信封形态）。
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, true},
+		// msg 短语命中（无 code 字段）。
+		{400, `{"msg":"model service info not found"}`, true},
+		// 11102 撞在 requestId 上不算（reference converter test_model_site_blocks.py:55 同款）。
+		{404, `{"requestId":"11102","code":0,"msg":"ok"}`, false},
+		{400, `{"requestId":"11102","msg":"boom"}`, false},
+		// 429 带 11102 属限流语义，不算模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, false},
+		// 非 400/404 不算。
+		{500, `{"code":11102,"msg":"service info not found"}`, false},
+		// code 非 11102 且无短语 → 不算。
+		{404, `{"code":11103,"msg":"x"}`, false},
+		// 空 body 不算。
+		{404, ``, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBlocked(c.status, c.body); got != c.want {
+			t.Errorf("IsModelBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
 		}
 	}
 }

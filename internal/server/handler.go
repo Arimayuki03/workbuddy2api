@@ -625,6 +625,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 		if sessKey != "" && h.cfg.Session != nil {
@@ -712,6 +715,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
+//     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
@@ -776,6 +781,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+	case upstream.ErrModelBlocked:
+		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
+		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
+		// 24h）。选号侧 healthyForModel 对该账号自动避开该模型；切模型/切账号即可用。
+		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}
