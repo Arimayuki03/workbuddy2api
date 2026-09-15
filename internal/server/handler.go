@@ -696,9 +696,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //
 // 七条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate) 连续触发指数退避（封顶 soft_rate_max）；
-//     若上游 body 为模型级 6004 且带重置时间 → CooldownSoftForModel（until=重置墙钟，
-//     封顶 soft_rate_max，记录触发模型供切模型豁免）。
+//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
+//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
+//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
@@ -720,18 +720,24 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 模型级 6004 且带「将在 … 重置」时间（issue #31）：冷却到上游明说的重置墙钟
-		// （封顶 soft_rate_max），记录触发模型 → 该账号对**其他模型**请求可豁免冷却。
-		// 解析失败（无时间文案 / 非 6004）→ 退回既有 600s 基数 + 指数退避现况。
-		if upstream.IsModelRateLimit(body) {
-			if resetAt, ok := upstream.ParseSoftRateReset(body); ok {
+		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
+		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
+		// softStreak 指数堆加。
+		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
+		//     豁免（既有 issue #31 语义）。
+		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
+		//     （普通账号级限流不该因切模型绕过）。
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
+			if upstream.IsModelRateLimit(body) {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 				return
 			}
+			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+			return
 		}
-		// 其余 soft_rate：软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时
-		// pool 内部按 softStreak 指数退避并封顶 soft_rate_max。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
+		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
+		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:

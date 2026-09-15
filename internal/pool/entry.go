@@ -59,8 +59,8 @@ type RateLimitedModel struct {
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
-	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断，跟 softRateReset）；
-	// 截断后 Until==ResetAt，省略 ResetAt 让台账自然减少一列。
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）；未截断时
+	// Until==ResetAt（两者同值）。截断/未截断都透出，台账始终可见上游权威时点。
 	ResetAt time.Time `json:"reset_at,omitempty"`
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string `json:"reason,omitempty"`
