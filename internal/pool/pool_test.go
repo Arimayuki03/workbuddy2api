@@ -1112,30 +1112,32 @@ func TestModelCooldownsClearedByPlainCooldown(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsNotPersistedToState 新字段 modelCooldowns 缺省空 = 现状兼容：
-// 旧 state.json 不写它也能正常加载；落盘不引入该字段（运行态语义，重启即清零）。
-func TestModelCooldownsNotPersistedToState(t *testing.T) {
+// TestModelCooldownsPersistedToState modelCooldowns 现已持久化（修复重启后 6004
+// 模型级冷却失忆）：带解析时间触发后落盘写入 model_cooldowns 字段，重载后恢复。
+// 旧 state.json 不写该字段时缺省空（向后兼容，见 TestModelCooldownsPersistCompatOldState）。
+func TestModelCooldownsPersistedToState(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftForModel("u1", time.Minute, time.Now(), "glm-5.3", "429 rate limit")
+	// reset 在未来 → 模型级冷却生效（Until 在未来）。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
 	p.Flush()
 	raw, err := os.ReadFile(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "model_cooldowns") || strings.Contains(string(raw), "modelCooldowns") {
-		t.Errorf("state.json should not persist modelCooldowns (runtime-only):\n%s", raw)
+	if !strings.Contains(string(raw), "model_cooldowns") {
+		t.Errorf("state.json should persist model_cooldowns:\n%s", raw)
 	}
-	// 重载后 modelCooldowns 清零（运行态语义，重启退化为账号级冷却现状）。
+	// 重载后恢复（Until 在未来，不过滤）。
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
 	p2.mu.RLock()
 	n := len(p2.byUID["u1"].modelCooldowns)
 	p2.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("modelCooldowns should reset on reload, found %d entries", n)
+	if n != 1 {
+		t.Errorf("modelCooldowns should restore on reload, found %d entries", n)
 	}
 }
 
