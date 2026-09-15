@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"os"
@@ -160,11 +161,11 @@ func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
 		log.SetFlags(log.LstdFlags)
 	})
 
-	s.dispatch(taskSchool)
+	s.dispatch(context.Background(), taskSchool)
 	if f.runN != 1 || f.lastArgs[0] != "scripts/school_open_day_2026.py" {
 		t.Errorf("dispatch(school) 未执行: runN=%d last=%v", f.runN, f.lastArgs)
 	}
-	s.dispatch(taskCat)
+	s.dispatch(context.Background(), taskCat)
 	if f.runN != 2 || f.lastArgs[0] != "scripts/task_runner.py" {
 		t.Errorf("dispatch(cat) 未执行: runN=%d last=%v", f.runN, f.lastArgs)
 	}

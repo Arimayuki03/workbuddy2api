@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -183,31 +184,36 @@ func TestRunTravelCtxCancelsDuringAccountDelay(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestRunBatchFiresKindsInParallel 同一唤醒时刻的两类任务并行执行：
-// 签到在 /daily-checkin 上占住 500ms 窗口，期间活跃上报的 /v2/report 仍能发出
-// （串行派发时 report 必然落在窗口之后 → overlap=false）。
+// 签到 handler 在 /daily-checkin 窗口内等 /v2/report 的信号（握手）——并行派发时
+// report 随时可达（checkin 不阻塞 activity）；串行派发时 report 只会在 checkin
+// 结束后才发出，checkin 等信号必然超时 → overlap=false。
 // 账号 token 未过期（不触发 refresh 写 AccessToken），与 activity 读并发，
 // 保证 -race 干净（refresh 写 vs report 读属既有 chat/keepalive 同款并发面）。
 func TestRunBatchFiresKindsInParallel(t *testing.T) {
 	fastActivity(t)
 	fastTravel(t)
 
-	var checkinActive, overlap atomic.Bool
+	reportSeen := make(chan struct{})
+	var reportOnce sync.Once
+	var overlap atomic.Bool
 	var checkinCalls, reportCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
 			checkinCalls.Add(1)
-			checkinActive.Store(true)
-			time.Sleep(500 * time.Millisecond) // 占住窗口：串行派发时 report 必落在窗口后
-			checkinActive.Store(false)
+			// 窗口内等 report 信号：并行时 report 在 checkin 进行中可达；
+			// 串行时 report 落在窗口之后，2s 超时 → overlap 保持 false。
+			select {
+			case <-reportSeen:
+				overlap.Store(true)
+			case <-time.After(2 * time.Second):
+			}
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
 			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/v2/report"):
 			reportCalls.Add(1)
-			if checkinActive.Load() {
-				overlap.Store(true) // report 落在签到进行中 → 两任务族并行
-			}
+			reportOnce.Do(func() { close(reportSeen) })
 			w.Write([]byte(`{"code":0,"msg":"OK"}`))
 		default:
 			http.Error(w, "not found", 404) // streak 自检 / buddy-info 等，无需模拟
