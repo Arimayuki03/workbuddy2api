@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -247,12 +248,31 @@ func (a *Auth) SaveAtomic() error {
 	return os.Rename(tmp, a.FilePath)
 }
 
+// AuthFileGlob auth 文件的统一 glob 模式（宽侧：workbuddy*.json）。
+// 网关 LoadDir 与 cmd 运维工具（signin/credit/trial）共用此单一来源——
+// 此前 cmd 侧私用 workbuddy-*.json 窄模式，不带连字符的文件（如
+// workbuddy_new.json）被网关加载却被运维工具跳过，排障口径对不上
+// （审查发现 10）。
+const AuthFileGlob = "workbuddy*.json"
+
+// LoadAuthFiles 返回 dir 下按 AuthFileGlob 匹配的 auth 文件清单（已排序）。
+// 供 cmd 运维工具复用：只列文件、不解析不迁移（LoadDir 才做 backfill 等副作用），
+// 保持 signin/credit/trial 原有的「逐文件 Parse、损坏即跳过/报行错」流程不变。
+func LoadAuthFiles(dir string) ([]string, error) {
+	files, err := filepath.Glob(filepath.Join(dir, AuthFileGlob))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
 func LoadDir(dir string) ([]*Auth, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
+	files, err := LoadAuthFiles(dir)
 	if err != nil {
 		return nil, err
 	}

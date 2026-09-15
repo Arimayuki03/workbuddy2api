@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"workbuddy2api/internal/auth"
@@ -30,12 +29,13 @@ func main() {
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
 	}
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy-*.json"))
+	// 文件清单走 auth.LoadAuthFiles（宽侧 workbuddy*.json）：与网关 LoadDir 同口径，
+	// 不带连字符的文件不再被跳过（P2-10，审查发现 10）。
+	files, err := auth.LoadAuthFiles(dir)
 	if err != nil || len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "no auth files in %s\n", dir)
 		os.Exit(1)
 	}
-	sort.Strings(files)
 	up := upstream.New()
 	// 允许按 realm 路由：global 账号的签到/余额会打到 global base（workbuddy.ai），
 	// 由幂等码兜底为「未开启/不适用」，而不是误打到 CN base 产生签到成功的假象。

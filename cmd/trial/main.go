@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
@@ -64,13 +63,13 @@ func main() {
 	if len(os.Args) > 1 {
 		authDir = os.Args[1]
 	}
-	files, err := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
+	// 文件清单走 auth.LoadAuthFiles（宽侧 workbuddy*.json）：与网关 LoadDir 同口径，
+	// 不带连字符的文件不再被跳过（P2-10，审查发现 10）。
+	files, err := auth.LoadAuthFiles(authDir)
 	if err != nil || len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "no auth files in %s\n", authDir)
 		os.Exit(1)
 	}
-	sort.Strings(files)
-
 	up := upstream.New()
 	// trial 是 global 专属端点：必须开启 global realm 路由，否则 upstream.New() 的
 	// GlobalEnabled 零值 false 会把请求路由到 CN base（codebuddy.cn）而必然失败。
