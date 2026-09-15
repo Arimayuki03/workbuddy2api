@@ -453,8 +453,10 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 				Until:  mc.Until,
 				Reason: mc.Reason,
 			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+			// 上游「将在 … 重置」的原始墙钟：无论是否被 soft_rate_max 截断都透出——
+			// 未截断时 Until==ResetAt（两者同值），截断时 ResetAt 是真实恢复时刻，
+			// 台账据此始终可见上游权威时点（omitempty 仅在无 ResetAt 的旧数据上省略）。
+			if !mc.ResetAt.IsZero() {
 				row.ResetAt = mc.ResetAt
 			}
 			rows = append(rows, row)
