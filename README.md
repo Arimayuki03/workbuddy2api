@@ -164,10 +164,10 @@ curl -s http://localhost:7863/healthz
 
 本仓库在上游基础上附带一套 Windows 原生工作流（无需 Docker，直接跑 `wb2api.exe`）：
 
-- **启动服务.bat** — 交互菜单：查积分 / 加入用户（国内版）/ 加入国际版用户（global）/ 后台启动（含状态判断）/ 停止 / 看日志 / 手动批量签到 / 领取国际版加油包（trial）/ 服务状态台账（/status）。首次用到工具时自动 `go build` 出 `credit.exe` / `login.exe` / `signin.exe` / `trial.exe` / `wb2api.exe`。
+- **启动服务.bat** — 交互菜单：`1` 查积分 / `2` 手动批量签到 / `3` 手动执行定时任务 / `4` 后台启动（含状态判断）/ `5` 停止 / `6` 服务状态台账 / `7` 看日志 / `8` 加入用户（国内版）/ `9` 加入国际版用户 / `0` 领取国际版加油包。首次用到工具时自动 `go build` 出 `credit.exe` / `login.exe` / `signin.exe` / `trial.exe` / `task.exe` / `wb2api.exe`。
 - **`login.exe join`** — 一步登录：拿授权 URL → 自动打开浏览器 → 轮询 token → 拉账号 →（CN）签到 → 原子落盘 `auths/workbuddy-<uid>.json`；等待授权期间按任意键可中止。等价于 `login.sh` 的编排，供 cmd/菜单直接驱动。支持 `--realm=cn|global`。
 - **`trial.exe`** — 国际版账号批量领取 /billing/ide/trial 加油包（CN 账号自动跳过）。
-- **`task.exe <kind>`** — 定时任务手动一次性触发器（checkin/activity/keepalive/travel/school/cat/all），独立进程立即跑一次与排程相同的任务体，不影响常驻服务的自动排程；菜单 `10` 提供子菜单入口。
+- **`task.exe <kind>`** — 定时任务手动一次性触发器（checkin/activity/keepalive/travel/school/cat/all），独立进程立即跑一次与排程相同的任务体，不影响常驻服务的自动排程；菜单 `3` 提供子菜单入口。
 - **`credit.exe -pretty`** — 积分日报，除汇总外附账号明细表（昵称 / UID / 剩余 / 已用 / 总量 / 状态）。
 - **scripts/start-service.ps1** — 后台隐藏启动 `wb2api.exe`，stderr 重定向到 `logs/server.log`。
 - 详细图文见 **[使用指南.md](使用指南.md)**。

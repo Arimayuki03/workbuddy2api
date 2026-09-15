@@ -38,29 +38,29 @@ echo  ============================================
 echo     workbuddy2api 管理菜单
 echo  ============================================
 echo     [1] 查询积分 / 查看账号
-echo     [2] 加入用户（国内版 cn）
-echo     [3] 启动服务（后台）
-echo     [4] 停止服务
-echo     [5] 查看服务日志
-echo     [6] 手动签到（批量全部账号）
-echo     [7] 加入国际版用户（global）
-echo     [8] 领取国际版加油包（trial）
-echo     [9] 查看服务状态（/status 台账）
-echo    [10] 手动执行定时任务（不影响自动排程）
+echo     [2] 手动签到（批量全部账号）
+echo     [3] 手动执行定时任务（不影响自动排程）
+echo     [4] 启动服务（后台）
+echo     [5] 停止服务
+echo     [6] 查看服务状态（/status 台账）
+echo     [7] 查看服务日志
+echo     [8] 加入用户（国内版 cn）
+echo     [9] 加入国际版用户（global）
+echo     [0] 领取国际版加油包（trial）
 echo     [q] 退出
 echo  ============================================
 echo.
 set /p c=  请选择:
 if /i "%c%"=="1" goto :query
-if /i "%c%"=="2" goto :add
-if /i "%c%"=="3" goto :start
-if /i "%c%"=="4" goto :stop
-if /i "%c%"=="5" goto :log
-if /i "%c%"=="6" goto :signin
-if /i "%c%"=="7" goto :add_global
-if /i "%c%"=="8" goto :trial
-if /i "%c%"=="9" goto :status
-if /i "%c%"=="10" goto :task
+if /i "%c%"=="2" goto :signin
+if /i "%c%"=="3" goto :task
+if /i "%c%"=="4" goto :start
+if /i "%c%"=="5" goto :stop
+if /i "%c%"=="6" goto :status
+if /i "%c%"=="7" goto :log
+if /i "%c%"=="8" goto :add
+if /i "%c%"=="9" goto :add_global
+if /i "%c%"=="0" goto :trial
 if /i "%c%"=="q" goto :end
 goto :menu
 
@@ -133,7 +133,7 @@ if errorlevel 2 (
     echo  已中止，未添加账号。
 ) else (
     echo.
-    echo  加入完成。若服务运行中，需重启才能加载新账号（选 3 前先选 4 停止，再选 3 启动）。
+    echo  加入完成。若服务运行中，需重启才能加载新账号（选 4 前先选 5 停止，再选 4 启动）。
 )
 echo.
 pause
@@ -147,7 +147,7 @@ echo.
 .\signin.exe auths
 if errorlevel 1 (
     echo.
-    echo  [提示] 签到失败或 auths 目录无账号。请先选 2 加入用户。
+    echo  [提示] 签到失败或 auths 目录无账号。请先选 8 加入用户。
 )
 echo.
 pause
@@ -251,11 +251,11 @@ goto :waithealth
 echo  [成功] 服务已就绪，可正常使用。
 goto :run_done
 :health_timeout
-echo  [警告] 端口未在 10 秒内就绪，请选 5 查看日志确认。
+echo  [警告] 端口未在 10 秒内就绪，请选 7 查看日志确认。
 :run_done
 echo.
 echo  服务在后台运行，窗口可继续操作。
-echo  查看日志选 5，停止服务选 4。
+echo  查看日志选 7，停止服务选 5。
 echo.
 pause
 goto :menu

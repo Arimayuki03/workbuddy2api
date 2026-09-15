@@ -1,4 +1,4 @@
-﻿# status-report.ps1 — 拉取 /healthz 与 /status 渲染中文状态摘要（启动服务.bat 菜单 9 调用）。
+﻿# status-report.ps1 — 拉取 /healthz 与 /status 渲染中文状态摘要（启动服务.bat 菜单 6 调用）。
 # 用 curl.exe 而非 Invoke-RestMethod：后者在 503（无可用账号）时抛异常，而 healthz
 # 503 仍是有效响应（body 带 service/healthy 字段），必须能读回。
 # 编码要点：PS5.1 按系统 ANSI（GBK）解码 curl 的 UTF-8 stdout，中文昵称会解出乱码并
@@ -15,7 +15,7 @@ $tmp  = Join-Path $env:TEMP ('wb2api-status-{0}.json' -f $PID)
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) {
     if (Test-Path $tmp) { Remove-Item $tmp -Force }
     Write-Output "[状态] 服务未运行或无法连接（$base）。"
-    Write-Output "[处理] 请先在菜单选 3 启动服务；已启动则选 5 查看日志排查。"
+    Write-Output "[处理] 请先在菜单选 4 启动服务；已启动则选 7 查看日志排查。"
     exit 1
 }
 $hz = Get-Content -Raw -Encoding UTF8 $tmp | ConvertFrom-Json
