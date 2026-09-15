@@ -1005,9 +1005,14 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 // CN 现状 /console/enterprises/personal/models 逐字保留（零回归）；
 // global 走 /v2/enterprises/personal/models（PR #20 实测 /console 500、/v2 200 含
 // credits 倍率的完整模型表）。modelsPath 按 globalOn 分发。
+// v3ConfigPath 是 CN/global 双域通用的 /v3/config 模型目录端点（v3 系客户端权威
+// 目录；UA 门禁：仅三段式 CLI UA 可过，CommonHeaders 即满足，见
+// .claude/reports/global-models-missing.md）：v3 为主、企业端点补缺（任务书
+// v3-config-merge）。
 const (
 	cnModelsPath     = "/console/enterprises/personal/models"
 	globalModelsPath = "/v2/enterprises/personal/models"
+	v3ConfigPath     = "/v3/config"
 )
 
 // modelsPath 按 realm 返回动态模型目录端点路径（不含 base）。
@@ -1044,9 +1049,98 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	return false
 }
 
-// FetchModels 调上游动态模型接口。
+// FetchModels 调上游动态模型接口（CN 侧；global 账号按 modelsPath 走 /v2，v3 补充
+// 见 global_models.go FetchGlobalModels 家族，本方法职责不变）。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
+//
+// v3-config-merge：动态目录 = /v3/config（主）+ 企业端点（/console 或 global /v2，
+// 补缺）的并集，两路**并发**探测（任务书 v3-config-merge 需求 3/4）。两域口径各自
+// 保留：CN 按 agents[cli].models 过滤（零回归）；合并去重 key = 模型 id，v3 条目优先
+// （credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型。/v3 失败（400/网络错/解析
+// 失败）不拖累企业端点结果——降级为仅企业端点，warn 日志；反之亦然（两路独立容错）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	type probeResult struct {
+		infos []ModelInfo
+		err   error
+	}
+	enterpriseCh := make(chan probeResult, 1)
+	v3Ch := make(chan probeResult, 1)
+	go func() {
+		infos, err := c.fetchEnterpriseModels(a)
+		enterpriseCh <- probeResult{infos, err}
+	}()
+	go func() {
+		infos, err := c.fetchV3Models(a)
+		v3Ch <- probeResult{infos, err}
+	}()
+	enterprise := <-enterpriseCh
+	v3 := <-v3Ch
+	if enterprise.err != nil && v3.err != nil {
+		return nil, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
+	}
+	if v3.err != nil {
+		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
+		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+	}
+	if enterprise.err != nil {
+		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+	}
+	out := mergeModelInfos(v3.infos, enterprise.infos)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("models api returned empty list")
+	}
+	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
+	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶（例：cn 桶已有档位，再次探测返回全无等级 → 不应清空）。
+	cache := make(map[string][]string, len(out))
+	defCache := make(map[string]string, len(out))
+	for _, mi := range out {
+		if len(mi.Efforts) > 0 {
+			cache[mi.ID] = mi.Efforts
+		}
+		if mi.DefaultEffort != "" {
+			defCache[mi.ID] = mi.DefaultEffort
+		}
+	}
+	if len(cache) == 0 && len(defCache) == 0 {
+		return out, nil
+	}
+	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
+	c.storeEfforts(a.Realm(), cache, defCache)
+	return out, nil
+}
+
+// mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为准——
+// credits 等字段以主端点为权威），secondary 只补 primary 缺失的 id。
+// 去重 key = 模型 id；输出顺序 = primary 原序在前、secondary 补充项（secondary 原序）
+// 在后——稳定输出，不依赖 map 迭代序（任务书实现要点：排序保持稳定）。
+func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
+	if len(secondary) == 0 {
+		return primary
+	}
+	seen := make(map[string]bool, len(primary)+len(secondary))
+	out := make([]ModelInfo, 0, len(primary)+len(secondary))
+	for _, mi := range primary {
+		if mi.ID == "" || seen[mi.ID] {
+			continue
+		}
+		seen[mi.ID] = true
+		out = append(out, mi)
+	}
+	for _, mi := range secondary {
+		if mi.ID == "" || seen[mi.ID] {
+			continue
+		}
+		seen[mi.ID] = true
+		out = append(out, mi)
+	}
+	return out
+}
+
+// fetchEnterpriseModels 单路探测企业模型端点（CN → /console/enterprises/personal/models；
+// global → /v2/enterprises/personal/models，按 modelsPath 分发）。解析口径：对象形态
+// agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除（既有 FetchModels 逐字保留，
+// v3-config-merge 重构抽出的单路函数）。
+func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	url := c.chatBase(a) + c.modelsPath(a)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -1114,23 +1208,55 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
-	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶（例：cn 桶已有档位，再次探测返回全无等级 → 不应清空）。
-	cache := make(map[string][]string, len(out))
-	defCache := make(map[string]string, len(out))
-	for _, mi := range out {
-		if len(mi.Efforts) > 0 {
-			cache[mi.ID] = mi.Efforts
-		}
-		if mi.DefaultEffort != "" {
-			defCache[mi.ID] = mi.DefaultEffort
-		}
+	return out, nil
+}
+
+// fetchV3Models 单路探测 /v3/config（CN/global 双域通用，按 chatBase 切 base）。
+// 解析口径与 parseGlobalModelNames 对象形态一致（data.models[].id 优先、disabled 剔除、
+// 全字段落 ModelInfo）；v3 独有的 contextWindow/agent modelTags 额外字段自然忽略。
+// CN 侧不按 agents[cli] 过滤（与 global 探测口径一致：v3 面取全量 models）——
+// 实测 CN v3 51 模型含大量非 cli 面模型，cli 过滤后与 console 口径才有可比性；
+// 但 mergeModelInfos 以 enterprise（已 cli 过滤）为 secondary 补缺，v3 全量条目中
+// 只有企业端点缺失的 id 会进并集，实际生效口径仍是「cli 面并集」。
+func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+	url := c.chatBase(a) + v3ConfigPath
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
 	}
-	if len(cache) == 0 && len(defCache) == 0 {
-		return out, nil
+	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
+	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
+	c.CommonHeaders(req, a)
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
 	}
-	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.storeEfforts(a.Realm(), cache, defCache)
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("v3 config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	names, infos, _, _, err := parseGlobalModelNames(raw)
+	if err != nil {
+		return nil, fmt.Errorf("v3 config parse: %w", err)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("v3 config empty list")
+	}
+	// v3 面全量 models 不经 agents[cli] 过滤，nes-/completion-/codewise- 嵨补全/图片
+	// 生成等非对话条目（企业端点的 nonChatModel 口径）同样要挡在目录外——
+	// 这里按同一 nonChatModel 规则过滤（selected ID 会选模型报 code=11102）。
+	out := make([]ModelInfo, 0, len(infos))
+	for _, mi := range infos {
+		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+			continue
+		}
+		out = append(out, mi)
+	}
 	return out, nil
 }
 

@@ -324,7 +324,10 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	var outbound []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"),
+			strings.HasSuffix(r.URL.Path, "/v3/config"):
+			// v3-config-merge：FetchModels 并发打 console + /v3/config 两路，同一份
+			// glm-5.2 模型表（v3 主条目进 effort 桶，口径不变）。
 			return jsonResp(200, `{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil

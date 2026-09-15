@@ -1193,9 +1193,13 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 
+	// v3-config-merge：单次 fetch 并发打企业端点 + /v3/config，计数须并发安全。
+	var mu sync.Mutex
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		mu.Lock()
 		calls++
+		mu.Unlock()
 		return 500, `boom`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
@@ -1210,8 +1214,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	if calls != 1 {
-		t.Errorf("want 1 fetch, got %d", calls)
+	if calls != 2 {
+		// v3-config-merge：单次 fetch 并发打企业端点 + /v3/config 两路 = 2 个上游请求。
+		t.Errorf("want 2 upstream calls (single fetch, enterprise + v3), got %d", calls)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1223,8 +1228,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if calls != 2 {
-		t.Errorf("want 2 fetch after cooldown, got %d", calls)
+	if calls != 4 {
+		// 第二次 fetch 同样两路并发：累计 4 个上游请求。
+		t.Errorf("want 4 upstream calls after cooldown (2nd fetch, enterprise + v3), got %d", calls)
 	}
 }
 
