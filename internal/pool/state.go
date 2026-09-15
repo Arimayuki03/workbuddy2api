@@ -204,21 +204,7 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
 func (p *Pool) AvailableUIDs() []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if !e.healthy(now) {
-			continue
-		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	return uids
+	return p.availableUIDsLocked("", func(e *entry, now time.Time) bool { return e.healthy(now) })
 }
 
 // AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
@@ -226,12 +212,23 @@ func (p *Pool) AvailableUIDs() []string {
 // （issue #31 模型豁免）。
 // 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
 func (p *Pool) AvailableUIDsForModel(model string) []string {
+	return p.availableUIDsLocked("",
+		func(e *entry, now time.Time) bool { return e.healthyForModel(now, model) })
+}
+
+// availableUIDsLocked 是 AvailableUIDs 四变体（AvailableUIDs/ForModel/ForRealm/
+// ForModelRealm）共用的遍历实现：realm 过滤（""=全池）+ 可替换健康口径（healthy /
+// healthyForModel）+ 在途占满过滤，输出按 UID 排序（稳定）。调用方必须不持锁。
+func (p *Pool) availableUIDsLocked(realm string, health func(e *entry, now time.Time) bool) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if !e.healthyForModel(now, model) {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !health(e, now) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -323,24 +320,20 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 // （plain Cooldown 会清空 modelCooldowns，6004 不写 until），此处仅为探活存在性语义，
 // 不构成 chat 选号路径。
 func (p *Pool) ServableNow() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	for _, e := range p.byUID {
-		if p.inFlightFull(e) {
-			continue
-		}
-		if e.healthy(now) || e.modelExempt() {
-			return true
-		}
-	}
-	return false
+	return p.servableLocked("")
 }
 
 // ServableForRealm 报告某 realm 是否可服务：存在至少一个该 realm 的 healthy 且未占满在途名额的账号。
 // 与 ServableNow 同口径（healthy 或模型豁免、排除 inFlightFull），仅叠加 Realm()==realm 谓词。
 // realm=="" 退化为 ServableNow（现状语义）。供 /healthz 按 realm 暴露 CN/global 各自可达性。
 func (p *Pool) ServableForRealm(realm string) bool {
+	return p.servableLocked(realm)
+}
+
+// servableLocked 是 ServableNow / ServableForRealm 共用的遍历实现：
+// 存在至少一个（realm 匹配、未占满在途名额、healthy 或模型豁免形态）的账号即 true。
+// realm=="" 不加 realm 谓词（全池）。调用方必须不持锁。
+func (p *Pool) servableLocked(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
