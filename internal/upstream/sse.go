@@ -73,7 +73,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 								}
 								if txt, ok := delta["content"].(string); ok {
 									content.WriteString(txt)
-									gotAnyContent = true
+									// 仅真实内容置位：空串（工具调用首片/角色切换片常见）不能
+									// 触发 gotAnyContent，否则会把后续 message.content 兜底分支吞掉。
+									if txt != "" {
+										gotAnyContent = true
+									}
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
 									reasoning.WriteString(rc)

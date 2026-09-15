@@ -116,24 +116,26 @@ type Upstash struct {
 	done chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
 	closeOnce sync.Once
+	// pending 已提交未执行完的写计数。Close 等它归零：填槽法（占满全部写槽）
+	// 与排队写竞争槽位，赢了的 Close 会在排队写执行前返回，丢停机镜像末笔写。
+	pending sync.WaitGroup
 }
 
 // goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
 // 必然执行（停机镜像完整性），Close 后提交的写直接丢弃（进程已在退出）。
 func (u *Upstash) goWrite(fn func()) {
 	u.closeOnceGuard()
+	// 关停判定只在提交时刻做一次（同步）：进了 pending 的写不再复查 done，
+	// 否则排队写在 done 关闭后会在"丢弃/执行"间随机分叉，Close 等待不完整。
+	select {
+	case <-u.done:
+		return
+	default:
+	}
+	u.pending.Add(1)
 	go func() {
-		// 先检查关停标志再抢写槽：Close 之后的提交直接丢弃。
-		select {
-		case <-u.done:
-			return
-		default:
-		}
-		select {
-		case <-u.done:
-			return
-		case u.sem <- struct{}{}:
-		}
+		defer u.pending.Done()
+		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
 		fn()
 	}()
@@ -154,20 +156,15 @@ func (u *Upstash) closeOnceGuard() {
 func (u *Upstash) Close() error {
 	u.closeOnceGuard()
 	u.closeOnce.Do(func() { close(u.done) })
-	// 等在途 + 排队的写排空：写槽可被全部腾出，说明没有写在执行或排队
-	//（已持槽的写释放即归位，排队者会立刻取到——所以持续占满直到排空为止）。
-	deadline := time.Now().Add(10 * time.Second)
-	for i := 0; i < cap(u.sem); i++ {
-		select {
-		case u.sem <- struct{}{}:
-		case <-time.After(time.Until(deadline)):
-			// 兜底超时（单写上限 5s×cap，10s 富余）：卡死的写不应阻塞进程退出。
-			log.Printf("[redisstore] WARN: Close 等待在途写超时，放弃（镜像可能未写完）")
-			return u.closeClient()
-		}
-	}
-	for i := 0; i < cap(u.sem); i++ {
-		<-u.sem
+	// 等已提交（含排队中）的写全部执行完：pending 由 goWrite 提交时登记、fn 执行完
+	// 注销，归零即全部落地。done 只拦"Close 之后的新提交"，不碰已入队者。
+	// 兜底超时（单写上限 5s×cap，10s 富余）：卡死的写不应阻塞进程退出。
+	waitCh := make(chan struct{})
+	go func() { u.pending.Wait(); close(waitCh) }()
+	select {
+	case <-waitCh:
+	case <-time.After(10 * time.Second):
+		log.Printf("[redisstore] WARN: Close 等待在途写超时，放弃（镜像可能未写完）")
 	}
 	return u.closeClient()
 }

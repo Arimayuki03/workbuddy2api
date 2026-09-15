@@ -160,6 +160,16 @@ curl -s http://localhost:7863/healthz
 > docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
 > ```
 
+### Windows 免 Docker 使用（本仓库定制）
+
+本仓库在上游基础上附带一套 Windows 原生工作流（无需 Docker，直接跑 `wb2api.exe`）：
+
+- **启动服务.bat** — 交互菜单：查积分 / 加入用户 / 后台启动（含状态判断）/ 停止 / 看日志 / 手动批量签到。首次用到工具时自动 `go build` 出 `credit.exe` / `login.exe` / `signin.exe` / `wb2api.exe`。
+- **`login.exe join`** — 一步登录：拿授权 URL → 自动打开浏览器 → 轮询 token → 拉账号 →（CN）签到 → 原子落盘 `auths/workbuddy-<uid>.json`；等待授权期间按任意键可中止。等价于 `login.sh` 的编排，供 cmd/菜单直接驱动。支持 `--realm=cn|global`。
+- **`credit.exe -pretty`** — 积分日报，除汇总外附账号明细表（昵称 / UID / 剩余 / 已用 / 总量 / 状态）。
+- **scripts/start-service.ps1** — 后台隐藏启动 `wb2api.exe`，stderr 重定向到 `logs/server.log`。
+- 详细图文见 **[使用指南.md](使用指南.md)**。
+
 ### 源码构建
 
 ```bash

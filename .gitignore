@@ -12,6 +12,19 @@ data/
 /credit
 /wb2api
 /signin_bin
+# Windows 预编译产物（启动服务.bat 自动生成/使用）
+/login.exe
+/credit.exe
+/wb2api.exe
+/signin.exe
+
+# Runtime logs & distribution archive（本地定制）
+logs/
+workbuddy2api-dist.zip
+
+# Session artifacts
+.omo/
+.v2c/
 
 # Config with secrets (use config.example.json)
 config.json
@@ -34,3 +47,4 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+!使用指南.md

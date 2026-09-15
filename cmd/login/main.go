@@ -309,10 +309,10 @@ func buildLoginOutput(tok struct {
 func main() {
 	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
-		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
+		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm|join>)", err)
 	}
 	if len(rest) < 1 {
-		fatal("usage: login [--realm=cn|global] <url|poll>")
+		fatal("usage: login [--realm=cn|global] <url|poll|join>")
 	}
 	// 每个流程独立 cookie jar（多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
@@ -333,7 +333,11 @@ func main() {
 		realm := promptRealm(os.Stdin, os.Stderr)
 		fmt.Println(realm)
 
+	case "join":
+		// 一步登录（Windows 启动服务.bat 驱动）：url→浏览器→轮询→账号→签到→落盘
+		runJoin(base, origin, realm, client)
+
 	default:
-		fatal("unknown subcommand %q (want url|poll|realm)", rest[0])
+		fatal("unknown subcommand %q (want url|poll|realm|join)", rest[0])
 	}
 }

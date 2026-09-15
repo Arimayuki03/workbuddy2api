@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -125,7 +126,7 @@ func printAccounts(accounts []accountResult, pretty bool) {
 	fmt.Println(string(raw))
 }
 
-// printPretty 人类可读日报：四行汇总，无账号明细。
+// printPretty 人类可读日报：汇总一行 + 账号明细表（昵称/UID/剩余/已用/总量/状态）。
 func printPretty(accounts []accountResult, totalRemain, totalUsed, totalSize int64, okCount int) {
 	withBalance := 0
 	var failed []string
@@ -145,11 +146,65 @@ func printPretty(accounts []accountResult, totalRemain, totalUsed, totalSize int
 	if totalSize > 0 {
 		pct = totalRemain * 100 / totalSize
 	}
-	fmt.Printf("📊 WorkBuddy 积分日报\n")
-	fmt.Printf("账号: %d/%d\n", withBalance, len(accounts))
-	fmt.Printf("总计: %d/%d\n", totalRemain, totalSize)
-	fmt.Printf("剩余: %d%%\n", pct)
-	for _, f := range failed {
-		fmt.Printf("⚠️ %s\n", f)
+	var b strings.Builder
+	fmt.Fprintf(&b, "📊 WorkBuddy 积分日报\n")
+	fmt.Fprintf(&b, "账号: %d/%d    总计: %d/%d    剩余: %d%%\n", withBalance, len(accounts), totalRemain, totalSize, pct)
+	// 账号明细表（看用户 + 积分）
+	fmt.Fprintf(&b, "%-14s %-14s %10s %10s %10s  %s\n", "昵称", "UID", "剩余", "已用", "总量", "状态")
+	for _, a := range accounts {
+		status := "✔"
+		remain, used, size := "-", "-", "-"
+		if a.OK && a.Remain != nil {
+			remain, used, size = itoa(*a.Remain), itoa(*a.Used), itoa(*a.Size)
+		}
+		if !a.OK {
+			status = "✘ " + trunc(a.Error, 24)
+		}
+		nick := a.Nickname
+		if nick == "" {
+			nick = "(无昵称)"
+		}
+		uid := a.UID
+		if len(uid) > 14 {
+			uid = uid[:14]
+		}
+		fmt.Fprintf(&b, "%-14s %-14s %10s %10s %10s  %s\n", trunc(nick, 14), uid, remain, used, size, status)
 	}
+	for _, f := range failed {
+		fmt.Fprintf(&b, "⚠️ %s\n", f)
+	}
+	// 纯 UTF-8 输出。目标控制台按 UTF-8 渲染（实测：chcp 虽报 936，但 Windows Terminal/
+	// UTF-8 控制台正确显示 UTF-8，GBK 反而乱码），因此不做任何代码页转换。
+	fmt.Print(b.String())
+}
+
+// itoa 极简 int→string（避免只为输出格式化引 strconv）。
+func itoa(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}
+
+// trunc 截断字符串到 n 个字节（中文可能被截半，接受；仅用于表格对齐）。
+func trunc(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
