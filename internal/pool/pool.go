@@ -45,7 +45,7 @@ type Pool struct {
 	closeOnce sync.Once
 }
 
-// defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
+// New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。
 func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:              map[string]*entry{},
@@ -117,9 +117,8 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 	p.store = s
 }
 
-// RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
-// 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
-// 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
+// Acquire 为 uid 占一个在途名额（会话粘性命中后调用）；池上限内返回 true。
+// 名额用 entry.inFlight 原子自增，满额返回 false。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
@@ -171,7 +170,7 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.randInt64N = fn
 }
 
-// startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘。
+// Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号）。
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -209,5 +208,3 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 	}
 	p.byUID[a.UID] = &entry{a: a}
 }
-
-// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

@@ -328,7 +328,7 @@ type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
 }
 
-// flushInterval 后台落盘周期。
+// defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
 const (
 	defaultBreakerThreshold   = 3
 	defaultBreakerCooldown    = 30 * time.Minute
@@ -355,11 +355,8 @@ func SessionDeadThreshold() int { return sessionDeadThreshold }
 // 无论 streak 累积多少，封顶逻辑总会先生效，此值只是溢出兜底。
 const softStreakShiftMax = 16
 
-// StoreSnapshotter 池状态快照镜像的最小接口（redisstore.Store 满足；Noop 空实现安全）。
-// 与本地 state.json 并存，作启动恢复备份：快照比本地新才采用，否则本地优先。
+// defaultIdle* 闲置补偿默认参数（claude-api selectWeightedRandom 参考口径）。
 const (
 	defaultIdleWeightPerHour = 0.5
 	defaultIdleWeightMax     = 5.0
 )
-
-// New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。

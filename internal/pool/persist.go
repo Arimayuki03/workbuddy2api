@@ -27,13 +27,16 @@ type snapshot struct {
 	SavedAt time.Time `json:"saved_at"`
 }
 
-// Pool 账号池。
+// StoreSnapshotter 池状态快照镜像的最小接口（redisstore.Store 满足；Noop 空实现安全）。
+// 与本地 state.json 并存，作启动恢复备份：快照比本地新才采用，否则本地优先。
 type StoreSnapshotter interface {
 	SaveState(data []byte)
 	LoadState() ([]byte, bool)
 }
 
-// defaultIdle* 闲置补偿默认参数（claude-api selectWeightedRandom 参考口径）。
+// RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
+// 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
+// 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
 func (p *Pool) RestoreFromSnapshot() {
 	store := p.store
 	if store == nil || p.stateFp == "" {
@@ -110,7 +113,8 @@ func (p *Pool) Flush() {
 	p.mu.Unlock()
 }
 
-// Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+// load 从本地 state.json 读回持久化状态（无文件/解析失败静默跳过，零状态启动）。
+// New 构造时调用；恢复用 placeholder 凭证，Add/SyncToDir 时换全。
 func (p *Pool) load() {
 	raw, err := os.ReadFile(p.stateFp)
 	if err != nil {
@@ -182,6 +186,9 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
 	p.applyAccountsLocked(s.Accounts)
 }
+
+// saveLocked 把内存状态原子落盘（tmp + rename），并 fire-and-forget 镜像一份快照
+// 到 Redis（择新恢复备份）。失败走 notePersistFail 节流日志。调用方必须已持 p.mu。
 func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
 		return
