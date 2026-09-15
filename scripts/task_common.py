@@ -8,7 +8,6 @@
   - chat 域（copilot.tencent.com）：growth / tasks / buddy / streak / chat/completions
   - billing 域（www.codebuddy.cn）：/v2/report
   - accept : POST /v2/activity/growth/tasks/accept  {"task_codes":[code]}
-  - claim  : POST /v2/activity/growth/tasks/reward/claim {"task_code":code}
 """
 import json, os, time, glob, urllib.request, urllib.error
 
@@ -36,7 +35,6 @@ BILL_BASE = "https://www.codebuddy.cn"      # report / billing
 # growth 域常量（travel.go / report.go 与本次实测对齐）
 PATH_LIST_TASKS     = "/v2/activity/growth/tasks"
 PATH_ACCEPT_TASKS   = "/v2/activity/growth/tasks/accept"
-PATH_CLAIM_REWARD   = "/v2/activity/growth/tasks/reward/claim"
 PATH_BUDDY_FIRST    = "/activity/growth/buddy/first"
 PATH_BUDDY_AGREEMENT = "/activity/growth/buddy/agreement"
 PATH_STREAK         = "/activity/growth/streak"
@@ -160,12 +158,6 @@ def accept_tasks(auth, task_codes) -> tuple:
     """POST accept 任务（not_accepted → accepted）。返回 (status, resp)。"""
     return do_post(auth, chat_base(auth), PATH_ACCEPT_TASKS,
                    {"task_codes": task_codes})
-
-
-def claim_reward(auth, task_code) -> tuple:
-    """POST claim 领取奖励（任务已 complete 后可领）。重复领返回业务错误，安全。"""
-    return do_post(auth, chat_base(auth), PATH_CLAIM_REWARD,
-                   {"task_code": task_code})
 
 
 def get_streak(auth) -> int:
