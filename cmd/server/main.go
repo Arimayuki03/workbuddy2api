@@ -205,6 +205,12 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
+		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
+		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有超时兜底。
+		if cErr := store.Close(); cErr != nil {
+			log.Printf("WARN: [server] redisstore close: %v", cErr)
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
