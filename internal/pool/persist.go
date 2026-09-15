@@ -146,6 +146,13 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			lastErr:      s.LastErr,
 			lastSuccess:  s.LastSuccess,
 			softStreak:   s.SoftStreak,
+			creditsExpiring: s.CreditsExpiring,
+		}
+		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
+		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
+		if s.BreakerUntil != nil && !s.BreakerUntil.IsZero() && now.Before(*s.BreakerUntil) {
+			e.breakerUntil = *s.BreakerUntil
+			e.retryCount = s.RetryCount
 		}
 		// 恢复 modelCooldowns，惰性过滤已过期条目（Until 在未来才恢复）。
 		// 防止重启后残留已过期的模型级冷却条目（与 pick 路径的 pruneExpiredModelCooldowns 同口径）。
@@ -250,6 +257,16 @@ func persistFailDiag(stateFp string) string {
 	return b.String()
 }
 
+// cooledReasonLocked 对非 disabled 账号，若 until 已过期/零值，清空 coolKind/reason
+// （惰性清理僵尸 reason）。disabled 账号的 reason 是禁用原因，照常保留。落盘（stateOverviewLocked）
+// 与 status（statusOf）共用本判断，避免两条路径口径不一致导致 reason 残留（最多 5s 落盘窗口）。
+func cooledReasonLocked(e *entry, now time.Time) (coolKind CoolKind, reason string) {
+	if e.disabled || (!e.until.IsZero() && now.Before(e.until)) {
+		return e.coolKind, e.reason
+	}
+	return 0, ""
+}
+
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
@@ -274,16 +291,23 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				mcs = nil
 			}
 		}
+		// 熔断器 breakerUntil + retryCount 落盘（惰性过滤：仅未过期才写出）。
+		// breakerUntil 已过期/零值时不写 breaker_until + retry_count——过期时退避
+		// 已无意义，保留 retryCount 是无用退避指数。与恢复侧过期过滤同口径。
+		// BreakerUntil 用指针：未过期时取地址写出，过期/零值留 nil（omitempty 省略）。
+		var breakerUntil *time.Time
+		var retryCount int
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			bu := e.breakerUntil
+			breakerUntil = &bu
+			retryCount = e.retryCount
+		}
 		// 惰性清理僵尸 reason：until 为零值或已过期时不写出 cool_kind/reason，
 		// 避免 state.json 残留「until=0001 零值 + reason=6004 model rate limit」
 		// 的不一致快照（模型级冷却不该污染账号级 coolKind/reason 域）。disabled
 		// 账号的 reason 是禁用原因，不在冷却语义内，照常保留。
-		coolKind := e.coolKind
-		reason := e.reason
-		if !e.disabled && (e.until.IsZero() || !now.Before(e.until)) {
-			coolKind = 0
-			reason = ""
-		}
+		// 与 statusOf（state.go）共用 cooledReasonLocked，保证落盘与查询同口径。
+		coolKind, reason := cooledReasonLocked(e, now)
 		sf.Accounts[uid] = stateAccount{
 			Credits:       e.credits,
 			Disabled:      e.disabled,
@@ -295,6 +319,9 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			LastSuccess:   e.lastSuccess,
 			LastErr:       e.lastErr,
 			SoftStreak:    e.softStreak,
+			BreakerUntil:   breakerUntil,
+			RetryCount:     retryCount,
+			CreditsExpiring: e.creditsExpiring,
 			ModelCooldowns: mcs,
 		}
 	}

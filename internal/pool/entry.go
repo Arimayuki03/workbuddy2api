@@ -72,7 +72,9 @@ type entry struct {
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
-	// （issue:积分过期）。运行态，签到刷新，不单独持久化（credits 仍持总量）。
+	// （issue:积分过期）。持久化（stateAccount.CreditsExpiring）：重启后到下次
+	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
+	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
 	successCount    int64     // 累计成功
 	errTotal        int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
@@ -89,7 +91,11 @@ type entry struct {
 	// lastUsed 全等 → LRU Before 全 false → 恒选 candsAll[0] → 集中单号）。
 	// usedSeq 提供严格全序，与时间精度无关。运行态，不持久化。
 	usedSeq uint64
-	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
+	// breakerUntil / fails / retryCount 为熔断器运行态。
+	// breakerUntil + retryCount 持久化（stateAccount.BreakerUntil/RetryCount）：
+	// breakerUntil 持久化以避免熔断期重启失忆（账号立即回到可选池再撞 5xx 雷区），
+	// retryCount 持久化以保留"越熔越长"的退避累积（重启归零会失去累积保护）。
+	// fails 不持久化——短期计数，重启从 0 累计可接受（达 breakerThreshold=3 才熔断）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。
 	breakerUntil time.Time // 熔断截止（指数退避）
@@ -259,6 +265,20 @@ type stateAccount struct {
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak,omitempty"`
+
+	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
+	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
+	// 用 *time.Time（而非 time.Time）：Go 的 omitempty 对非指针 time.Time 的零值
+	// 不生效（会序列化成 0001-01-01T00:00:00Z）；指针 nil 才能真正被 omitempty 省略，
+	// 与落盘"过期不写"的口径一致。
+	BreakerUntil *time.Time `json:"breaker_until,omitempty"`
+	// RetryCount 已熔断次数（指数退避的指数）。持久化以保留"越熔越长"的退避累积——
+	// 重启归零会让反复熔断只从最小退避开始。仅在 BreakerUntil 未过期时才有意义，
+	// 恢复时若 BreakerUntil 已过期则 retryCount 归零（不保留无用退避指数）。
+	RetryCount int `json:"retry_count,omitempty"`
+	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留第四因子
+	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
+	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
 
 	// ModelCost 实测扣费账本（model → 观测）。仅内存态，重启后重新学习：
 	// 成本会随上游活动（限免期/夜间免费/折扣）变化，持久化旧值反而是脏数据。
