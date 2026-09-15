@@ -658,13 +658,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {
-				// 内容命中网关内容防火墙：立即回客户端，**不轮转**、不暴露账号/冷却/上游错误码
-				// （此前会落到 503 no_healthy_account + lastErr 泄露 11128 与账号语义）。
-				// 不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError），但 content_blocked
-				// 是本请求的终态——换任何账号都会撞同一审核，轮转纯属浪费时间。
+				// 内容命中网关内容防火墙：立即回客户端，**不轮转**——换任何账号都会撞同一
+				// 审核，轮转纯属浪费时间。不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError）。
+				// error-passthrough：message 装上游 body 原文（code/msg/requestId 原样，
+				// 任务书授权上游错误码/账号语义对客户端可见），不再改写成网关固定文案。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
 				fail(acct.UID)
-				msg := upstream.ContentBlockedClientMessage(string(respBody))
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
+					msg = "content blocked by upstream content firewall"
+				}
 				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
 				st.status = http.StatusBadRequest
 				return
@@ -719,17 +723,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// 末端错误规范化（疑点 5 修正）：不再把上游原始错误文本透传给用户——原始 body 可能
-	// 泄露账号 UID 与上游内部错误码（11128 / 12153 / 6004 后台措辞）。全部账号不可用时
-	// 按 lastErr 的权威分类映射为 OpenAI 风格错误：
+	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。
 	//
-	//   - ErrSoftRate → 429 rate_limit_exceeded（限流语义，用户应等待+重试）。
-	//     这是症状根因：此前把 200/400 + 11140 rate-limiting 原文原样 503 透传。
-	//   - ErrBadParams → 白名单透传上游 11101 解析失败原文（客户端请求体错误，
-	//     用户需要原文定位参数，且不涉及账号语义）。
-	//   - 其余（hard_credit / session_dead / not_found / server / account_fault /
-	//     client / transport error）→ 固定 503 no_healthy_account 文案，不拼接
-	//     lastErr（避免泄露账号与内部错误码）。
+	// 背景：此前把上游原始错误文本统一改写，防账号 UID / 上游内部错误码（11128 / 12153 /
+	// 6004 后台措辞）泄露——但副作用是客户端看不到真实错误，根本没法排查上游问题。
+	// 任务书规定上游错误码/账号语义**允许**泄露给客户端（有意为之），排查必须看到原文。
+	//
+	//   - 上游返回（*upstream.Error）→ error.message 装**上游 body 原文**（code/msg/
+	//     requestId 原样保留，如 {"code":6004,"msg":"…","requestId":"…"}）。HTTP 状态码
+	//     按 OpenAI 兼容口径映射类别：ErrSoftRate → 429（限流语义、客户端应等待重试），
+	//     其余保持 503（网关侧无健康账号可用）。业务 code 取本地分类可读名
+	//     （rate_limit_exceeded / no_healthy_account）。
+	//   - 本地调度类错误（无可用账号 acct==nil、传输层抖动、非上游返回的 lastErr）
+	//     → 保留自有文案 no_healthy_account（本地错误没有上游原文可透传，不编造）。
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
@@ -740,9 +746,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
-		case upstream.ErrBadParams:
-			// 白名单透传：保留上游 11101 原文（客户端参数错误，帮助用户定位）。
-			msg = "upstream rejected request params: " + ue.Msg
+		}
+		if s := strings.TrimSpace(ue.Msg); s != "" {
+			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
+			msg = s
 		}
 	}
 	writeOpenAIError(w, status, code, msg)

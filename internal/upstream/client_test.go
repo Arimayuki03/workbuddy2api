@@ -86,31 +86,18 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestContentBlockedClientMessage 内容拦截把上游 body 改写成防火墙口径：
-// 括号填分类关键词（由 body 抽出，抽不到回「违禁词」），绝不泄露上游 code/账号/upstream 字样。
-func TestContentBlockedClientMessage(t *testing.T) {
-	cases := []struct {
-		body    string
-		keyword string
-	}{
-		{`{"code":11128,"msg":"blocked by security policy"}`, "违禁词"},
-		{`{"code":"11128","msg":"blocked by security policy"}`, "违禁词"},
-		{`Illegal API invocation from an unapproved channel`, "违禁词"},
-		{`{"code":11128,"msg":"content contains NSFW material"}`, "nsfw"},
-		{`{"msg":"命中色情内容"}`, "色情"},
-		{`violence detected`, "violence"},
-		{"", "违禁词"},
-	}
-	for _, c := range cases {
-		got := ContentBlockedClientMessage(c.body)
-		want := fmt.Sprintf("触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[%s]，已被拦截。请修改内容后重试。", c.keyword)
-		if got != want {
-			t.Errorf("ContentBlockedClientMessage(%q)=\n%q\nwant %q", c.body, got, want)
-		}
-		for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "no_healthy"} {
-			if strings.Contains(strings.ToLower(got), leak) {
-				t.Errorf("client message must not leak %q: %s", leak, got)
-			}
+// TestClassifyContentBlocked 内容拦截分类仍由 Classify 负责（error-passthrough 后
+// 固定文案生成器已删除，分类仍按 contentBlockedRule 识别内容审核——识别是为了不罚号
+// 与降级重试，客户端文案改为直接透传上游原文）。
+func TestClassifyContentBlocked(t *testing.T) {
+	for _, body := range []string{
+		`{"code":11128,"msg":"blocked by security policy"}`,
+		`{"code":"11128","msg":"blocked by security policy"}`,
+		`Illegal API invocation from an unapproved channel`,
+		`{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`,
+	} {
+		if got := Classify(400, body); got != ErrContentBlocked {
+			t.Errorf("Classify(400, %q)=%v want ErrContentBlocked", body, got)
 		}
 	}
 }
