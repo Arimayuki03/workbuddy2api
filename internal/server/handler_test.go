@@ -772,7 +772,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
+	// bad 占满唯一在途名额：粘性命中校验将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
 	p.SetMaxInFlight(1)
 	p.Acquire("bad")
 
@@ -1148,7 +1148,11 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	}
 }
 
-func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
+// TestModelsFetchFailureDoesNotPenalizeAccount models 拉取失败与 chat 熔断解耦
+// （P1-6/发现 6）：/v1/models 的动态拉取失败（Billing/Models 端点网络抖动）不喂
+// NoteError——该熔断器保护的是 chat 选号，models 拉取失败 ≠ 账号 chat 不可用，
+// 跨界惩罚会让上游 models 端点偶发 5xx 把好号提前打进熔断。失败只进 5min 负缓存。
+func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
@@ -1157,7 +1161,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	dynamicModelsCache.Unlock()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
+	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若误喂 NoteError 一次即熔断
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
@@ -1168,8 +1172,23 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 		t.Fatalf("code=%d (static fallback)", rec.Code)
 	}
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatalf("fetch failure should trip breaker with threshold=1: %+v", st)
+	// 熔断器零观测：不喂 fails（breaker_fails=0）、不熔断（Cooling=false）、
+	// 不记 last_err/err_total。负缓存是唯一的失败退避（另测）。
+	if st.BreakerFails != 0 {
+		t.Errorf("models fetch failure should not feed breaker: breaker_fails=%d", st.BreakerFails)
+	}
+	if st.Cooling {
+		t.Errorf("models fetch failure should not trip breaker with threshold=1: %+v", st)
+	}
+	if st.ErrTotal != 0 {
+		t.Errorf("models fetch failure should not record err_total: %d", st.ErrTotal)
+	}
+	// 负缓存仍然生效：拉取失败进 lastFail（5min 冷却）。
+	dynamicModelsCache.RLock()
+	failTs := dynamicModelsCache.lastFail
+	dynamicModelsCache.RUnlock()
+	if failTs.IsZero() {
+		t.Error("negative cache (lastFail) should be set on fetch failure")
 	}
 }
 
