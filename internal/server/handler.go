@@ -238,6 +238,11 @@ func (h *Handler) modelList() []map[string]any {
 				"context_length":    mi.ContextWindow,
 				"max_output_tokens": mi.MaxTokens,
 			}
+			// name 显示名透出：上游 /console 模型接口下发 name（如 "Hunyuan T1"），
+			// 下游面板可直连展示。上游省略 → 字段省略（不编造）。
+			if mi.Name != "" {
+				entry["name"] = mi.Name
+			}
 			if mi.ContextWindow == 0 {
 				entry["context_length"] = 131072 // 兜底
 			}
