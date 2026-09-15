@@ -60,7 +60,7 @@ if ($rt) {
 }
 
 Write-Output ""
-Write-Output ("{0,-14} {1,-9} {2,-6} {3,9}  {4}" -f "昵称", "UID", "域", "积分", "状态")
+Write-Output ("{0,-14} {1,-9} {2,-6} {3,11}  {4}" -f "昵称", "UID", "域", "积分(缓存)", "状态")
 foreach ($a in $st.accounts) {
     $nick = if ($a.nickname) { [string]$a.nickname } else { "(无昵称)" }
     if ($nick.Length -gt 14) { $nick = $nick.Substring(0, 14) }
@@ -84,7 +84,9 @@ foreach ($a in $st.accounts) {
         $models = ($a.rate_limited_models | ForEach-Object { $_.model }) -join ","
         $stat = "$stat | 限流:$models"
     }
-    Write-Output ("{0,-14} {1,-9} {2,-6} {3,9}  {4}" -f $nick, $uid, $a.realm, $a.credits, $stat)
+    Write-Output ("{0,-14} {1,-9} {2,-6} {3,11}  {4}" -f $nick, $uid, $a.realm, $a.credits, $stat)
 }
 Write-Output ""
-Write-Output "[说明] cooling=冷却中 disabled=禁用 限流=模型级6004台账 sticky=粘性会话 redis=状态镜像模式"
+Write-Output "[说明] 积分(缓存)=服务池内存快照:签到批次/对话扣费时回写,task.exe 手动任务的奖励"
+Write-Output "       不会实时反映(它在独立进程里),重启服务或等下次签到批次才刷新——实时余额见菜单 1。"
+Write-Output "       cooling=冷却中 disabled=禁用 限流=模型级6004台账 sticky=粘性会话 redis=状态镜像模式"

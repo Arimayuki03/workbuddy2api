@@ -168,6 +168,9 @@ echo.
 echo  ===== 服务状态 =====
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\status-report.ps1"
 echo.
+echo  ===== 实时积分余额（credit.exe 直查上游） =====
+.\credit.exe -pretty
+echo.
 pause
 goto :menu
 
