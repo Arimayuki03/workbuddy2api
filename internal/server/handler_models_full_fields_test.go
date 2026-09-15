@@ -34,8 +34,8 @@ func TestModelListFullFieldsDynamicCN(t *testing.T) {
 	if entry == nil {
 		t.Fatalf("cn:hy3 not found in %v", got)
 	}
-	if entry["description"] != "混元思考模型，具有增强的推理能力" {
-		t.Errorf("description=%v want 混元思考模型，具有增强的推理能力", entry["description"])
+	if entry["description"] != "[x0.05 credit] 混元思考模型，具有增强的推理能力" {
+		t.Errorf("description=%v want [x0.05 credit] 混元思考模型，具有增强的推理能力", entry["description"])
 	}
 	if entry["credits"] != "x0.05" {
 		t.Errorf("credits=%v want x0.05", entry["credits"])
@@ -127,7 +127,7 @@ func TestModelListFullFieldsGlobalRich(t *testing.T) {
 	if entry["name"] != "Hy3" {
 		t.Errorf("name=%v want Hy3", entry["name"])
 	}
-	if entry["description"] != "混元思考模型，具有增强的推理能力" {
+	if entry["description"] != "[x0.05 credit] 混元思考模型，具有增强的推理能力" {
 		t.Errorf("description=%v", entry["description"])
 	}
 	if entry["credits"] != "x0.05" {

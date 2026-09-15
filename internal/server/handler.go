@@ -223,6 +223,20 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // 保留本别名引用，避免 handler 侧魔法数字与 upstream overlay 重复维护。
 var globalModels = upstream.GlobalModelNames
 
+// fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
+// 上游格式不统一："x0.05 credits" / "x0.29" / "x0.00 credits" 等，
+// 统一提取 x数字 部分，去 "credits" 后缀。
+func fmtCreditsPrefix(raw string) string {
+	s := strings.TrimSpace(raw)
+	// 去掉 "credits" 后缀
+	s = strings.TrimSuffix(s, "credits")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	return "[" + s + " credit]"
+}
+
 // applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
 // 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
 // max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
@@ -234,7 +248,13 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 		entry["name"] = mi.Name
 	}
 	if mi.Description != "" {
-		entry["description"] = mi.Description // descriptionZh 中文描述
+		// 积分倍率前缀：从 "x0.05 credits" / "x0.29" 等格式提取纯数字，
+		// 统一为 "[x0.05 credit]" 前缀拼入 description，方便下游面板直接展示。
+		if mi.Credits != "" {
+			entry["description"] = fmtCreditsPrefix(mi.Credits) + " " + mi.Description
+		} else {
+			entry["description"] = mi.Description // descriptionZh 中文描述
+		}
 	}
 	if mi.Credits != "" {
 		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
