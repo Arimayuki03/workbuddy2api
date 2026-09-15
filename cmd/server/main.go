@@ -171,6 +171,10 @@ func main() {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go sch.Run(ctx)
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -184,11 +188,17 @@ func main() {
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
+		// /admin 本地管理 API（缺省关闭；开启后 loopback + api_key 双重限制）。
+		// OnShutdown=stop：POST /admin/shutdown 等价一次 Ctrl+C，走既有 flush→close→
+		// srv.Shutdown 优雅路径（stop 可重复调用，defer 再触发无害）。
+		Admin: server.AdminConfig{
+			Enabled:                  cfg.Admin.Enabled,
+			CreditRefreshMinInterval: time.Duration(cfg.Admin.CreditRefreshMinIntervalSec) * time.Second,
+			ConfigPath:               *cfgPath,
+		},
+		Sched:      sch,
+		OnShutdown: stop,
 	})
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go sch.Run(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

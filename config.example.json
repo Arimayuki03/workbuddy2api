@@ -10,6 +10,10 @@
     "soft_rate": "600s",
     "soft_rate_max": "2h"
   },
+  "admin": {
+    "enabled": false,
+    "credit_refresh_min_interval_sec": 600
+  },
   "schedule": {
     "checkin_hours": [9, 21],
     "travel_hours": [9, 21],

@@ -40,6 +40,16 @@ type Config struct {
 
 	Schedule config.Schedule `json:"schedule"`
 
+	// Admin /admin 本地管理 API（TrafficMonitor 插件配套）。缺省关闭：
+	// enabled=false（或整段缺失）时不注册任何 /admin 路由，行为与引入前逐位一致。
+	// 开启后端点仅接受 loopback 来源 + 既有 api_key（见 internal/server/admin.go）。
+	Admin struct {
+		Enabled bool `json:"enabled"`
+		// CreditRefreshMinIntervalSec POST /admin/credits（逐号打上游查余额）的最小间隔，
+		// 默认 600 秒——风控兜底以服务端为准，UI 侧禁用只是第一道装饰。<=0 回落默认。
+		CreditRefreshMinIntervalSec int `json:"credit_refresh_min_interval_sec"`
+	} `json:"admin"`
+
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
 		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
@@ -178,6 +188,8 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// admin 缺省关闭（Enabled=false 零值即关闭，路由不注册）；积分查询冷却默认 600s。
+	c.Admin.CreditRefreshMinIntervalSec = 600
 	return c
 }
 
@@ -336,6 +348,11 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// 积分实时查询冷却兜底 600s：显式配 0/负数同样回落默认（不给"配错=无冷却连点打爆上游"
+	// 留口子；真要拉长间隔配正数即可）。
+	if c.Admin.CreditRefreshMinIntervalSec <= 0 {
+		c.Admin.CreditRefreshMinIntervalSec = 600
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

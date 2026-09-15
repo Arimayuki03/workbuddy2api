@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -64,7 +65,26 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// —— 以下为 /admin 热管理与观测新增字段（不影响既有定时/CLI 行为）——
+	//
+	// enabled 六类任务的可热改排程开关：New 时从 Config.*Disabled 取反初始化，
+	// 之后 SetEnabled 原子改写并经 wake 唤醒 Run 重排定时器（热生效免重启）。
+	// nextWake 只读本组标志，不再读 cfg 的 Disabled bool（cfg 保持不可变快照语义）。
+	enabled [kindCount]atomic.Bool
+	// wake 容量 1 的通知通道：SetEnabled 后让阻塞在旧 timer 上的 Run 立即重算。
+	wake chan struct{}
+	// runMu 每类任务一把锁：定时 dispatch 阻塞式排队，手动触发 TryLock 撞车回 ErrBusy。
+	// （checkin 另有 CheckinAll 内部 checkinMu，历史语义保留不动。）
+	runMu [kindCount]sync.Mutex
+	// running/lastRun/lastOut 观测字段：正在执行 / 上次执行完成时间(unix) / 结果摘要。
+	running [kindCount]atomic.Bool
+	lastRun [kindCount]atomic.Int64
+	lastOut [kindCount]atomic.Value // string
 }
+
+// kindCount 与 taskKind 枚举数量一致（checkin/travel/activity/keepalive/school/cat）。
+const kindCount = 6
 
 // New 构建。
 func New(cfg Config) *Scheduler {
@@ -90,7 +110,18 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string)}
+	s := &Scheduler{cfg: cfg, adoptTried: make(map[string]string), wake: make(chan struct{}, 1)}
+	// 排程开关初始化自 Config 的 Disabled 标志：零值 Config = 全部启用，与引入前逐字一致。
+	s.enabled[taskCheckin].Store(!cfg.CheckinDisabled)
+	s.enabled[taskTravel].Store(!cfg.TravelDisabled)
+	s.enabled[taskActivity].Store(!cfg.ActivityDisabled)
+	s.enabled[taskKeepalive].Store(!cfg.KeepaliveDisabled)
+	s.enabled[taskSchool].Store(!cfg.SchoolDisabled)
+	s.enabled[taskCat].Store(!cfg.CatDisabled)
+	for i := range s.lastOut {
+		s.lastOut[i].Store("")
+	}
+	return s
 }
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
@@ -149,28 +180,31 @@ const (
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
+//
+// 禁用判定读 enabled 原子标志（New 时初始化自 Config.*Disabled，之后可由
+// SetEnabled 热改）——热改经 wake 唤醒 Run 重算，无需重启。
 func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	type slot struct {
 		at   time.Time
 		kind taskKind
 	}
 	var slots []slot
-	if !s.cfg.CheckinDisabled {
+	if s.enabled[taskCheckin].Load() {
 		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
 	}
-	if !s.cfg.TravelDisabled {
+	if s.enabled[taskTravel].Load() {
 		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
 	}
-	if !s.cfg.ActivityDisabled {
+	if s.enabled[taskActivity].Load() {
 		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
 	}
-	if !s.cfg.KeepaliveDisabled {
+	if s.enabled[taskKeepalive].Load() {
 		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
 	}
-	if !s.cfg.SchoolDisabled {
+	if s.enabled[taskSchool].Load() {
 		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
 	}
-	if !s.cfg.CatDisabled {
+	if s.enabled[taskCat].Load() {
 		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
 	}
 	var earliest time.Time
@@ -195,19 +229,30 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 }
 
 // Run 主循环，阻塞直到 ctx 取消。
+//
+// wake 分支（/admin 热改排程开关后由 SetEnabled 投递）：立即停掉旧 timer、
+// 从"现在"重算 nextWake——禁用即撤排、启用即补排，全程不重启进程。
+// runBatch 执行期间到达的 wake 会留在容量 1 的通道里，本批收尾后下一轮循环消费。
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
-			// 六类任务全部禁用：不空转，只等退出信号。
-			<-ctx.Done()
-			return
+			// 六类任务全部禁用：不空转，等退出信号或热改启用通知。
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.wake:
+				continue
+			}
 		}
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+		case <-s.wake:
+			timer.Stop()
+			continue
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
@@ -237,20 +282,66 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 // 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
 // ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
 func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
+	s.runMu[k].Lock()
+	defer s.runMu[k].Unlock()
+	s.runOne(ctx, k)
+}
+
+// runOne 单类任务真正执行体 + 观测记录（running/lastRun/lastOut）。
+// 调用方必须已持有 runMu[k]（定时 dispatch 阻塞排队；手动 RunKindNow TryLock 独占）。
+// checkin 分支把 RunCheckinNow 的 CheckinAll 结果收进摘要；撞车仅记日志的旧语义不变。
+func (s *Scheduler) runOne(ctx context.Context, k taskKind) {
+	s.running[k].Store(true)
+	started := time.Now()
+	var summary string
 	switch k {
 	case taskCheckin:
-		s.RunCheckinNow()
+		out, err := s.CheckinAll()
+		if err != nil {
+			log.Printf("scheduled checkin skipped: %v", err)
+			summary = "skipped: " + err.Error()
+		} else {
+			summary = summarizeCheckin(out)
+		}
 	case taskTravel:
 		s.runTravel(ctx)
+		summary = "done"
 	case taskActivity:
 		s.runActivity(ctx)
+		summary = "done"
 	case taskKeepalive:
 		s.RunKeepaliveNow()
+		summary = "done"
 	case taskSchool:
 		s.RunSchoolNow()
+		summary = "done"
 	case taskCat:
 		s.RunCatNow()
+		summary = "done"
 	}
+	// 收尾顺序：running 先于 lastRun/lastOut 落定——观测者（/admin 轮询方）看到
+	// lastRun 更新时 running 必已复位，不存在"有结果却仍在跑"的中间态。
+	s.running[k].Store(false)
+	s.lastRun[k].Store(time.Now().Unix())
+	s.lastOut[k].Store(fmt.Sprintf("%s (耗时 %s)", summary, time.Since(started).Round(time.Second)))
+}
+
+// summarizeCheckin 把逐账号签到回执压成一行摘要（供 /admin 观测展示）。
+func summarizeCheckin(out []CheckinOutcome) string {
+	var okN, alreadyN, failN, skipN int
+	for _, o := range out {
+		switch o.Status {
+		case CheckinOK:
+			okN++
+		case CheckinAlready:
+			alreadyN++
+		case CheckinSkipped:
+			skipN++
+		default:
+			failN++
+		}
+	}
+	return fmt.Sprintf("ok=%d already=%d fail=%d skipped=%d", okN, alreadyN, failN, skipN)
 }
 
 // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
@@ -495,5 +586,119 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
 		}
+	}
+}
+
+// ============================================================================
+// /admin 热管理与观测（server 包的 /admin 端点依赖；对既有定时/CLI 行为零影响）
+// ============================================================================
+
+// kindNames/kindLabels 六类任务的稳定字符串标识与中文显示名（顺序与 taskKind 枚举一致）。
+var kindNames = [kindCount]string{"checkin", "travel", "activity", "keepalive", "school", "cat"}
+
+var kindLabels = [kindCount]string{"签到", "猫猫旅行", "活跃上报", "Token 保活", "开学季", "夜猫子"}
+
+// Kinds 返回六类任务的字符串标识（枚举顺序），供外部遍历与参数校验。
+func Kinds() []string {
+	out := make([]string, 0, kindCount)
+	out = append(out, kindNames[:]...)
+	return out
+}
+
+// KindFromName 字符串标识 → taskKind。
+func KindFromName(name string) (taskKind, bool) {
+	for i, n := range kindNames {
+		if n == name {
+			return taskKind(i), true
+		}
+	}
+	return 0, false
+}
+
+// SetEnabled 热改某类任务的排程开关：原子更新后通知 Run 主循环重排定时器（免重启）。
+// 只影响"定时自动跑"，不影响 RunKindNow/cmd/task 的手动触发语义。
+// 返回值 ok=false 表示 name 不是合法任务标识。
+func (s *Scheduler) SetEnabled(name string, on bool) (ok bool) {
+	k, exist := KindFromName(name)
+	if !exist {
+		return false
+	}
+	if s.enabled[k].Swap(on) != on {
+		select {
+		case s.wake <- struct{}{}:
+		default: // 已有一次未消费的通知：重算本来就是幂等的，无需排队
+		}
+	}
+	return true
+}
+
+// KindSnapshot 单类任务的观测快照（供 GET /admin/tasks）。
+type KindSnapshot struct {
+	Kind        string `json:"kind"`
+	Label       string `json:"label"`
+	Enabled     bool   `json:"enabled"`
+	Hours       []int  `json:"hours"`
+	NextFire    string `json:"next_fire"` // RFC3339；""= 已禁用（无排程时点）
+	Running     bool   `json:"running"`
+	LastRunUnix int64  `json:"last_run_unix"` // 0 = 本进程启动以来未执行过
+	LastResult  string `json:"last_result"`   // 上次执行摘要；""= 未执行过
+}
+
+// SnapshotAll 六类任务的观测快照（枚举顺序）。hours 为 cfg 不可变快照的拷贝。
+func (s *Scheduler) SnapshotAll() []KindSnapshot {
+	out := make([]KindSnapshot, 0, kindCount)
+	for i := range kindCount {
+		k := taskKind(i)
+		sn := KindSnapshot{
+			Kind:        kindNames[k],
+			Label:       kindLabels[k],
+			Enabled:     s.enabled[k].Load(),
+			Hours:       append([]int(nil), s.hoursOf(k)...),
+			Running:     s.running[k].Load(),
+			LastRunUnix: s.lastRun[k].Load(),
+		}
+		if v, _ := s.lastOut[k].Load().(string); v != "" {
+			sn.LastResult = v
+		}
+		if sn.Enabled {
+			sn.NextFire = nextFire(time.Now(), s.hoursOf(k)).Format(time.RFC3339)
+		}
+		out = append(out, sn)
+	}
+	return out
+}
+
+// RunKindNow 手动触发单类任务（供 POST /admin/tasks/run，异步 goroutine 中调用）：
+// 与定时器或另一次手动撞车时返回 ErrBusy，不排队不重复打上游。
+// 不看排程开关——禁用中的任务同样允许手动执行一次（与 cmd/task 语义一致）。
+// 执行完成（含失败）后写 running/lastRun/lastOut 观测字段。
+func (s *Scheduler) RunKindNow(name string) error {
+	k, ok := KindFromName(name)
+	if !ok {
+		return fmt.Errorf("unknown task kind %q", name)
+	}
+	if !s.runMu[k].TryLock() {
+		return ErrBusy
+	}
+	defer s.runMu[k].Unlock()
+	s.runOne(context.Background(), k)
+	return nil
+}
+
+// hoursOf 单类任务的排程小时表（cfg 快照，New 后不再变化）。
+func (s *Scheduler) hoursOf(k taskKind) []int {
+	switch k {
+	case taskCheckin:
+		return s.cfg.CheckinHours
+	case taskTravel:
+		return s.cfg.TravelHours
+	case taskActivity:
+		return s.cfg.ActivityHours
+	case taskKeepalive:
+		return s.cfg.KeepaliveHours
+	case taskSchool:
+		return s.cfg.SchoolHours
+	default:
+		return s.cfg.CatHours
 	}
 }

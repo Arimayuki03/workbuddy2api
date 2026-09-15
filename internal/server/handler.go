@@ -18,6 +18,7 @@ import (
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -50,6 +51,16 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// Admin /admin 本地管理 API（TrafficMonitor 插件配套，见 admin.go）。
+	// Enabled=false（缺省）时一条 /admin* 路由都不注册，其余行为与引入前逐位一致。
+	Admin AdminConfig
+	// Sched 调度器句柄：Admin.Enabled 时提供任务快照/热改开关/手动触发。
+	// 注册了 admin 路由但没接调度器属接线错误，端点回 503 防御，不会 panic。
+	Sched *scheduler.Scheduler
+	// OnShutdown 优雅停机回调（main 注入 signal ctx 的 cancel）：POST /admin/shutdown
+	// 调用它走既有的 flush→关 store→srv.Shutdown 路径；nil 时端点退化为 os.Exit(0)。
+	OnShutdown func()
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -68,6 +79,8 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// adm /admin 运行态（手动任务标记、积分查询缓存/冷却）。nil = admin 未注册。
+	adm *adminState
 }
 
 // NewHandler 构建 handler。
@@ -92,6 +105,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// /admin 管理面：admin.enabled=false（缺省）时一条路由都不注册——
+	// 未启用 admin 的部署中，本二进制的路由表与引入前逐字节一致。
+	if cfg.Admin.Enabled {
+		h.registerAdmin()
+	}
 	return h
 }
 
