@@ -76,7 +76,7 @@ func TestModelListFullFieldsDynamicCN(t *testing.T) {
 }
 
 // TestModelListFullFieldsDynamicCNOmitted 上游不下发新字段的模型 → 对应字段整体省略
-//（不输出空串/空数组/false 之外的伪值，不编造）。
+// （不输出空串/空数组/false 之外的伪值，不编造）。
 func TestModelListFullFieldsDynamicCNOmitted(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, `{"code":0,"data":{"models":[
@@ -159,37 +159,42 @@ func TestModelListFullFieldsGlobalRich(t *testing.T) {
 	}
 }
 
-// TestModelListFullFieldsGlobalFallbackOmitted global 探测失败（500）→ 名单回落静态，
-// 条目保持裸形态：富字段全部省略（与既有 TestModelListNameFieldGlobalOmited 同口径，
+// TestModelListFullFieldsGlobalNarrowOmitted 窄表探测（只有 ID 名单）→ 条目保持裸形态：
+// 富字段全部省略（数据源没给，不编造；与 TestModelListNameFieldGlobalNarrow 同口径，
 // 扩到全字段集合）。
-func TestModelListFullFieldsGlobalFallbackOmitted(t *testing.T) {
+func TestModelListFullFieldsGlobalNarrowOmitted(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
 
-	cf := newGlobalModelsHandlerFake(t, 500, `{"code":500,"msg":"boom"}`)
+	cf := newGlobalModelsHandlerFake(t, 200, `{"code":0,"data":["gpt-5.4","narrow-only"]}`)
 	p := testPoolWith(
 		&auth.Auth{UID: "g1", AccessToken: "at_gl", Domain: "www.workbuddy.ai", ExpiresAt: 9999999999},
 	)
 	h := NewHandler(Config{Pool: p, Upstream: cf.up, GlobalEnabled: true})
 
+	entries := 0
 	for _, m := range h.modelList() {
 		id, ok := m["id"].(string)
 		if !ok || len(id) < 7 || id[:7] != "global:" {
 			continue
 		}
+		entries++
 		for _, field := range []string{"name", "description", "credits", "tags", "vendor",
 			"supports_tool_call", "only_reasoning", "max_allowed_size",
 			"reasoning_effort", "reasoning_summary"} {
 			if _, ok := m[field]; ok {
-				t.Errorf("global fallback entry %v should omit %s (no data source)", id, field)
+				t.Errorf("global narrow entry %v should omit %s (no data source)", id, field)
 			}
 		}
+	}
+	if entries == 0 {
+		t.Fatal("narrow probe should yield global entries")
 	}
 }
 
 // TestFetchGlobalModelsReturnsAccount fetchGlobalModels 返回被探测账号（供
-// FetchGlobalModelInfos 同账号共享缓存）；无 global 号 → (静态名单, nil)。
+// FetchGlobalModelInfos 同账号共享缓存）；无 global 号 → (空名单, nil)。
 func TestFetchGlobalModelsReturnsAccount(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })

@@ -16,9 +16,9 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// GlobalModelNames 国际版（global realm）模型名静态名单兜底（PLAN §7.2 附录 21 名）。
-// 只含模型名、不含倍率。探测失败 / 无 global 账号时直接输出此名单；
-// 探测成功时以其 "权威 21 名" 为基底，追加探测独有的模型名（去重）。
+// GlobalModelNames 国际版（global realm）历史静态名单（PLAN §7.2 附录 21 名）。
+// 纯动态化后**不再作为模型目录的基底/兜底**：/v1/models 只透出上游实际下发的模型，
+// 生产链路对本名单零引用。保留仅作历史对照（global e2e 观测日志差集参照）。
 var GlobalModelNames = []string{
 	"default-model",
 	"fast-model",
@@ -48,7 +48,7 @@ var GlobalModelNames = []string{
 // Mutex 内嵌，与 modelList 无并发读路径竞争（唯一读写点本文件内）。
 type fetchGlobalModelsCache struct {
 	sync.Mutex
-	names    []string     // 成功缓存：探测 ∪ 静态名单（已去重）；nil = 未探测
+	names    []string    // 成功缓存：探测结果（已去重）；nil = 未探测/失败
 	infos    []ModelInfo // 成功缓存：探测对象形态的全字段条目（窄表/失败形态为 nil）
 	fetched  time.Time
 	lastFail time.Time
@@ -71,13 +71,11 @@ var globalModelsProbePaths = []string{
 
 // FetchGlobalModels 探测 global 账号的模型名目录并返回模型名列表（含 context 无关、无倍率）。
 //
-// 成功：探测结果 ∪ GlobalModelNames（去重，静态 21 为基底，探测独有追加），缓存 1h。
-// 失败（家族端点全非 2xx / 解析失败 / 空列表）：记 5min 负缓存，回落 GlobalModelNames。
-// 缓存/负缓存命中：直接返回，零上游调用。
+// 纯动态：成功返回探测结果（去重），缓存 1h；失败（家族端点全非 2xx / 解析失败 /
+// 空列表）记 5min 负缓存，返回 nil（无静态回落）。缓存/负缓存命中：直接返回，零上游调用。
 //
-// 调用方负责：① 仅在有 global 账号时调用（无则不探测）；
-// ② GlobalEnabled 关闭时（逃生门）不得调用——本方法由 globalOn(a) 内部兜底，若账号
-// 因开关回落 cn 则返回 nil（handler 侧回落静态名单，仍零探测）。
+// 调用方负责：仅在有 global 账号时调用（无则不探测）；GlobalEnabled 关闭时（逃生门）
+// 不得调用——本方法由 globalOn(a) 内部兜底，若账号因开关回落 cn 则返回 nil。
 func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
 	names, _ := c.fetchGlobalModelsOnce(a)
 	return names
@@ -95,12 +93,12 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 }
 
 // fetchGlobalModelsOnce 单次探测决策（缓存命中/负缓存/触发探测），返回 (names, infos)。
-// names 语义与原 FetchGlobalModels 完全一致（探测 ∪ 静态 overlay 去重，失败回落静态）；
+// 纯动态：成功 = 探测结果去重（不与任何静态名单合并）；一切失败 = nil（不回落静态）。
 // infos 仅对象形态成功探测时非 nil。
 func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []ModelInfo) {
 	if !c.globalOn(a) {
-		// 逃生门兜底：账号不路由 global 上游 → 不探测，回落静态名单（零上游调用）。
-		return GlobalModelNames, nil
+		// 逃生门兜底：账号不路由 global 上游 → 不探测（零上游调用）。
+		return nil, nil
 	}
 
 	c.globalModels.Lock()
@@ -110,21 +108,21 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		return names, infos
 	}
 	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
-		// 负缓存冷却期内：避免反复打上游，直接按失败处理（回落静态）。
+		// 负缓存冷却期内：避免反复打上游，直接按失败处理（无静态回落）。
 		c.globalModels.Unlock()
-		return GlobalModelNames, nil
+		return nil, nil
 	}
 	c.globalModels.Unlock()
 
 	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
-		// 探测失败：负缓存 + 回落静态名单（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
+		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
 		c.globalModels.Lock()
 		c.globalModels.lastFail = time.Now()
 		c.globalModels.names = nil
 		c.globalModels.infos = nil
 		c.globalModels.Unlock()
-		return GlobalModelNames, nil
+		return nil, nil
 	}
 	// global 域 effort 能力：探测下发的 supportedEfforts/defaultEffort 权威写入 global 桶
 	// （raw remote，不并入静态表——静态兜底在 prepareBody 的 globalEffortMap 与
@@ -133,17 +131,10 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		c.storeEfforts("global", efforts, defaults)
 	}
 
-	// 成功：静态名单为基底，追加探测独有（去重）。names/infos 均落缓存；
-	// 倍率等选号敏感字段只透出展示，不注入 costTier（§3.D2 不变）。
-	seen := make(map[string]bool, len(GlobalModelNames)+len(names))
-	merged := make([]string, 0, len(GlobalModelNames)+len(names))
-	for _, id := range GlobalModelNames {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		merged = append(merged, id)
-	}
+	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
+	// 不注入 costTier（§3.D2 不变）。
+	seen := make(map[string]bool, len(names))
+	merged := make([]string, 0, len(names))
 	for _, id := range names {
 		if id == "" || seen[id] {
 			continue

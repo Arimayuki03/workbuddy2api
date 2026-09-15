@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -35,30 +36,31 @@ func TestModelListNameFieldDynamicCN(t *testing.T) {
 	}
 }
 
-// TestModelListNameFieldStaticCNOmited 静态兜底表无 name 数据源 → 字段省略（不编造）。
-func TestModelListNameFieldStaticCNOmited(t *testing.T) {
+// TestModelListNameFieldNoCNEmpty 无 CN 健康号 → CN 面空列表（纯动态，无静态兜底）。
+func TestModelListNameFieldNoCNEmpty(t *testing.T) {
 	resetModelsCache()
 	h := NewHandler(Config{Pool: testPoolWith(), Upstream: upstream.New(), GlobalEnabled: false})
-	for _, m := range h.modelList() {
-		if _, ok := m["name"]; ok {
-			t.Errorf("static CN entry should not carry name (no data source): %v", m["id"])
-		}
+	if got := h.modelList(); len(got) != 0 {
+		t.Fatalf("no CN account: modelList=%v want empty (pure dynamic)", got)
 	}
 }
 
-// TestModelListNameFieldGlobalOmited global 分支只有 ID 名单（FetchGlobalModels 只产名），
-// 无 name 数据源 → 字段省略（不编造）。
-func TestModelListNameFieldGlobalOmited(t *testing.T) {
+// TestModelListNameFieldGlobalNarrow 窄表探测（只有 ID 名单）→ 条目无 name（数据源没给，不编造）。
+func TestModelListNameFieldGlobalNarrow(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
-	cf := newGlobalModelsHandlerFake(t, 500, `{"code":500,"msg":"boom"}`) // 探测失败→静态名单
+	cf := newGlobalModelsHandlerFake(t, 200, `{"code":0,"data":["gpt-5.4","narrow-only"]}`) // 窄表：只有 ID
 	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at_gl", Domain: "www.workbuddy.ai", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: cf.up, GlobalEnabled: true})
-	for _, m := range h.modelList() {
-		if id, _ := m["id"].(string); len(id) > 6 && id[:6] == "global" {
+	got := h.modelList()
+	if len(got) == 0 {
+		t.Fatal("narrow probe should yield global entries")
+	}
+	for _, m := range got {
+		if id, _ := m["id"].(string); strings.HasPrefix(id, "global:") {
 			if _, ok := m["name"]; ok {
-				t.Errorf("global entry should not carry name (no data source): %v", id)
+				t.Errorf("global narrow entry should not carry name (no data source): %v", id)
 			}
 		}
 	}

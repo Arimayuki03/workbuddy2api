@@ -463,8 +463,8 @@ type Client struct {
 	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
 	defaultEfforts map[string]map[string]string
 
-	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
-	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
+	// globalModels 缓存 global 模型名目录纯动态探测结果（1h TTL + 5min 负缓存），
+	// 见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
@@ -936,17 +936,17 @@ type ModelInfo struct {
 	SupportsImages bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 
 	// 以下为模型目录全字段补齐（任务书 models-full-fields）：
-	Description        string   // descriptionZh 中文描述
-	Credits            string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
-	Tags               []string // tags 模型标签（含 badge:限时免费 等）
-	Vendor             string   // vendor 厂商标识
-	IsDefault          bool     // isDefault 是否默认模型
-	SupportsReasoning  bool     // supportsReasoning 是否支持推理
-	SupportsToolCall   bool     // supportsToolCall 是否支持工具调用
-	OnlyReasoning      bool     // onlyReasoning 是否纯推理模型
-	MaxAllowedSize     int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
-	ReasoningEffort    string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
-	ReasoningSummary   string   // reasoning.summary 推理摘要模式（如 "auto"）
+	Description       string   // descriptionZh 中文描述
+	Credits           string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
+	Tags              []string // tags 模型标签（含 badge:限时免费 等）
+	Vendor            string   // vendor 厂商标识
+	IsDefault         bool     // isDefault 是否默认模型
+	SupportsReasoning bool     // supportsReasoning 是否支持推理
+	SupportsToolCall  bool     // supportsToolCall 是否支持工具调用
+	OnlyReasoning     bool     // onlyReasoning 是否纯推理模型
+	MaxAllowedSize    int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
+	ReasoningEffort   string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
+	ReasoningSummary  string   // reasoning.summary 推理摘要模式（如 "auto"）
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，

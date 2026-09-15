@@ -179,23 +179,6 @@ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[stri
 	}
 }
 
-// 静态 CN 模型表（api-reference §5，**动态拉取失败才用的兜底**，见 modelList）：
-// 动态接口成功时以动态结果优先（含真实 context_length/max_output_tokens）；
-// 本表全用 context_length=131072 只是兜底形态，不得理解为权威值。
-// 触底前提：fetchDynamicModels 返回空（拉取失败 / 负缓存 / 池中无健康 CN 号）。
-var staticModels = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-}
-
 // dynamicModelsCache 动态模型缓存。
 var dynamicModelsCache struct {
 	sync.RWMutex
@@ -209,7 +192,7 @@ const (
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
+// models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -217,11 +200,8 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// globalModels 国际版（global realm）模型名名单（PLAN §7.2 附录 21 名）。
-// 同名名单的权威来源在 upstream.GlobalModelNames（探测 overlay 的静态基底），
-// 此处只在"无 global 账号 / 探测失败"时被 fetchGlobalModels 直接返回（零上游调用）。
-// 保留本别名引用，避免 handler 侧魔法数字与 upstream overlay 重复维护。
-var globalModels = upstream.GlobalModelNames
+// globalModels 国际版（global realm）模型名名单（PLAN §7.2 附录 21 名）——已删。
+// 纯动态化后 handler 不再持有任何静态名单：无 global 账号 / 探测失败 → 空列表。
 
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
 // 上游格式不统一："x0.05 credits" / "x0.29" / "x0.00 credits" 等，
@@ -294,56 +274,37 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
-// 动态失败回退静态表；global.enabled=false（显式逃生门）时只列 CN（global 名单不出现）。
+// 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底；
+// global.enabled=false（显式逃生门）时只列 CN（global 名单不出现）。
 func (h *Handler) modelList() []map[string]any {
-	out := make([]map[string]any, 0, len(staticModels)+len(globalModels))
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		for _, mi := range infos {
-			entry := map[string]any{
-				"id":                "cn:" + mi.ID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "workbuddy",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
-			}
-			// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
-			entry = applyModelInfoFields(entry, mi)
-			// P0：effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
-			// （issue #84 客户端可发现档位，不再盲传）。无档位→省略字段（非空数组）。
-			if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
-				entry["reasoning_supported_efforts"] = efforts
-				if def != "" {
-					entry["reasoning_default_effort"] = def
-				}
-			}
-			out = append(out, entry)
+	out := make([]map[string]any, 0)
+	for _, mi := range h.fetchDynamicModels() {
+		entry := map[string]any{
+			"id":                "cn:" + mi.ID,
+			"object":            "model",
+			"created":           1753600000,
+			"owned_by":          "workbuddy",
+			"context_length":    mi.ContextWindow,
+			"max_output_tokens": mi.MaxTokens,
 		}
-	} else {
-		for _, m := range staticModels {
-			e := make(map[string]any, len(m)+1)
-			for k, v := range m {
-				e[k] = v
-			}
-			if id, ok := m["id"].(string); ok {
-				e["id"] = "cn:" + id
-				// P0：静态兜底分支同样按 CN 静态档位表透出 effort 能力（远端不可用时的可发现性）。
-				if efforts, def := upstream.EffortListing("cn", id, nil, ""); efforts != nil {
-					e["reasoning_supported_efforts"] = efforts
-					if def != "" {
-						e["reasoning_default_effort"] = def
-					}
-				}
-			}
-			out = append(out, e)
+		if mi.ContextWindow == 0 {
+			entry["context_length"] = 131072 // 兜底
 		}
+		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
+		entry = applyModelInfoFields(entry, mi)
+		// P0：effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
+		// （issue #84 客户端可发现档位，不再盲传）。无档位→省略字段（非空数组）。
+		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+			entry["reasoning_supported_efforts"] = efforts
+			if def != "" {
+				entry["reasoning_default_effort"] = def
+			}
+		}
+		out = append(out, entry)
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
-	// 名单 = 探测结果 ∪ §7.2 静态（fetchGlobalModels 内合并去重）；无 global 账号时
-	// 直接静态名单且零上游调用。
+	// 名单 = 探测结果（fetchGlobalModels 纯动态，失败/无号 → 空）；无 global 账号时
+	// 空名单且零上游调用。
 	if h.cfg.GlobalEnabled {
 		// global 域 effort 能力三级查找：探测下发桶（权威）→ 静态兜底表 → 省略。
 		// 先 fetchGlobalModels（内部探测并落 effort 桶），再按 id 取快照。
@@ -387,11 +348,11 @@ func (h *Handler) modelList() []map[string]any {
 	return out
 }
 
-// fetchGlobalModels 返回 global 模型名单（探测 ∪ 静态 overlay，去重）及被探测账号。
+// fetchGlobalModels 返回 global 模型名单（纯动态探测结果）及被探测账号。
 // 与 fetchDynamicModels（CN 侧）同语义不同归位：缓存/失败回落封在 upstream.FetchGlobalModels
 // （内部 1h + 5min 负缓存）。本方法只负责"何时探测"：
-//   - 池中无 global 账号 → 直接静态名单 + nil 账号（不发起上游调用）；
-//   - 有 global 账号 → 单账号 Pick（global 域谓词），交 upstream 探测并合并。
+//   - 池中无 global 账号 → 空名单 + nil 账号（不发起上游调用）；
+//   - 有 global 账号 → 单账号 Pick（global 域谓词），交 upstream 探测。
 //
 // 返回的 acct 供调用方在同一账号上取富 ModelInfo（FetchGlobalModelInfos 与
 // FetchGlobalModels 共享缓存，不会触发第二次上游探测）。
@@ -399,7 +360,7 @@ func (h *Handler) modelList() []map[string]any {
 func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
 	if acct == nil {
-		return globalModels, nil
+		return nil, nil
 	}
 	return h.cfg.Upstream.FetchGlobalModels(acct), acct
 }
@@ -425,10 +386,11 @@ func rewriteModel(body []byte, bare string) []byte {
 	return out
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
-// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
+// fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
+// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接返回 nil（纯动态，无静态表兜底），
+// 避免反复打上游。
 // 只从 CN realm 账号拉取（PickExcludingForRealm(nil,"","cn")）：全局账号的模型列表
-// 未必与 CN 一致，动态模型表只服务 CN 前缀（global 用内置静态名单）。
+// 未必与 CN 一致，动态模型表只服务 CN 前缀（global 走独立探测）。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
