@@ -223,6 +223,55 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // 保留本别名引用，避免 handler 侧魔法数字与 upstream overlay 重复维护。
 var globalModels = upstream.GlobalModelNames
 
+// applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
+// 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
+// max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
+// 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
+// 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
+// 字段（零值）整体省略——不编造。
+func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[string]any {
+	if mi.Name != "" {
+		entry["name"] = mi.Name
+	}
+	if mi.Description != "" {
+		entry["description"] = mi.Description // descriptionZh 中文描述
+	}
+	if mi.Credits != "" {
+		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+	}
+	if len(mi.Tags) > 0 {
+		entry["tags"] = mi.Tags
+	}
+	if mi.Vendor != "" {
+		entry["vendor"] = mi.Vendor
+	}
+	if mi.IsDefault {
+		entry["is_default"] = true
+	}
+	if mi.SupportsImages {
+		entry["supports_images"] = true // 多模态能力透出
+	}
+	if mi.SupportsReasoning {
+		entry["supports_reasoning"] = true
+	}
+	if mi.SupportsToolCall {
+		entry["supports_tool_call"] = true
+	}
+	if mi.OnlyReasoning {
+		entry["only_reasoning"] = true
+	}
+	if mi.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = mi.MaxAllowedSize
+	}
+	if mi.ReasoningEffort != "" {
+		entry["reasoning_effort"] = mi.ReasoningEffort
+	}
+	if mi.ReasoningSummary != "" {
+		entry["reasoning_summary"] = mi.ReasoningSummary
+	}
+	return entry
+}
+
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
 // 动态失败回退静态表；global.enabled=false（显式逃生门）时只列 CN（global 名单不出现）。
@@ -238,17 +287,11 @@ func (h *Handler) modelList() []map[string]any {
 				"context_length":    mi.ContextWindow,
 				"max_output_tokens": mi.MaxTokens,
 			}
-			// name 显示名透出：上游 /console 模型接口下发 name（如 "Hunyuan T1"），
-			// 下游面板可直连展示。上游省略 → 字段省略（不编造）。
-			if mi.Name != "" {
-				entry["name"] = mi.Name
-			}
 			if mi.ContextWindow == 0 {
 				entry["context_length"] = 131072 // 兜底
 			}
-			if mi.SupportsImages {
-				entry["supports_images"] = true // 多模态能力透出
-			}
+			// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
+			entry = applyModelInfoFields(entry, mi)
 			// P0：effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 			// （issue #84 客户端可发现档位，不再盲传）。无档位→省略字段（非空数组）。
 			if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
@@ -284,7 +327,14 @@ func (h *Handler) modelList() []map[string]any {
 	if h.cfg.GlobalEnabled {
 		// global 域 effort 能力三级查找：探测下发桶（权威）→ 静态兜底表 → 省略。
 		// 先 fetchGlobalModels（内部探测并落 effort 桶），再按 id 取快照。
-		globalIDs := h.fetchGlobalModels()
+		globalIDs, globalAccount := h.fetchGlobalModels()
+		// 探测对象形态的全字段条目（与 fetchGlobalModels 共享同一次探测缓存）：
+		// 命中 id 才透出富字段；窄表/失败 → nil，按裸 ID 条目输出（不编造字段）。
+		// globalAccount 为 nil（无 global 号）时返回 nil，跳过富字段映射。
+		globalInfos := map[string]upstream.ModelInfo{}
+		for _, mi := range h.cfg.Upstream.FetchGlobalModelInfos(globalAccount) {
+			globalInfos[mi.ID] = mi
+		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			entry := map[string]any{
@@ -293,6 +343,17 @@ func (h *Handler) modelList() []map[string]any {
 				"created":        1753600000,
 				"owned_by":       "workbuddy",
 				"context_length": 131072,
+			}
+			if mi, ok := globalInfos[id]; ok {
+				entry = applyModelInfoFields(entry, mi)
+				// 富条目命中：context_length/max_output_tokens 用探测真实值替换
+				// 131072 兜底（与 CN 动态分支同口径；上游零值保留兜底）。
+				if mi.ContextWindow > 0 {
+					entry["context_length"] = mi.ContextWindow
+				}
+				if mi.MaxTokens > 0 {
+					entry["max_output_tokens"] = mi.MaxTokens
+				}
 			}
 			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
 				entry["reasoning_supported_efforts"] = efforts
@@ -306,19 +367,21 @@ func (h *Handler) modelList() []map[string]any {
 	return out
 }
 
-// fetchGlobalModels 返回 global 模型名单（探测 ∪ 静态 overlay，去重）。
+// fetchGlobalModels 返回 global 模型名单（探测 ∪ 静态 overlay，去重）及被探测账号。
 // 与 fetchDynamicModels（CN 侧）同语义不同归位：缓存/失败回落封在 upstream.FetchGlobalModels
 // （内部 1h + 5min 负缓存）。本方法只负责"何时探测"：
-//   - 池中无 global 账号 → 直接静态名单（不发起上游调用）；
+//   - 池中无 global 账号 → 直接静态名单 + nil 账号（不发起上游调用）；
 //   - 有 global 账号 → 单账号 Pick（global 域谓词），交 upstream 探测并合并。
 //
+// 返回的 acct 供调用方在同一账号上取富 ModelInfo（FetchGlobalModelInfos 与
+// FetchGlobalModels 共享缓存，不会触发第二次上游探测）。
 // GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
-func (h *Handler) fetchGlobalModels() []string {
+func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
 	if acct == nil {
-		return globalModels
+		return globalModels, nil
 	}
-	return h.cfg.Upstream.FetchGlobalModels(acct)
+	return h.cfg.Upstream.FetchGlobalModels(acct), acct
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
