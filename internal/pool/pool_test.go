@@ -1592,7 +1592,7 @@ func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "soft"})
 	p.Add(&auth.Auth{UID: "brk"})
-	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429") // soft: until=10m, fails=1
+	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429") // soft: until=10m（重构后 Cooldown 不喂熔断）
 	p.SetBreaker(2, 5*time.Minute, 5*time.Minute)       // 阈值 2：soft 的 1 次失败不熔断
 	p.NoteError("brk")                                  // brk: fails=1
 	p.NoteError("brk")                                  // brk: 熔断，breakerUntil=5m
