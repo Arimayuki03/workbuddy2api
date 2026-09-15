@@ -168,7 +168,11 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, map[stri
 		return nil, nil, nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		// 读失败 → 传输层错误：半截 body 不进解析（探测负缓存走 lastFail，不罚号）。
+		return nil, nil, nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, nil, fmt.Errorf("global models status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
