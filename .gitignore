@@ -17,6 +17,8 @@ data/
 /credit.exe
 /wb2api.exe
 /signin.exe
+/trial.exe
+/task.exe
 
 # Runtime logs & distribution archive（本地定制）
 logs/

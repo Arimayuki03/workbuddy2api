@@ -26,6 +26,10 @@ if not exist "trial.exe" (
     echo 首次运行：编译 trial 工具...
     go build -o trial.exe ./cmd/trial
 )
+if not exist "task.exe" (
+    echo 首次运行：编译 task 工具...
+    go build -o task.exe ./cmd/task
+)
 
 :menu
 cls
@@ -42,6 +46,7 @@ echo     [6] 手动签到（批量全部账号）
 echo     [7] 加入国际版用户（global）
 echo     [8] 领取国际版加油包（trial）
 echo     [9] 查看服务状态（/status 台账）
+echo    [10] 手动执行定时任务（不影响自动排程）
 echo     [q] 退出
 echo  ============================================
 echo.
@@ -55,8 +60,46 @@ if /i "%c%"=="6" goto :signin
 if /i "%c%"=="7" goto :add_global
 if /i "%c%"=="8" goto :trial
 if /i "%c%"=="9" goto :status
+if /i "%c%"=="10" goto :task
 if /i "%c%"=="q" goto :end
 goto :menu
+
+:task
+cls
+echo.
+echo  ============================================
+echo     手动执行定时任务
+echo     （立即跑一次，不影响常驻服务的自动排程；
+echo       幂等性由上游/防抖判定兜底，重复跑安全）
+echo  ============================================
+echo     [1] 令牌保活（按需 refresh 全部账号）
+echo     [2] 每日签到
+echo     [3] 猫猫旅行巡检
+echo     [4] 活跃上报（N 连发 + 领猫联动）
+echo     [5] 开学季任务（python）
+echo     [6] 夜猫子任务（python）
+echo     [7] 全部按顺序跑一遍
+echo     [q] 返回主菜单
+echo  ============================================
+echo.
+set /p t=  请选择:
+if /i "%t%"=="1" (.\task.exe keepalive & goto :task_done)
+if /i "%t%"=="2" (.\task.exe checkin & goto :task_done)
+if /i "%t%"=="3" (.\task.exe travel & goto :task_done)
+if /i "%t%"=="4" (.\task.exe activity & goto :task_done)
+if /i "%t%"=="5" (.\task.exe school & goto :task_done)
+if /i "%t%"=="6" (.\task.exe cat & goto :task_done)
+if /i "%t%"=="7" (.\task.exe all & goto :task_done)
+if /i "%t%"=="q" goto :menu
+goto :task
+
+:task_done
+echo.
+echo  [提示] school/cat 需要 python：解释器名不是 python3 时先 set WB2A_PYTHON=python
+echo  [提示] 服务日志里看不到本次执行（这是独立进程），结果直接打在上方输出中。
+echo.
+pause
+goto :task
 
 :query
 echo.
