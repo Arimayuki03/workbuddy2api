@@ -90,13 +90,15 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	}
 }
 
-// NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal。
-// 达到 breakerThreshold 触发熔断（指数退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
+// NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal，
+// 并拉高 errorEMA（成功率权重的衰减口径）。达到 breakerThreshold 触发熔断（指数
+// 退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
 func (p *Pool) NoteError(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.errTotal++
+		e.errorEMA += (1 - e.errorEMA) * successAlpha
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
@@ -122,8 +124,9 @@ func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
 	return mc.CostPer1k, true
 }
 
-// NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本。
-// credit 为上游 usage.credit（本次真实扣费），tokens 为本次请求的 token 总数
+// NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本，并顺带
+// 扣减账号余额（credits/creditsExpiring，见下方「P1-A」段）。credit 为上游
+// usage.credit（本次真实扣费=消耗量），tokens 为本次请求的 token 总数
 // （prompt+completion，用于折算单位成本）。tokens<=0 时不记录：无法折算单价，
 // 记进去会污染账本。
 //
@@ -144,6 +147,26 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	e, ok := p.byUID[uid]
 	if !ok {
 		return
+	}
+	// P1-A credits 签到外回写：credit 是本次请求的**消耗量**（上游 usage.credit，
+	// handler 侧 stats.Credit()/usageCreditTotal），不是剩余余额。顺手扣减 credits
+	// 与 creditsExpiring，让四因子里的两个余额因子随消耗实时收敛——旧口径只在
+	// 签到（每天 09:00/21:00 两次）刷新，两次签到之间（最长 12h）高消耗号持续
+	// 高权重直到打空撞 402；global 账号不签到，credits 曾是终身冻结。
+	// 签到仍定期覆盖（ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额
+	// 重置），扣减只是两次签到之间的内插估计；credit=0（免费请求）不动余额。
+	if credit > 0 {
+		d := int64(credit + 0.5) // 四舍五入，与测试口径一致（2.5 → 3）
+		if d > e.credits {
+			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
+		}
+		e.credits -= d
+		if e.creditsExpiring > 0 {
+			if d > e.creditsExpiring {
+				d = e.creditsExpiring
+			}
+			e.creditsExpiring -= d
+		}
 	}
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
@@ -173,6 +196,7 @@ func (p *Pool) NoteSuccess(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.successCount++
+		e.successEMA += (1 - e.successEMA) * successAlpha
 		e.lastSuccess = time.Now()
 		e.fails = 0
 		e.retryCount = 0
@@ -266,6 +290,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	e.lastUsed = now
+	// 粘性路径同样推进 usedSeq/pickSeq：粘性重度使用的账号在 LRU 兜底
+	// （pick 按 usedSeq 选最旧）眼中不再是"最旧"，与 pick 的严格全序语义对齐
+	// （entry.usedSeq 注释声明「每次被选中时取 pickSeq 自增值」，粘性命中也是选中）。
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
 	return e.a
 }
 

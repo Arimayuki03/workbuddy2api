@@ -138,6 +138,27 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
 		}
+		// creditsExpiring 恢复时钳到 [0, credits]（与 SetCreditsDetailed 的写入钳制
+		// 对称）：state.json 手工脏数据/旧版本 bug 数据不得让 expiring/credits > 1
+		// 放大 ×8 权重项。
+		expiring := s.CreditsExpiring
+		if expiring < 0 {
+			expiring = 0
+		}
+		if expiring > s.Credits {
+			expiring = s.Credits
+		}
+		// 成功率 EMA：新字段直接恢复；旧 state.json 缺字段时从 successCount/errTotal
+		// 反推初始值（归一到 [0,1] 区间：EMA 初值 = 历史比率），向后兼容且不丢历史信号。
+		// 无任何记录（success_ema==error_ema==0 且计数为 0）保持零值 → weightOf 走
+		// 1.5 中性偏信任分支。
+		successEMA, errorEMA := s.SuccessEMA, s.ErrorEMA
+		if successEMA == 0 && errorEMA == 0 {
+			if obs := s.SuccessCount + errTotal; obs > 0 {
+				successEMA = float64(s.SuccessCount) / float64(obs)
+				errorEMA = float64(errTotal) / float64(obs)
+			}
+		}
 		e := &entry{
 			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:          s.Credits,
@@ -147,11 +168,13 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			coolKind:         s.CoolKind,
 			successCount:     s.SuccessCount,
 			errTotal:         errTotal,
+			successEMA:       successEMA,
+			errorEMA:         errorEMA,
 			lastErr:          s.LastErr,
 			lastSuccess:      s.LastSuccess,
 			softStreak:       s.SoftStreak,
 			sessionDeadFails: s.SessionDeadFails,
-			creditsExpiring:  s.CreditsExpiring,
+			creditsExpiring:  expiring,
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
 		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
@@ -324,6 +347,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CoolKind:         coolKind,
 			SuccessCount:     e.successCount,
 			ErrTotal:         e.errTotal,
+			SuccessEMA:       e.successEMA,
+			ErrorEMA:         e.errorEMA,
 			LastSuccess:      e.lastSuccess,
 			LastErr:          e.lastErr,
 			SoftStreak:       e.softStreak,
