@@ -1,5 +1,5 @@
 // 账号状态演进与查询：禁用/12153 连续计数判定、成功与错误入账、复活解冻，
-// 以及状态查询（Status/AvailableUIDs/PickByUID/CountsDetailed/ServableNow/List）。
+// 以及状态查询（Status/AvailableUIDs/PickByUIDForModel/CountsDetailed/ServableNow/List）。
 package pool
 
 import (
@@ -241,8 +241,9 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	return uids
 }
 
-// PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
-// 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
+// PickByUIDForModel 若 uid 当前 healthy（含模型级 6004 豁免口径）且未占满在途名额，
+// 返回其凭证（记录 lastUsed 防撞号）；否则返回 nil。供会话粘性路由命中校验与直取使用。
+// 绑定号在当前模型被 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换——
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
@@ -254,26 +255,6 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthyForModel(now, model) {
-		return nil
-	}
-	if p.inFlightFull(e) {
-		return nil
-	}
-	e.lastUsed = now
-	return e.a
-}
-
-// PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
-// 否则返回 nil。供会话粘性路由命中校验与直取使用。
-func (p *Pool) PickByUID(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return nil
-	}
-	now := time.Now()
-	if !e.healthy(now) {
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -423,8 +404,15 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.DisabledReason = e.reason
 	}
 	if st.Cooling {
-		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
+		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。口径与 Cooling 判定一致：
+		// 取 until 与 breakerUntil 中更远的截止（发现 5——熔断冷却的号原实现只算
+		// until，显示"冷却中却 0 秒恢复"；BreakerUntil 虽单独透出，两口径不一致
+		// 误导排查）。两者都过期不会进入本分支（Cooling=false）。
+		remain := time.Until(e.until)
+		if b := time.Until(e.breakerUntil); b > remain {
+			remain = b
+		}
+		st.CoolRemaining = int64(remain.Seconds() + 0.999)
 		if st.CoolRemaining < 0 {
 			st.CoolRemaining = 0
 		}
