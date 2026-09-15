@@ -1269,9 +1269,5 @@ func IsAlreadyCheckin(err error) bool {
 }
 
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
+	return logfmt.Truncate(s, n)
 }

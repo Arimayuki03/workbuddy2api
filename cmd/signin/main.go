@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -108,7 +109,7 @@ func main() {
 			remain = fmt.Sprintf("%d", r.remain)
 		}
 		fmt.Printf("%-36s | %-11s | %-12s | %-6s | %s\n",
-			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
+			logfmt.Truncate(r.uid, 36), logfmt.Truncate(r.nick, 11), r.status, remain, r.detail)
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
 }
@@ -228,13 +229,6 @@ func checkinStatusOf(err error) string {
 		return "ALREADY"
 	}
 	return "FAIL"
-}
-
-func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
 }
 
 func short(s string) string {
