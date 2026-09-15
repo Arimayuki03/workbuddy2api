@@ -2,6 +2,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,7 +103,11 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.APIKey != "" {
 			authz := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authz, "Bearer ") || strings.TrimPrefix(authz, "Bearer ") != h.cfg.APIKey {
+			// 常量时间比较（发现 7）：!= 短路时序随前缀长度变化，公网暴露下
+			// 理论上可逐字节探测 key 前缀；ConstantTimeCompare 消除该信号。
+			provided := strings.TrimPrefix(authz, "Bearer ")
+			if !strings.HasPrefix(authz, "Bearer ") ||
+				subtle.ConstantTimeCompare([]byte(provided), []byte(h.cfg.APIKey)) != 1 {
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 				return
 			}

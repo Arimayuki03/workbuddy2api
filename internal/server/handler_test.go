@@ -1360,6 +1360,42 @@ func TestAPIKeyAuth(t *testing.T) {
 	}
 }
 
+// TestAPIKeyAuthConstantTime Bearer 比较的边界回归（P2-8，发现 7）：
+// 正确 key 通过；错误/空/前缀相同但长度不同一律 401。
+// 常量时间属性（subtle.ConstantTimeCompare）本身无法用单元测试观测，
+// 此处锁的是行为等价——换实现前后四条断言必须同样成立。
+func TestAPIKeyAuthConstantTime(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "secret",
+	})
+	cases := []struct {
+		name string
+		bear string // 完整 Authorization 头（不含 "Bearer " 前缀则按原样发）
+		want int
+	}{
+		{"correct key", "secret", 200},
+		{"wrong key", "wrong", 401},
+		{"empty key", "", 401},
+		{"same prefix longer", "secret-extra", 401},
+		{"same prefix shorter", "sec", 401},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/models", nil)
+			req.Header.Set("Authorization", "Bearer "+c.bear)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			// 正确 key 会继续打到上游（GET /v1/models 走静态表 → 200）；
+			// 其余必须被 401 挡在鉴权层。
+			if rec.Code != c.want {
+				t.Errorf("Bearer %q: code=%d want %d", c.bear, rec.Code, c.want)
+			}
+		})
+	}
+}
+
 func TestStatusEndpoint(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
 	p.SetCredits("u1", 42)
