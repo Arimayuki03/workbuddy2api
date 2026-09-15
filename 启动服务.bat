@@ -123,24 +123,7 @@ goto :menu
 :status
 echo.
 echo  ===== 服务状态 =====
-curl -s -m 3 http://127.0.0.1:7863/healthz
-echo.
-if not exist "config.json" (
-    echo  [提示] 未找到 config.json，跳过 /status 详情（该接口需要 api_key）。
-    echo.
-    pause
-    goto :menu
-)
-rem /status 需鉴权：从 config.json 读 api_key（读取失败则按无鉴权尝试）
-set "APIKEY="
-for /f "usebackq delims=" %%k in (`powershell -NoProfile -Command "(Get-Content 'config.json' -Raw | ConvertFrom-Json).api_key" 2^>nul`) do set "APIKEY=%%k"
-if defined APIKEY (
-    curl -s -m 5 -H "Authorization: Bearer %APIKEY%" http://127.0.0.1:7863/status
-) else (
-    curl -s -m 5 http://127.0.0.1:7863/status
-)
-echo.
-echo  [说明] healthy=可用账号 cooling=冷却中 disabled=禁用 quota=模型级限流台账
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\status-report.ps1"
 echo.
 pause
 goto :menu
