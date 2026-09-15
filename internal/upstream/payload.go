@@ -10,6 +10,9 @@ import (
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
+// DeptestOnly: 仅测试引用（upstream 各 _test + server 稳定性回归）；生产经
+// prepareBody 走 PrepareBodyOptWithEffortsAndDefault。跨包测试引用，
+// 迁 export_test.go 不可行。保留作三层封装的最底层语义锚点。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
 }
@@ -17,6 +20,10 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
+//
+// DeptestOnly: 仅测试引用（upstream stability/thinking/cache_key/sse 族 +
+// server 稳定性回归）；生产经 prepareBody 走 PrepareBodyOptWithEffortsAndDefault。
+// 跨包测试引用，迁 export_test.go 不可行。保留作无默认档的降级管线锚点。
 //
 // 向后兼容封装：不传 defaultEfforts（无模型声明默认档），thinking.go 回退硬编码 high。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {

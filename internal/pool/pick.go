@@ -12,6 +12,10 @@ import (
 )
 
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知）。
+// DeptestOnly: 全库仅 pool 包测试引用；生产选号全走 PickExcludingForRealm /
+// PickByUIDForModel。保留是因为测试需要无轮换/无 realm 的最小选号原语；
+// 迁 export_test.go 不可行——export_test 对包外不可见，而本方法的语义文档
+// （挑选策略全文）对生产簇（pick 私有实现）仍有维护参考价值。
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 // model 非空时启用 6004 模型级冷却豁免（healthyForModel）；空则等价账号级 healthy。

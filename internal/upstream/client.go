@@ -772,6 +772,9 @@ const (
 func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
+// DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
+// （handler 传 r.Context()）。迁 export_test.go 不可行——测试需要真实
+// HTTP 回放走完整 chatPaths/monitorBody 链路，与生产共用同一实现。
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 新调用方应优先用 ChatStreamContext 传入请求 ctx（客户端断连即中断在途调用、释放租约）。
 //

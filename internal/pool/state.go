@@ -104,7 +104,10 @@ func (p *Pool) NoteError(uid string) {
 }
 
 // ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
-// 供测试/运维断言成本账本内容；无观测或观测过期（modelCostTTL）时 ok=false。
+// DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
+// handler_cost_test / global_e2e_test 断言账本内容。跨包（internal/server）
+// 测试引用，迁 export_test.go 不可行（对包外不可见）。
+// 无观测或观测过期（modelCostTTL）时 ok=false。
 func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -210,6 +213,9 @@ func (p *Pool) AvailableUIDs() []string {
 // AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
 // 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入
 // （issue #31 模型豁免）。
+// DeptestOnly: 仅 cost_test.go 引用；生产经 wiring.go 走
+// AvailableUIDsForModelRealm（带 realm 维度）。保留作 ForModelRealm 的
+// realm=="" 退化语义锚点测试。
 // 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	return p.availableUIDsLocked("",

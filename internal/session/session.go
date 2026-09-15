@@ -121,12 +121,6 @@ func (r *Router) LoadFromStore() {
 	}
 }
 
-// Resolve 返回会话 key 应绑定的账号 uid，ok=false 表示当前无可用账号。
-// 无模型维度（等价于 ResolveForModel(key, "")），保留给不关心模型的调用方。
-func (r *Router) Resolve(key string) (string, bool) {
-	return r.ResolveForModel(key, "")
-}
-
 // ResolveForModel 返回会话 key 在该模型上应绑定的账号 uid。
 // 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
 // 被该模型限流）走重新分配。
