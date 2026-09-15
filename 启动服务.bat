@@ -22,6 +22,10 @@ if not exist "signin.exe" (
     echo 首次运行：编译 signin 工具...
     go build -o signin.exe ./cmd/signin
 )
+if not exist "trial.exe" (
+    echo 首次运行：编译 trial 工具...
+    go build -o trial.exe ./cmd/trial
+)
 
 :menu
 cls
@@ -30,11 +34,14 @@ echo  ============================================
 echo     workbuddy2api 管理菜单
 echo  ============================================
 echo     [1] 查询积分 / 查看账号
-echo     [2] 加入用户
+echo     [2] 加入用户（国内版 cn）
 echo     [3] 启动服务（后台）
 echo     [4] 停止服务
 echo     [5] 查看服务日志
 echo     [6] 手动签到（批量全部账号）
+echo     [7] 加入国际版用户（global）
+echo     [8] 领取国际版加油包（trial）
+echo     [9] 查看服务状态（/status 台账）
 echo     [q] 退出
 echo  ============================================
 echo.
@@ -45,6 +52,9 @@ if /i "%c%"=="3" goto :start
 if /i "%c%"=="4" goto :stop
 if /i "%c%"=="5" goto :log
 if /i "%c%"=="6" goto :signin
+if /i "%c%"=="7" goto :add_global
+if /i "%c%"=="8" goto :trial
+if /i "%c%"=="9" goto :status
 if /i "%c%"=="q" goto :end
 goto :menu
 
@@ -58,10 +68,23 @@ goto :menu
 
 :add
 echo.
-echo  ===== 加入用户 (WorkBuddy OAuth 登录) =====
+echo  ===== 加入用户（国内版 cn，WorkBuddy OAuth 登录） =====
 echo  将自动打开浏览器完成授权，登录后自动落盘到 auths 目录。
 echo.
 .\login.exe join
+call :join_result
+goto :menu
+
+:add_global
+echo.
+echo  ===== 加入国际版用户（global，workbuddy.ai） =====
+echo  将自动打开浏览器完成授权；国际版账号无每日签到，登录后自动落盘。
+echo.
+.\login.exe join --realm=global
+call :join_result
+goto :menu
+
+:join_result
 if errorlevel 2 (
     echo.
     echo  已中止，未添加账号。
@@ -71,11 +94,11 @@ if errorlevel 2 (
 )
 echo.
 pause
-goto :menu
+goto :eof
 
 :signin
 echo.
-echo  ===== 手动签到（批量全部账号） =====
+echo  ===== 手动签到（批量全部账号，国际版账号自动判为不适用） =====
 echo  遍历 auths\ 下所有 workbuddy-*.json 账号签到。
 echo.
 .\signin.exe auths
@@ -83,6 +106,41 @@ if errorlevel 1 (
     echo.
     echo  [提示] 签到失败或 auths 目录无账号。请先选 2 加入用户。
 )
+echo.
+pause
+goto :menu
+
+:trial
+echo.
+echo  ===== 领取国际版加油包（trial，仅 global 账号） =====
+echo  遍历 auths\ 全部账号，CN 账号自动跳过（N/A）。
+echo.
+.\trial.exe auths
+echo.
+pause
+goto :menu
+
+:status
+echo.
+echo  ===== 服务状态 =====
+curl -s -m 3 http://127.0.0.1:7863/healthz
+echo.
+if not exist "config.json" (
+    echo  [提示] 未找到 config.json，跳过 /status 详情（该接口需要 api_key）。
+    echo.
+    pause
+    goto :menu
+)
+rem /status 需鉴权：从 config.json 读 api_key（读取失败则按无鉴权尝试）
+set "APIKEY="
+for /f "usebackq delims=" %%k in (`powershell -NoProfile -Command "(Get-Content 'config.json' -Raw | ConvertFrom-Json).api_key" 2^>nul`) do set "APIKEY=%%k"
+if defined APIKEY (
+    curl -s -m 5 -H "Authorization: Bearer %APIKEY%" http://127.0.0.1:7863/status
+) else (
+    curl -s -m 5 http://127.0.0.1:7863/status
+)
+echo.
+echo  [说明] healthy=可用账号 cooling=冷却中 disabled=禁用 quota=模型级限流台账
 echo.
 pause
 goto :menu
@@ -95,14 +153,14 @@ netstat -ano | findstr ":7863" | findstr "LISTENING" >nul 2>nul
 if errorlevel 1 goto :run
 for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":7863" ^| findstr "LISTENING"') do set PID=%%p
 
-rem 端口被占用 → 健康检查
-curl -s -m 3 http://127.0.0.1:7863/healthz | findstr /i "ok" >nul 2>nul
+rem 端口被占用 → 健康检查（上游 /healthz 响应带 service:"workbuddy2api" 身份字段）
+curl -s -m 3 http://127.0.0.1:7863/healthz | findstr /i "workbuddy2api" >nul 2>nul
 if not errorlevel 1 goto :healthy
 
 rem 端口占用但 healthz 不通 → 查进程归属
 set PROCLINE=
 for /f "delims=" %%n in ('tasklist /FI "PID eq %PID%" 2^>nul') do set "PROCLINE=%%n"
-echo %PROCLINE% | findstr /i "server.exe" >nul 2>nul
+echo %PROCLINE% | findstr /i "wb2api.exe" >nul 2>nul
 if not errorlevel 1 goto :stale
 
 rem 其他程序占用
@@ -151,10 +209,10 @@ echo  日志文件 : logs\server.log
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start-service.ps1"
 echo  服务已后台启动，正在等待端口 7863 就绪...
-rem 最多等 10 秒，轮询 healthz
+rem 最多等 10 秒，轮询 healthz（匹配 service 身份字段，注意服务无账号时 /healthz 返回 503 也算就绪）
 set /a n=0
 :waithealth
-curl -s -m 2 http://127.0.0.1:7863/healthz | findstr /i "ok" >nul 2>nul
+curl -s -m 2 http://127.0.0.1:7863/healthz | findstr /i "workbuddy2api" >nul 2>nul
 if not errorlevel 1 goto :health_ok
 set /a n+=1
 if %n% geq 10 goto :health_timeout
