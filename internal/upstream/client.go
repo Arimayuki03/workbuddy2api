@@ -132,7 +132,7 @@ func (e *Error) Error() string {
 
 // hardRule 余额不足关键词（大小写不敏感 + 中文原文双通道）。
 var hardRule = errorRule{kind: ErrHardCredit, mode: matchFold, patterns: []string{
-	"insufficient credit", "no credit", "credit exhausted", "out of credit",
+	"insufficient credit", "no credit", "credit exhausted", "credits exhausted", "out of credit",
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",

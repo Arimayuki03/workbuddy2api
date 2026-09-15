@@ -25,6 +25,8 @@ func TestClassify(t *testing.T) {
 		{402, ``, ErrHardCredit},
 		{400, `{"code":1,"msg":"余额不足"}`, ErrHardCredit},
 		{403, `insufficient credits`, ErrHardCredit},
+		{403, `credits exhausted`, ErrHardCredit},
+		{200, `{"code":1,"msg":"credits exhausted, please top up"}`, ErrHardCredit},
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
