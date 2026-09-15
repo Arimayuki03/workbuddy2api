@@ -1,21 +1,25 @@
 ﻿# status-report.ps1 — 拉取 /healthz 与 /status 渲染中文状态摘要（启动服务.bat 菜单 9 调用）。
 # 用 curl.exe 而非 Invoke-RestMethod：后者在 503（无可用账号）时抛异常，而 healthz
 # 503 仍是有效响应（body 带 service/healthy 字段），必须能读回。
-# 关键：PS5.1 默认按系统 ANSI 代码页（GBK）解码 curl 的 UTF-8 stdout，中文昵称会被
-# 解成乱码并吞掉 JSON 引号，导致 ConvertFrom-Json 失败——显式设 OutputEncoding 为 UTF-8。
-$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+# 编码要点：PS5.1 按系统 ANSI（GBK）解码 curl 的 UTF-8 stdout，中文昵称会解出乱码并
+# 吞掉 JSON 引号。这里不用 [Console]::OutputEncoding=UTF8 修复——那个调用会改掉共享
+# 控制台窗口的代码页且退出后不恢复（cmd 后续输出乱码回归）；改为 curl -o 落盘 +
+# Get-Content -Encoding UTF8 显式解码，全程不触碰控制台 CP。
 $base = 'http://127.0.0.1:7863'
 $proj = Split-Path $PSScriptRoot -Parent
 $cfg  = Join-Path $proj 'config.json'
+$tmp  = Join-Path $env:TEMP ('wb2api-status-{0}.json' -f $PID)
 
 # 1) 探活：连接失败（服务未启动）时 curl 非零退出，给出明确指引
-$hzRaw = & curl.exe -s -m 3 "$base/healthz" 2>$null
-if ($LASTEXITCODE -ne 0 -or -not $hzRaw) {
+& curl.exe -s -m 3 -o $tmp "$base/healthz" 2>$null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) {
+    if (Test-Path $tmp) { Remove-Item $tmp -Force }
     Write-Output "[状态] 服务未运行或无法连接（$base）。"
     Write-Output "[处理] 请先在菜单选 3 启动服务；已启动则选 5 查看日志排查。"
     exit 1
 }
-$hz = $hzRaw | ConvertFrom-Json
+$hz = Get-Content -Raw -Encoding UTF8 $tmp | ConvertFrom-Json
+Remove-Item $tmp -Force
 if (-not $hz -or -not $hz.service) {
     Write-Output "[错误] /healthz 响应解析失败（端口 7863 可能不是本网关）。"
     exit 1
@@ -26,19 +30,21 @@ Write-Output ("healthy={0}  total={1}  cn={2}  global={3}" -f $hz.healthy, $hz.t
 # 2) /status 台账（需 api_key）
 $key = $null
 if (Test-Path $cfg) {
-    try { $key = (Get-Content $cfg -Raw | ConvertFrom-Json).api_key } catch {}
+    try { $key = (Get-Content -Raw -Encoding UTF8 $cfg | ConvertFrom-Json).api_key } catch {}
 }
 if (-not $key) {
     Write-Output ""
     Write-Output "[提示] 未找到 config.json 或未配置 api_key，跳过 /status 台账。"
     exit 0
 }
-$stRaw = & curl.exe -s -m 5 -H "Authorization: Bearer $key" "$base/status" 2>$null
-if ($LASTEXITCODE -ne 0 -or -not $stRaw) {
+& curl.exe -s -m 5 -H "Authorization: Bearer $key" -o $tmp "$base/status" 2>$null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) {
+    if (Test-Path $tmp) { Remove-Item $tmp -Force }
     Write-Output "[错误] /status 请求失败（api_key 不对，或服务刚停止）。"
     exit 1
 }
-$st = $stRaw | ConvertFrom-Json
+$st = Get-Content -Raw -Encoding UTF8 $tmp | ConvertFrom-Json
+Remove-Item $tmp -Force
 if ($null -eq $st) {
     Write-Output "[错误] /status 响应解析失败。"
     exit 1

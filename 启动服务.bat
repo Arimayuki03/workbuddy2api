@@ -230,11 +230,13 @@ goto :menu
 
 :log
 echo.
-echo  ===== 服务日志 (logs\server.log) =====
+echo  ===== 服务日志 (最后 200 行，完整见 logs\server.log) =====
 if not exist "%~dp0logs\server.log" (
     echo  尚无日志文件（服务可能未启动过）。
 ) else (
-    type "%~dp0logs\server.log"
+    rem type 在 GBK 代码页控制台会把 UTF-8 日志解成乱码；走 PowerShell 显式 UTF-8 读，
+    rem 其输出经 Unicode 控制台 API 渲染，任何代码页下都正确。
+    powershell -NoProfile -Command "Get-Content -LiteralPath '%~dp0logs\server.log' -Encoding UTF8 -Tail 200"
 )
 echo.
 pause
