@@ -270,10 +270,7 @@ func IsModelRateLimit(body string) bool {
 // ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 //
-// 与旧 ParseSoftRateReset 的关键差异：不再被 IsModelRateLimit（6004）门禁。只要是
-// 带「将在 … 重置」的限流文案——6004 模型级、11140 "The model provider is
-// rate-limiting requests." 等任意形态——都提取同一上游权威重置墙钟。是否走模型级
-// 豁免、时日对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
+// 是否走模型级豁免、时日对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
@@ -289,12 +286,6 @@ func ParseRateReset(body string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
-}
-
-// ParseSoftRateReset 旧函数名的兼容别名：等价于 ParseRateReset（统一入口）。
-// 保留仅为避免旧调用点/外部引用断裂；新增代码应直接使用 ParseRateReset。
-func ParseSoftRateReset(body string) (time.Time, bool) {
-	return ParseRateReset(body)
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
@@ -408,7 +399,7 @@ type Client struct {
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
 	// （仅当 client_name 非空，见 billingUA）。
 	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
-	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUA。默认值已对齐官方（A 段变更），
+	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUAFor。默认值已对齐官方（A 段变更），
 	// 用户仍可显式配置完全自定义的 UA。
 	UserAgent string
 
@@ -455,12 +446,6 @@ type Client struct {
 	// false 即显式逃生门：即使用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
-
-	// UsageBaseCN / UsageBaseGlobal 积分消耗明细（get-user-request-usage）所在主机：
-	// 官网 usercenter 同源，与 billing base 不同（CN 实测仅在 www.workbuddy.cn 提供，
-	// codebuddy.cn 同路径 404/400）。空 = 回落默认。
-	UsageBaseCN     string
-	UsageBaseGlobal string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -478,7 +463,6 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
-		UsageBaseCN:          "https://www.workbuddy.cn",
 	}
 }
 
@@ -1272,76 +1256,6 @@ func IsAlreadyCheckin(err error) bool {
 		return false
 	}
 	return alreadyCheckinRule.hit(ue.Msg, strings.ToLower(ue.Msg))
-}
-
-// UsageRec 一条积分消耗明细（按请求）。
-type UsageRec struct {
-	RequestTime string  // "2006-01-02 15:04:05"（上游本地 = CST）
-	Credit      float64 // 本次扣减积分（如 0.12）
-	Model       string
-}
-
-// UsageRecords 拉取账号在 [begin, end] 内的按请求积分消耗明细
-// （POST /billing/meter/get-user-request-usage，官网「积分消耗明细」同源；
-// 注意在 UsageBaseCN 主机、无 /v2 前缀，与 get-user-resource 的 /v2 路径不同）。
-// 带分页与上限保护：单账号/区间最多 maxUsagePages×pageSize 条，超出截断（趋势聚合仍成样）。
-func (c *Client) UsageRecords(a *auth.Auth, begin, end time.Time) ([]UsageRec, error) {
-	const (
-		pageSize     = 100
-		maxUsagePage = 10 // 1000 条/账号/区间封顶；响应含提示词快照，控制带宽
-	)
-	var out []UsageRec
-	total := 0
-	for page := 1; page <= maxUsagePage; page++ {
-		body := map[string]any{
-			"startTime": begin.Format("2006-01-02") + " 00:00:00",
-			"endTime":   end.Format("2006-01-02") + " 23:59:59",
-			"pageNum":   page,
-			"pageSize":  pageSize,
-		}
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			c.UsageBaseCN+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		c.BillingHeaders(req, a)
-		data, err := c.doJSON(req)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		var shape struct {
-			Total int `json:"total"`
-			Data  []struct {
-				RequestTime string      `json:"requestTime"`
-				Credit      json.Number `json:"credit"`
-				Model       string      `json:"model"`
-			} `json:"data"`
-		}
-		err = json.Unmarshal(data, &shape)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("request usage parse: %w", err)
-		}
-		total = shape.Total
-		for _, r := range shape.Data {
-			v, err := r.Credit.Float64()
-			if err != nil {
-				continue
-			}
-			out = append(out, UsageRec{RequestTime: r.RequestTime, Credit: v, Model: r.Model})
-		}
-		if len(shape.Data) == 0 || len(out) >= total {
-			break
-		}
-	}
-	return out, nil
 }
 
 func truncate(s string, n int) string {

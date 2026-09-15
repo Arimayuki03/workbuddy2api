@@ -279,10 +279,6 @@ type stateAccount struct {
 	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留第四因子
 	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
 	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
-
-	// ModelCost 实测扣费账本（model → 观测）。仅内存态，重启后重新学习：
-	// 成本会随上游活动（限免期/夜间免费/折扣）变化，持久化旧值反而是脏数据。
-	ModelCost map[string]stateModelCost `json:"-"`
 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
 	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
@@ -298,25 +294,13 @@ type stateModelCooldown struct {
 	Reason  string    `json:"reason,omitempty"`
 }
 
-// stateModelCost 单个 (账号, 模型) 的实测成本观测。
-type stateModelCost struct {
-	// CostPer1k 每千 token 的 credit 消耗（EMA 平滑）。0 = 免费。
-	// 用"每千 token"归一而非"单次 credit"：扣费随请求长度变化，
-	// 不同长度的请求之间不可比。
-	CostPer1k float64
-	// LastSeen 最近观测时刻，超过 modelCostTTL 视为失效。
-	LastSeen time.Time
-	// Samples 观测次数（供排查）。
-	Samples int
-}
-
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
 // 单次会话，又不至于让昨天的价格决定今天的选择——过期的免费观测若永久有效，
 // 白天会把已开始收费的号继续当成免费。
 const modelCostTTL = 6 * time.Hour
 
-// modelCostEntry 运行时成本账本（与 stateModelCost 同构，独立于持久化结构，
-// 避免账本污染 state.json）。
+// modelCostEntry 运行时成本账本（独立于持久化结构，避免账本污染 state.json；
+// 成本随上游活动变化，仅内存态，重启后重新学习）。
 type modelCostEntry struct {
 	CostPer1k float64
 	LastSeen  time.Time

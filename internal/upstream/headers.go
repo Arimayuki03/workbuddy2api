@@ -70,11 +70,6 @@ func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
 	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
 }
 
-// defaultWorkBuddyUA 返回 CN 形态的默认 UA（默认账号形态即 CN，零回归兼容既有调用/测试）。
-func (c *Client) defaultWorkBuddyUA() string {
-	return c.defaultWorkBuddyUAFor(nil)
-}
-
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
 // 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
 // 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
