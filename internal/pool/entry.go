@@ -116,8 +116,9 @@ type entry struct {
 	modelCooldowns map[string]modelCooldown
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
-	// 运行态语义（不持久化，与 inFlight 同语义）：重启清零可接受——重启后首个 keepalive
-	// 成功即清计数，误判号不会因重启前的历史累积被继续追杀。
+	// 持久化（stateAccount.SessionDeadFails）：上游持续 session dead 时重启归零会导致
+	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
+	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
@@ -265,6 +266,10 @@ type stateAccount struct {
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak,omitempty"`
+	// SessionDeadFails 连续 12153 计数（判定 session 死亡的进度）。持久化以保留
+	// 「重启后连续计数继续累计」——上游持续 session dead 时重启归零会重学 2 次失败。
+	// 零值省略（omitempty）。
+	SessionDeadFails int `json:"session_dead_fails,omitempty"`
 
 	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
 	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
