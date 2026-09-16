@@ -19,6 +19,12 @@ data/
 /signin.exe
 /trial.exe
 /task.exe
+# 换版前留的旧产物备份（*.exe.bak / *.exe.bak-日期 / *.exe.<tag>.bak）
+*.exe.bak*
+*.exe.*.bak*
+
+# Windows 下误重定向 nul 设备产生的空文件（Git Bash 会落出实体文件）
+/nul
 
 # Runtime logs & distribution archive（本地定制）
 logs/
@@ -30,6 +36,8 @@ workbuddy2api-dist.zip
 
 # Config with secrets (use config.example.json)
 config.json
+# admin PATCH 落盘自动备份 / 手动备份（同样含密钥）
+config.json.bak*
 
 # Build artifacts
 *.tmp
