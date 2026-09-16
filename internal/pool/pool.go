@@ -175,11 +175,12 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
-	limit := p.inFlightLimit(e)
-	p.mu.RUnlock()
 	if !ok {
+		p.mu.RUnlock()
 		return false
 	}
+	limit := p.inFlightLimit(e)
+	p.mu.RUnlock()
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
