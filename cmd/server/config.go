@@ -119,6 +119,12 @@ type Config struct {
 		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
+		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
+		// 并存取更长者不叠加。默认 5 次 / 10m。
+		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长，默认 "10m"
+		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权封顶，默认 "2h"
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
@@ -137,6 +143,8 @@ type Config struct {
 	SoftRateMaxDur      time.Duration `json:"-"`
 	BreakerCooldownDur  time.Duration `json:"-"`
 	BreakerCooldownMaxD time.Duration `json:"-"`
+	DegradeCooldownDur  time.Duration `json:"-"`
+	DegradeCooldownMaxD time.Duration `json:"-"`
 	SessionTTL          time.Duration `json:"-"`
 	SessionGCInterval   time.Duration `json:"-"`
 	ExpiringSoonDur     time.Duration `json:"-"`
@@ -178,6 +186,9 @@ func Default() *Config {
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
+	c.Pool.DegradeThreshold = 5
+	c.Pool.DegradeCooldown = "10m"
+	c.Pool.DegradeCooldownMax = "2h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
@@ -307,6 +318,12 @@ func (c *Config) normalize() error {
 	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
 	}
+	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown: %w", err)
+	}
+	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)
 	}
@@ -315,6 +332,16 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
+	}
+	// 连败降权参数缺省归一（非法/未设置回落默认，与 breaker_threshold 同风格）。
+	if c.Pool.DegradeThreshold <= 0 {
+		c.Pool.DegradeThreshold = 5
+	}
+	if c.Pool.DegradeCooldown == "" {
+		c.Pool.DegradeCooldown = "10m"
+	}
+	if c.Pool.DegradeCooldownMax == "" {
+		c.Pool.DegradeCooldownMax = "2h"
 	}
 	// global 在途分档：0/负数视为未设置回落默认 2（WAF 403 修复 P1-1）。
 	if c.Pool.MaxInFlightGlobal <= 0 {
