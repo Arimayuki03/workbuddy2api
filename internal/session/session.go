@@ -291,7 +291,13 @@ func hashIndex(key string, n int) int {
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
-//  5. metadata.user_id
+//
+// 全部为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+//（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
+// user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
+// 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
+//（与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
+//（7d 兜底）自然过期，键消失不产生脏绑定。
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
@@ -309,9 +315,6 @@ func ExtractKey(body []byte) string {
 			return v
 		}
 		if v := strOrEmpty(meta["conversationId"]); v != "" {
-			return v
-		}
-		if v := strOrEmpty(meta["user_id"]); v != "" {
 			return v
 		}
 	}
