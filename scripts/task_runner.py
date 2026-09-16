@@ -40,6 +40,11 @@
     Buddy_App/_QQ       buddyapp 五连（discover→…→bind_skip）  1  （application_id: open-platform search）
   web 域行为（fork ReportWebEvent 实测：POST www.workbuddy.cn/v2/report + web 指纹）：
     Library_read        web_element_click(library_doc_intro_click) 1  （space 文档 URL）
+  小程序开学季任务（/portal/activity/school/*，模块 school_open_day_2026.py；accept=viewed 激活）：
+    chat_3_times        小程序对话 3 次（mini chat_request_send+activityId 点亮） 3/每日
+    expert_use          开学季专家对话（BackToSchool 专家 expert_actual_use）    1/每日
+    share_invite        分享活动（share-complete 端点）                          1/每日
+    task_student_verify 人工环节（跳过）
   仍不可伪造：
     Expert_Philanthropy   真实捐款动作(M8)
 
@@ -68,6 +73,11 @@ import sys, os, json, time, argparse, glob, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc
+# 小程序开学季任务模块（直接 import 复用其 MP 指纹/事件构造/领奖端点，勿复制实现）。
+# 不抽到 task_common：task_common 是纯 growth/report HTTP 工具层（本文件头部注释约定），
+# school_open_day_2026 才是小程序域指纹（MP_UA/extName=workbuddy-mp）与 school 端点的
+# 唯一事实源；import 消耗为零（模块级只有常量定义，main() 有 __main__ 门）。
+import school_open_day_2026 as school
 
 # --------------------------------------------------------------------------
 # 任务映射表（task_code -> 完成定义）
@@ -98,6 +108,11 @@ MAPPING = {
     "RichMeow_Chat":          {"kind": "richmeow",   "target": 1, "src": "无(桌面指纹对话链)"},
     # web 域 web_element_click（fork ReportWebEvent，三账号实测点亮）
     "Library_read":           {"kind": "library",    "target": 1, "src": "无(资料库介绍点击)"},
+    # 小程序开学季任务（school_open_day_2026.py 同款判据，accept=viewed 激活）
+    "chat_3_times":           {"kind": "school", "target": 3, "src": "无(mini_chat×3+activityId)"},
+    "expert_use":             {"kind": "school", "target": 1, "src": "BackToSchool 专家 id"},
+    "share_invite":           {"kind": "school", "target": 1, "src": "无(share-complete)"},
+    "desktop_chat_1_time":    {"kind": "school", "target": 1, "src": "无(桌面 6 连+activityId)"},
     # 不可伪造（真实业务副作用）
     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
 }
@@ -407,6 +422,16 @@ def _dedup_slice(src, offset, need):
     return final[offset:offset + need]
 
 
+# 小程序开学季任务 → school 模块的 report_kind/处理方式映射（school_open_day_2026.KNOWN_TASKS）
+# mode=manual（task_student_verify 学生认证）不在 MAPPING，未映射任务照旧保守跳过。
+SCHOOL_REPORT_KIND = {
+    "chat_3_times": "mini_chat",
+    "expert_use": "expert",
+    "share_invite": "share",        # 非事件上报，走 /tasks/share-complete 端点
+    "desktop_chat_1_time": "desktop_seq",
+}
+
+
 def ids_for(kind, auth, need, offset=0):
     """返回需要上报的对象 id 列表 [(obj_id, meta)]（按源顺序，偏移 cur 避免复用）。"""
     if need <= 0:
@@ -434,6 +459,9 @@ def ids_for(kind, auth, need, offset=0):
         return [("", {}) for _ in range(need)]
     if kind in ("buddy5", "library", "buddyfirst"):
         # history/current 不是顺序语义：buddy5/library/buddyfirst 是固定事件组按需补 1 次（offset 无意义）
+        return [("", {}) for _ in range(need)]
+    if kind == "school":
+        # school 任务的进度语义同上（每次事件独立 +1，无对象 id）；school 域进度不在 growth 任务里
         return [("", {}) for _ in range(need)]
     return []
 
@@ -749,6 +777,155 @@ def claim_one(auth, code, uid8, stats, gap):
 
 
 # --------------------------------------------------------------------------
+# 小程序开学季任务（school 域）：独立任务空间 /portal/activity/school/tasks，
+# 复用 school_open_day_2026.py 的全部判据与端点（同指纹、同 accept→claim 链路）。
+# 与 growth 任务不同点：accept 动作是 POST /tasks/{code}/viewed；领奖走
+# POST /tasks/{code}/claim（school 域专属，非 growth claim 端点）。
+# --------------------------------------------------------------------------
+SCHOOL_CODES = [c for c in SCHOOL_REPORT_KIND]
+
+
+def school_fetch_tasks(auth):
+    """school 域任务列表（复用 school 模块）。返回 (tasks, in_period)；失败抛异常。"""
+    return school.fetch_school_tasks(auth["token"])
+
+
+def _school_find(tasks, code):
+    return next((t for t in tasks if t.get("task_code") == code), None)
+
+
+def process_school_task(auth, code, t, st_tasks, uid8, opts, stats):
+    """单个 school 任务：viewed 激活 → 判据触发（按 target-进度 循环）→ 回读 → claim。
+
+    判据触发全部复用 school.make_report_events（mini_chat/expert/desktop_seq）与
+    school.post_share_complete；幂等：completed/claimed 是正常态直接跳过。
+    """
+    def refetch():
+        try:
+            ts, _ = school_fetch_tasks(auth)
+            return _school_find(ts, code)
+        except Exception:
+            return None
+
+    status = (t.get("status") or "?").lower()
+    cur = t.get("progress") or 0
+    target = t.get("target_count") or 1
+    reward = t.get("reward_credit") or 0
+    stats["total"] += 1
+
+    if status in ("completed", "claimed"):
+        print(f"[task_runner] {uid8} {code}: query {status}({cur}/{target}) -> 已完成/已领，跳过")
+        stats["already"] += 1
+        return
+
+    report_kind = SCHOOL_REPORT_KIND.get(code)
+    if report_kind is None:
+        print(f"[task_runner] {uid8} {code}: query {status} -> school 未映射(人工/未知)，skip")
+        stats["skip"] += 1
+        return
+
+    if not opts.yes:
+        print(f"[task_runner] {uid8} {code}: query {status}({cur}/{target}) reward={reward} "
+              f"-> school {report_kind} 判据（dry-run 跳过）")
+        stats["pending"] += 1
+        return
+
+    # 1) pending -> viewed 激活（「接任务」，H5 行为；复用 school 模块端点）
+    if status == "pending":
+        try:
+            st, r = school.post_viewed(auth["token"], code)
+            print(f"[task_runner] {uid8} {code}: viewed 激活 {st} "
+                  f"code={r.get('code') if isinstance(r, dict) else r}")
+            time.sleep(opts.gap)
+        except Exception as e:
+            print(f"[task_runner] {uid8} {code}: viewed 失败: {e}")
+            stats["fail"] += 1
+            return
+
+    # 2) 判据触发：share 一次即完成；desktop_seq 一次 6 连 = 一次对话；
+    #    mini_chat/expert 按 target-当前进度 循环（每次事件独立 +1）。
+    if report_kind == "share":
+        rounds = 1
+    elif report_kind == "desktop_seq":
+        rounds = 1
+    else:
+        rounds = max(1, target - cur)
+
+    progressed = False
+    for ri in range(rounds):
+        try:
+            if report_kind == "share":
+                st, r = school.post_share_complete(auth["token"])
+            else:
+                events, host, extra_h = school.make_report_events(auth, report_kind)
+                st, r = school.report_events(auth, events, host=host, extra_headers=extra_h)
+            print(f"[task_runner] {uid8} {code}: report {ri + 1}/{rounds} {st} "
+                  f"code={r.get('code') if isinstance(r, dict) else r} ({report_kind})")
+        except Exception as e:
+            print(f"[task_runner] {uid8} {code}: report 失败 #{ri + 1}: {e}")
+            stats["fail"] += 1
+            break
+        time.sleep(opts.gap)
+        t2 = refetch()
+        if t2 is None:
+            continue
+        after = (t2.get("status") or "?").lower()
+        after_prog = t2.get("progress") or 0
+        if after_prog > cur:
+            cur, progressed = after_prog, True
+        if after in ("completed", "claimed") or after_prog >= target:
+            break
+
+    # 3) 回读 + claim（school 域端点，发抽奖机会/积分）
+    t2 = refetch() or t
+    after = (t2.get("status") or "?").lower()
+    after_prog = t2.get("progress") or 0
+    if after == "claimed":
+        print(f"[task_runner] {uid8} {code}: {status}/{cur} -> claimed（本轮已入账）")
+        stats["already"] += 1
+        return
+    if after == "completed" or after_prog >= target:
+        print(f"[task_runner] {uid8} {code}: {status} -> {after}/{after_prog}（点亮）")
+        try:
+            stc, rc = school.post_claim(auth["token"], code)
+            print(f"[task_runner] {uid8} {code}: claim {stc} "
+                  f"code={rc.get('code') if isinstance(rc, dict) else rc}")
+            stats["ok"] += 1
+            time.sleep(opts.gap)
+        except Exception as e:
+            print(f"[task_runner] {uid8} {code}: claim 失败: {e}（可稍后补领）")
+            stats["fail"] += 1
+        return
+    if progressed:
+        print(f"[task_runner] {uid8} {code}: {status} -> {after}/{after_prog}（部分点亮，未达 target）")
+        stats["ok"] += 1
+    else:
+        print(f"[task_runner] {uid8} {code}: {status} -> {after}/{after_prog}（未变化）")
+        stats["pending"] += 1
+
+
+def process_school_tasks(auth, opts, stats, uid8):
+    """账号级 school 段：拉 school 任务列表并逐个处理。异常/非活动期如实标注。"""
+    try:
+        tasks, in_period = school_fetch_tasks(auth)
+    except Exception as e:
+        print(f"[task_runner] {uid8} school/tasks 拉取失败: {e}")
+        stats["fail"] += 1
+        return
+    if not in_period:
+        print(f"[task_runner] {uid8} school 活动非进行期（in_period=false），school 段跳过")
+        return
+    print(f"[task_runner] {uid8} school/tasks in_period={in_period} tasks={len(tasks)}")
+    for code in SCHOOL_CODES:
+        t = _school_find(tasks, code)
+        if t is None:
+            continue
+        if opts.only_codes and code not in opts.only_codes:
+            continue
+        process_school_task(auth, code, t, tasks, uid8, opts, stats)
+
+
+# --------------------------------------------------------------------------
 # 单任务处理
 # --------------------------------------------------------------------------
 def process_task(auth, code, t, opts, stats):
@@ -977,10 +1154,15 @@ def process_account(auth, opts, stats):
         return
 
     by_code = {t.get("task_code"): t for t in tasks}
+    # growth 映射里带 school 段的 codes：growth 任务列表无此 code（school 域独立任务空间），
+    # 由 process_school_tasks 专段处理，不进 process_task（growth claim 端点对 school 任务 400）。
+    school_in_map = [c for c in MAPPING if MAPPING[c].get("kind") == "school"]
     if opts.only_codes:
-        codes = opts.only_codes
+        codes = [c for c in opts.only_codes if c not in school_in_map]
+        process_school = bool(set(opts.only_codes) & set(school_in_map))
     else:
-        codes = list(MAPPING)
+        codes = [c for c in MAPPING if MAPPING[c].get("kind") != "school"]
+        process_school = True
         # 未在映射表但存在于任务列表的（如 Expert_Philanthropy）——只计数展示
         for t in tasks:
             c = t.get("task_code")
@@ -1003,6 +1185,12 @@ def process_account(auth, opts, stats):
             stats["skip"] += 1
             continue
         process_task(auth, code, t, opts, stats)
+
+    # school 段（小程序开学季）：growth 任务循环之后执行，判据/端点全复用 school 模块。
+    # --only-claim 语义下跳过：school 无「已 completed 未领」的 only_claim 快路径，
+    # 点亮判据是写操作，不应在只领奖模式下触发（实测曾由此误触发写，见报告）。
+    if process_school and not opts.only_claim:
+        process_school_tasks(auth, opts, stats, uid8)
 
 
 # --------------------------------------------------------------------------
