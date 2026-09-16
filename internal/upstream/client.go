@@ -240,12 +240,6 @@ func isPromptTooLongStatus(status int) bool {
 		status == http.StatusRequestEntityTooLarge
 }
 
-// IsPromptTooLong 报告 status+body 是否为上游 11115「prompt is too long」答复。
-// handler 末端透传分支用（透传原文，不罚号不轮转）。
-func IsPromptTooLong(status int, body string) bool {
-	return isPromptTooLongStatus(status) && promptTooLongRule.hit(body, strings.ToLower(body))
-}
-
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
 var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
@@ -535,7 +529,7 @@ func Classify(status int, body string) ErrKind {
 	// 先于宽泛的状态码兜底（404 兜底会误归 ErrNotFound 只冷却不透传；ErrClient
 	// 只换号，浪费健康号配额）。只认请求级 4xx 状态码（见 promptTooLongRule），
 	// 429/5xx 在上方已被各自状态码层短路（限流/服务端故障语义优先）。
-	if IsPromptTooLong(status, body) {
+	if isPromptTooLongStatus(status) && promptTooLongRule.hit(body, lower) {
 		return ErrPromptTooLong
 	}
 	if status == http.StatusNotFound {
