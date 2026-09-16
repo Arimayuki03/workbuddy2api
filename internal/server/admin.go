@@ -14,6 +14,7 @@
 //	PATCH /admin/tasks        {kind, enabled} 热改排程开关 + 写回 config.json（最小 diff + .bak 备份）
 //	POST  /admin/credits      实时积分（每号 1 次上游余额查询）：服务端冷却 + 单飞，超频 429
 //	GET   /admin/credits      上次查询缓存 + 冷却截止时间（纯本地，零上游）
+//	PATCH /admin/credits-interval {interval_sec} 热改冷却 + 写回 config.json（60–86400 秒）
 //	POST  /admin/shutdown     优雅停机：走 main 注入的 ctx cancel（flush state → 关 store → srv.Shutdown）
 package server
 
@@ -99,9 +100,10 @@ func (h *Handler) registerAdmin() {
 	h.mux.HandleFunc("PATCH /admin/tasks", h.withAdmin(h.adminTaskPatch))
 	h.mux.HandleFunc("GET /admin/credits", h.withAdmin(h.adminCreditsGet))
 	h.mux.HandleFunc("POST /admin/credits", h.withAdmin(h.adminCreditsRefresh))
+	h.mux.HandleFunc("PATCH /admin/credits-interval", h.withAdmin(h.adminCreditsIntervalPatch))
 	h.mux.HandleFunc("POST /admin/shutdown", h.withAdmin(h.adminShutdown))
 	log.Printf("admin API 已启用（loopback only，%d 个端点，积分查询冷却 %s）",
-		6, h.cfg.Admin.CreditRefreshMinInterval)
+		7, h.cfg.Admin.CreditRefreshMinInterval)
 }
 
 // withAdmin 在既有 Bearer 鉴权前再垫一道 loopback 闸。
@@ -290,6 +292,51 @@ func (h *Handler) adminCreditsGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, creditsView(cache, next))
 }
 
+// adminCreditsIntervalPatch 热改积分查询冷却：内存立即生效（含已在跑的冷却，
+// 下次 GET/POST /admin/credits 即按新间隔算）+ 写回 config.json（重启后保持）。
+// TrafficMonitor 插件保存"自动刷新周期"时调用——插件按服务端冷却节奏查询，
+// 冷却不同步的话插件侧周期再小也会被 429 顶回，形同虚设。
+func (h *Handler) adminCreditsIntervalPatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IntervalSec int64 `json:"interval_sec"`
+	}
+	if !decodeAdminJSON(w, r, &req) {
+		return
+	}
+	// 风控兜底闸：下限 60s。再小就逼近上游风控阈值了，宁可直接拒绝也不放开。
+	if req.IntervalSec < 60 || req.IntervalSec > 86400 {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("interval_sec=%d 超出范围（60–86400 秒）", req.IntervalSec))
+		return
+	}
+	h.cfg.Admin.CreditRefreshMinInterval = time.Duration(req.IntervalSec) * time.Second
+
+	resp := map[string]any{
+		"service":      ServiceName,
+		"interval_sec": req.IntervalSec,
+		"persisted":    false,
+	}
+	path := h.cfg.Admin.ConfigPath
+	if path == "" {
+		resp["note"] = "ConfigPath 未配置，冷却仅内存生效（重启后丢失）"
+	} else {
+		changed, err := patchConfigInt(path, "admin", "credit_refresh_min_interval_sec", req.IntervalSec)
+		switch {
+		case err != nil:
+			resp["note"] = "写回 config.json 失败，冷却仅内存生效（重启后丢失）: " + err.Error()
+			log.Printf("WARN: admin: 写回 config.json: %v", err)
+		case !changed:
+			resp["persisted"] = true
+			resp["note"] = "config.json 已是目标值，未改动"
+		default:
+			resp["persisted"] = true
+			log.Printf("admin: admin.credit_refresh_min_interval_sec=%d 已热生效并写回 %s（原文件备份 .bak）",
+				req.IntervalSec, path)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // creditsView 统一组装积分查询响应体：无缓存只回 cached=false + cooldown_until。
 func creditsView(cache *creditReport, cooldownUntil int64) map[string]any {
 	v := map[string]any{
@@ -405,10 +452,24 @@ func (h *Handler) adminShutdown(w http.ResponseWriter, _ *http.Request) {
 }
 
 // ============================================================================
-// config.json 最小 diff 布尔补丁（PATCH /admin/tasks 落盘用）
+// config.json 最小 diff 标量补丁（PATCH /admin/tasks、PATCH /admin/credits-interval 落盘用）
 // ============================================================================
 
-// patchConfigBool 把配置文件里二级对象 section.key 的布尔值原子替换（或插入），
+// patchConfigBool 把配置文件里二级对象 section.key 的布尔值原子替换（或插入）。
+func patchConfigBool(path, section, key string, val bool) (bool, error) {
+	lit := []byte("false")
+	if val {
+		lit = []byte("true")
+	}
+	return patchConfigScalar(path, section, key, lit)
+}
+
+// patchConfigInt 同 patchConfigBool，但写整数标量（splice 对任意标量字面量通用）。
+func patchConfigInt(path, section, key string, val int64) (bool, error) {
+	return patchConfigScalar(path, section, key, []byte(strconv.FormatInt(val, 10)))
+}
+
+// patchConfigScalar 把配置文件里二级对象 section.key 的标量值原子替换（或插入），
 // 其余字节原样保留——对用户的 config.json 是影响最小化：只有目标那一处变。
 //
 // 规则：
@@ -422,14 +483,10 @@ func (h *Handler) adminShutdown(w http.ResponseWriter, _ *http.Request) {
 //     原子替换（与 state.json/auths 落盘同风格）。
 //
 // 返回 changed：文件字节是否发生改动（等值提交时 false）。
-func patchConfigBool(path, section, key string, val bool) (bool, error) {
+func patchConfigScalar(path, section, key string, lit []byte) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return false, fmt.Errorf("read config: %w", err)
-	}
-	lit := []byte("false")
-	if val {
-		lit = []byte("true")
 	}
 	newRaw, changed, err := spliceBool(raw, section, key, lit)
 	if err != nil {
@@ -465,8 +522,9 @@ func patchConfigBool(path, section, key string, val bool) (bool, error) {
 	return true, nil
 }
 
-// spliceBool 用 json.Decoder token 流定位 section.key 的布尔值并做跨度替换/插入。
-// 只依赖 Token()+InputOffset()，不重建对象——键序、未知字段、数字/字符串原文全部原样。
+// spliceBool 用 json.Decoder token 流定位 section.key 的标量值并做跨度替换/插入
+//（名字沿用旧称）。只依赖 Token()+InputOffset()，不重建对象——键序、未知字段、
+// 数字/字符串原文全部原样；lit 是目标标量的 JSON 字面量（true/false/数字/字符串）。
 func spliceBool(raw []byte, section, key string, lit []byte) ([]byte, bool, error) {
 	if !json.Valid(raw) {
 		return nil, false, fmt.Errorf("config 不是合法 JSON，拒绝写回")
@@ -497,10 +555,10 @@ func spliceBool(raw []byte, section, key string, lit []byte) ([]byte, bool, erro
 			return nil, false, fmt.Errorf("扫描 config 失败: %w", err)
 		}
 		if d, ok := t.(json.Delim); ok {
-			if pending {
-				// 目标 key 的值不是布尔标量（对象/数组）——不敢猜，直接拒写。
-				return nil, false, fmt.Errorf("config 里 %s.%s 的值不是布尔量，拒绝写回", section, key)
-			}
+		if pending {
+			// 目标 key 的值不是标量（对象/数组）——不敢猜，直接拒写。
+			return nil, false, fmt.Errorf("config 里 %s.%s 的值不是标量，拒绝写回", section, key)
+		}
 			switch d {
 			case '{', '[':
 				end := dec.InputOffset()

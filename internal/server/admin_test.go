@@ -379,3 +379,108 @@ func TestAdminPatchWithoutConfigPath(t *testing.T) {
 		t.Fatalf("无路径时应如实报告未落盘：%v", v)
 	}
 }
+
+func TestAdminCreditsIntervalPatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(baseConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := adminHandler(t, "sekret", path)
+	h.cfg.Admin.CreditRefreshMinInterval = 600 * time.Second
+
+	// 范围外拒绝（下限是风控兜底闸，服务端宁拒不放）
+	rec := do(t, h, "PATCH", "/admin/credits-interval", "sekret", `{"interval_sec":30}`, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("60s 以下应 400，实得 %d body=%s", rec.Code, rec.Body)
+	}
+	rec = do(t, h, "PATCH", "/admin/credits-interval", "sekret", `{"interval_sec":100000}`, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("86400s 以上应 400，实得 %d", rec.Code)
+	}
+	// 未知字段拒收（防 typo 假成功）
+	rec = do(t, h, "PATCH", "/admin/credits-interval", "sekret", `{"interval":180}`, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("未知字段应 400，实得 %d", rec.Code)
+	}
+
+	// 正常改：内存热生效 + 落盘 + 备份
+	rec = do(t, h, "PATCH", "/admin/credits-interval", "sekret", `{"interval_sec":180}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH 应 200，实得 %d body=%s", rec.Code, rec.Body)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp["persisted"] != true || resp["interval_sec"] != float64(180) {
+		t.Fatalf("应 persisted=true 且 interval_sec=180：%v", resp)
+	}
+	if h.cfg.Admin.CreditRefreshMinInterval != 180*time.Second {
+		t.Fatalf("内存未热生效：%v", h.cfg.Admin.CreditRefreshMinInterval)
+	}
+	newRaw, _ := os.ReadFile(path)
+	var cfg map[string]any
+	if err := json.Unmarshal(newRaw, &cfg); err != nil {
+		t.Fatalf("写回后 config 应合法：%v\n%s", err, newRaw)
+	}
+	admin, ok := cfg["admin"].(map[string]any)
+	if !ok {
+		t.Fatalf("admin 段缺失或非对象：%v", cfg["admin"])
+	}
+	if got, ok := admin["credit_refresh_min_interval_sec"].(float64); !ok || got != 180 {
+		t.Fatalf("admin 段插入失败：%v", admin)
+	}
+	// 最小 diff：原顶层键序与未知字段保留
+	if i := strings.Index(string(newRaw), `"retired_region"`); i < 0 {
+		t.Fatal("未知字段丢失")
+	}
+	if strings.Index(string(newRaw), `"listen"`) > strings.Index(string(newRaw), `"schedule"`) {
+		t.Fatal("顶层键序变了")
+	}
+	// 已有 admin 段时二次 PATCH 应走替换路径（首次是插入）
+	rec = do(t, h, "PATCH", "/admin/credits-interval", "sekret", `{"interval_sec":120}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("二次 PATCH 应 200，实得 %d", rec.Code)
+	}
+	newRaw, _ = os.ReadFile(path)
+	cfg = nil
+	if err := json.Unmarshal(newRaw, &cfg); err != nil {
+		t.Fatalf("二次写回后 config 应合法：%v", err)
+	}
+	admin = cfg["admin"].(map[string]any)
+	if got, _ := admin["credit_refresh_min_interval_sec"].(float64); got != 120 {
+		t.Fatalf("替换路径失败：%v", admin)
+	}
+
+	// 改完冷却立即约束 POST /admin/credits（空池瞬时完成，锚点=开始时刻）
+	rec = do(t, h, "POST", "/admin/credits", "sekret", "", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("首次查询应 200，实得 %d", rec.Code)
+	}
+	rec = do(t, h, "POST", "/admin/credits", "sekret", "", "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("120s 冷却内再查应 429，实得 %d", rec.Code)
+	}
+
+	// 等值提交：note 注明未改动
+	rec = do(t, h, "PATCH", "/admin/credits-interval", "sekret", `{"interval_sec":120}`, "")
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if !strings.Contains(resp["note"].(string), "已是目标值") {
+		t.Fatalf("等值提交应注明未改动：%v", resp["note"])
+	}
+}
+
+func TestAdminCreditsIntervalPatchNoConfigPath(t *testing.T) {
+	h := adminHandler(t, "sekret", "") // ConfigPath 空
+	rec := do(t, h, "PATCH", "/admin/credits-interval", "sekret", `{"interval_sec":60}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 200（内存生效），实得 %d", rec.Code)
+	}
+	var v map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if v["persisted"] != false || !strings.Contains(v["note"].(string), "仅内存") {
+		t.Fatalf("无路径时应如实报告未落盘：%v", v)
+	}
+	if h.cfg.Admin.CreditRefreshMinInterval != time.Minute {
+		t.Fatalf("内存未热生效：%v", h.cfg.Admin.CreditRefreshMinInterval)
+	}
+}
