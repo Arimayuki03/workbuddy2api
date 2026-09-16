@@ -427,37 +427,45 @@ func ParseRateReset(body string) (time.Time, bool) {
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
-//     （详见 IsModelBlocked 注释）。
-//  1. 402 / hardRule —— 计费额度耗尽，最严、最不可自愈，必须最先判。
-//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
-//     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
+//     （详见 IsModelBlocked 注释；只认 400/404，429+11102 属限流语义走第 3 层）。
+//  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 //  2. sessionDeadRule —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
 //     比限流层的大范围子串更具体，具体优先于宽泛。
 //  3. accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
-//     先于 softRate/status429 判定：14017 常带 429 状态码，若落到 status==429 兜底
-//     会误归 soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
+//     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
+//     soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
-//     落到 softRateRule 层，不受影响。
-//  4. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
-//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
-//     结果同为 soft_rate，与下一层一致。
-//  5. status==429 —— body 无文案时的兜底识别。
-//  6. 404 / 5xx —— 与限流无关的常规分类。
-//  7. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//     不在此层命中，后续走 softRateRule 层，不受影响。
+//  4. status==429 —— 限流状态码兜底（本层先于 hardRule，fork-scan-absorb T-3）：
+//     429 body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+//     若 hardRule 先判会把限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约
+//     12h。状态码是比关键词更权威的信号：上游既然给了 429，就按限流语义处理
+//     （宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardRule（第 5 层）。
+//  5. hardRule —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit；429 场景已由
+//     第 4 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
+//     原始响应确认后再定）。
+//  6. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 4 层
+//     短路，结果同为 soft_rate。
+//  7. 404 / 5xx —— 与限流无关的常规分类。
+//  8. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态（WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落
 //     ErrClient → applyErrorPolicy 只换号不罚 → 连环 403（报告 §4.1 的根因）。
-//     带业务信封的 403 已被上方 1-5 层捕获（11140 request illegal →
+//     带业务信封的 403 已被上方各层捕获（11140 request illegal →
 //     ErrAccountFault 禁用语义不变），走不到本层。
-//  8. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  9. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
 	// 但可能被更宽的 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
 	// 先于 hardRule：11102 答复的 msg 是模型不存在，不含 credit/quota/积分 等计费词，
 	// 正常不会撞 hardRule，但前置判定让语义零歧义（防上游未来在 msg 里混入余额词）。
+	// 只认 400/404（见 IsModelBlocked），429+11102 落下方 status==429 层走限流语义。
 	if IsModelBlocked(status, body) {
 		return ErrModelBlocked
 	}
@@ -465,19 +473,26 @@ func Classify(status int, body string) ErrKind {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	if hardRule.hit(body, lower) {
-		return ErrHardCredit
-	}
+	// sessionDead / accountFault 先于 status==429（原顺序已如此，此处只是跟随
+	// 429 前移保持相对次序）：账号级终态等不来自愈，限流状态码不得掩盖它们
+	// （429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须 sessionDead）。
 	if sessionDeadRule.hit(body, lower) {
 		return ErrSessionDead
 	}
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault
 	}
-	if softRateRule.hit(body, lower) {
+	// status==429 先于 hardRule（fork-scan-absorb T-3，本次修复点）：限流响应 body
+	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardRule 先判会误归
+	// ErrHardCredit 硬冷却到次日 04:00。402 真余额在上层已判；非 429 的 quota
+	// 措辞仍走下方 hardRule，历史语义不变。
+	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
-	if status == http.StatusTooManyRequests {
+	if hardRule.hit(body, lower) {
+		return ErrHardCredit
+	}
+	if softRateRule.hit(body, lower) {
 		return ErrSoftRate
 	}
 	if status == http.StatusNotFound {

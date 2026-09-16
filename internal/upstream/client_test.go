@@ -78,6 +78,20 @@ func TestClassify(t *testing.T) {
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
 		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
+		// 429 + 余额措辞 → 限流语义（fork-scan-absorb T-3，本次修复点）：限流响应
+		// body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+		// hardRule 在 429 之前会误判 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。
+		// 状态码是比关键词更权威的信号：真余额耗尽走 402，非 429 的 quota 措辞
+		// 仍归 hardRule（上方 {200,"quota exceeded"} 语义不变）。
+		{429, `quota exceeded`, ErrSoftRate},
+		{429, `{"code":1,"msg":"quota exceeded, please wait"}`, ErrSoftRate},
+		{429, `insufficient credits`, ErrSoftRate},
+		{429, `{"code":1,"msg":"额度不足"}`, ErrSoftRate},
+		{429, `积分不足，请充值`, ErrSoftRate},
+		// 429 + 账号级故障码防回归（accountFault 仍先于 429 判定）：429+14017 若
+		// 落到 status==429 兜底会误归 soft_rate，账号级故障等不来自愈。
+		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
+		{429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
 		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
 		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
 		{403, ``, ErrWafBlock},
