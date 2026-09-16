@@ -43,6 +43,12 @@ const modelsDevFetchCooldown = 5 * time.Minute
 // （任务书 §2：如同模型 24h 内不重查，查不到的模型负缓存防反复打）。
 const modelsDevNegativeTTL = 24 * time.Hour
 
+// modelsDevNegativesSoftCap 负缓存 map 的软上限：规模超过它时才做一次过期条目淘汰
+// 扫描。分批摊销是为避免每次 lookup 都做 O(n) 全扫——第 4 级触发点在 /v1/models 里
+// 每个模型各调一次（handler 遍历模型列表逐条 V4），n 大时全扫会被请求数放大成 CPU
+// 开销。淘汰只针对 TTL 已过期的条目，故低于上限时不扫也不会让任何有效条目过期失效。
+const modelsDevNegativesSoftCap = 1024
+
 // modelsDevMaxBody 拉取响应体上限（文档实测 ~4.7MB，留余量；防异常大响应拖死）。
 const modelsDevMaxBody = 32 << 20
 
@@ -118,7 +124,20 @@ func (f *modelsDevFetcher) lookup(model string) (modelsDevEntry, bool) {
 	if f.negatives == nil {
 		f.negatives = make(map[string]time.Time)
 	}
-	f.negatives[model] = time.Now()
+	now := time.Now()
+	// 惰性淘汰已过期的负缓存条目：TTL 到期后 negativeFresh 本就判 false（等效不存在），
+	// 条目继续留着只是内存泄漏——models.dev 永不收录的模型名（model 由客户端任意指定）
+	// 查一次就永久驻留，而全库唯一的删除点 backfillMisses 只删「文档里查到」的模型，
+	// 永远不会回收这些条目，map 在进程生命周期内无界增长。
+	// 仅在规模超软上限时才扫一遍（摊销 O(1)，理由见 modelsDevNegativesSoftCap 注释）。
+	if len(f.negatives) > modelsDevNegativesSoftCap {
+		for m, t := range f.negatives {
+			if now.Sub(t) >= modelsDevNegativeTTL {
+				delete(f.negatives, m)
+			}
+		}
+	}
+	f.negatives[model] = now
 	return modelsDevEntry{}, false
 }
 

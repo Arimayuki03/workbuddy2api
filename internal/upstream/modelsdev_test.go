@@ -634,3 +634,54 @@ func TestEnsureDocAsyncInflightDedup(t *testing.T) {
 		t.Errorf("in-flight dedup: hits=%d want 1", hits)
 	}
 }
+
+// TestModelsDevNegativesEvictsExpired 负缓存条目必须在 24h TTL 到期后被淘汰。
+//
+// negatives 是进程级单例（modelsDev）上的 map，全库唯一删除点在 backfillMisses——
+// 且仅删「models.dev 文档里**查到**的模型」。models.dev 永远不收录的模型名
+// （model 由客户端任意指定，/v1/models 走四级链第 4 级时逐条查询）查一次就永久留在
+// map 里：条目只增不减、TTL 到期也不回收，进程生命周期内无界增长（内存泄漏）。
+//
+// 本测试：灌入远超软上限的未知模型名 → 把全部条目时间回拨到 TTL 之外（等价 24h 后
+// 这些模型仍未收录）→ 再查一次，断言过期条目被惰性淘汰、规模回落，而不是继续累积。
+func TestModelsDevNegativesEvictsExpired(t *testing.T) {
+	resetModelsDev()
+	resetModelCatalog()
+
+	// 索引就绪（doc 非 nil）+ fetched=true：ensureDocAsync 直接短路，全程零网络。
+	modelsDev.mu.Lock()
+	modelsDev.doc = map[string]modelsDevEntry{"known-model": {Context: 100000, Output: 8192}}
+	modelsDev.fetched = true
+	modelsDev.lastFetch = time.Now()
+	modelsDev.mu.Unlock()
+
+	// 灌入远超软上限的未知模型名：每一个都落负缓存（无重复键，故条数 == 探测数）。
+	const probes = modelsDevNegativesSoftCap + 200
+	for i := 0; i < probes; i++ {
+		ContextWindowListingV4("ghost-"+itoa(int64(i)), 0, nil)
+	}
+	modelsDev.mu.Lock()
+	n := len(modelsDev.negatives)
+	modelsDev.mu.Unlock()
+	if n != probes {
+		t.Fatalf("negatives=%d want %d（每个未知模型都应记一条负缓存）", n, probes)
+	}
+
+	// 把全部条目的时间回拨到 TTL 之外。
+	stale := time.Now().Add(-modelsDevNegativeTTL - time.Minute)
+	modelsDev.mu.Lock()
+	for m := range modelsDev.negatives {
+		modelsDev.negatives[m] = stale
+	}
+	modelsDev.mu.Unlock()
+
+	// 再查一个新的未知模型：应触发惰性淘汰，过期条目全部回收。
+	ContextWindowListingV4("ghost-after-ttl", 0, nil)
+	modelsDev.mu.Lock()
+	after := len(modelsDev.negatives)
+	modelsDev.mu.Unlock()
+	if after > 2 {
+		t.Errorf("过期负缓存条目未被淘汰: negatives=%d（应为 ~1；旧行为累积到 %d 且永不回收）",
+			after, probes+1)
+	}
+}
