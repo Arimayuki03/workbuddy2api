@@ -1314,8 +1314,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	}
 }
 
-// TestModelsDynamicZeroContextFallback 动态模型缺 maxInputTokens → context_length 兜底 131072，
-// 其余真实值不得被覆盖（issue 提醒：不能全表统一 131072 抹平真实 ContextLength）。
+// TestModelsDynamicZeroContextFallback 动态模型缺 maxInputTokens → context_length 走
+// 知识表/1M 兜底（context_catalog 三级查找），其余真实值不得被覆盖
+// （issue 提醒：不能全表统一抹平真实 ContextLength）。
 func TestModelsDynamicZeroContextFallback(t *testing.T) {
 	resetModelsCache()
 
@@ -1348,9 +1349,10 @@ func TestModelsDynamicZeroContextFallback(t *testing.T) {
 			real = m
 		}
 	}
-	// 缺 maxInputTokens → 兜底 131072（其余字段保持真实）。
-	if zc, _ := zero["context_length"].(float64); zc != 131072 {
-		t.Errorf("zero-ctx context_length=%v want 131072 fallback", zc)
+	// 缺 maxInputTokens → 知识表/1M 兜底（其余字段保持真实）。
+	// dyn-zero-ctx 不在知识表 → 1M；绝不再透出假 131072。
+	if zc, _ := zero["context_length"].(float64); zc != 1000000 {
+		t.Errorf("zero-ctx context_length=%v want 1000000 (unknown → 1M fallback)", zc)
 	}
 	if zo, _ := zero["max_output_tokens"].(float64); zo != 4096 {
 		t.Errorf("zero-ctx max_output_tokens=%v want 4096 (real value preserved)", zo)

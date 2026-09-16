@@ -295,12 +295,15 @@ func (h *Handler) modelList() []map[string]any {
 			"id":                "cn:" + mi.ID,
 			"object":            "model",
 			"created":           1753600000,
-			"owned_by":          "workbuddy",
-			"context_length":    mi.ContextWindow,
-			"max_output_tokens": mi.MaxTokens,
+			"owned_by": "workbuddy",
 		}
-		if mi.ContextWindow == 0 {
-			entry["context_length"] = 131072 // 兜底
+		// context_length / max_output_tokens 三级查找（upstream.context_catalog）：
+		// 上游动态值（maxInputTokens/maxOutputTokens）权威 → 知识表 →
+		// context_length 1M 兜底 / max_output_tokens 省略。上游零值不再透出假 131072
+		// （误导 Codex/ZCode 等按 context_length 提前截断、白白丢上下文）。
+		entry["context_length"] = upstream.ContextWindowListing(mi.ID, mi.ContextWindow)
+		if mo, ok := upstream.MaxOutputTokensListing(mi.ID, mi.MaxTokens); ok {
+			entry["max_output_tokens"] = mo
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
 		entry = applyModelInfoFields(entry, mi)
@@ -331,22 +334,22 @@ func (h *Handler) modelList() []map[string]any {
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			entry := map[string]any{
-				"id":             "global:" + id,
-				"object":         "model",
-				"created":        1753600000,
-				"owned_by":       "workbuddy",
-				"context_length": 131072,
+				"id":       "global:" + id,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "workbuddy",
 			}
+			// context_length / max_output_tokens 三级查找（upstream.context_catalog，
+			// 与 CN 动态分支同口径）：探测富条目真实值权威 → 知识表 → 1M 兜底/省略。
+			// 裸 ID 条目（窄表探测）也经知识表补齐，不再裸 131072。
+			var remoteCtx, remoteOut int64
 			if mi, ok := globalInfos[id]; ok {
 				entry = applyModelInfoFields(entry, mi)
-				// 富条目命中：context_length/max_output_tokens 用探测真实值替换
-				// 131072 兜底（与 CN 动态分支同口径；上游零值保留兜底）。
-				if mi.ContextWindow > 0 {
-					entry["context_length"] = mi.ContextWindow
-				}
-				if mi.MaxTokens > 0 {
-					entry["max_output_tokens"] = mi.MaxTokens
-				}
+				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
+			}
+			entry["context_length"] = upstream.ContextWindowListing(id, remoteCtx)
+			if mo, ok := upstream.MaxOutputTokensListing(id, remoteOut); ok {
+				entry["max_output_tokens"] = mo
 			}
 			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
 				entry["reasoning_supported_efforts"] = efforts
