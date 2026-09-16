@@ -763,6 +763,18 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
+// RunMinichatNow 立即执行小程序成长任务（Sequential_Tasks_1）：
+// task_runner.py ALL --yes --only Sequential_Tasks_1。
+// 仅手动触发（本地菜单专用）：不进定时排程、不占 taskKind 枚举——判据是一次
+// mini 指纹对话（写操作），每天至多点亮一次，已领/未完成的幂等判定在
+// task_runner 专段内部完成。
+func (s *Scheduler) RunMinichatNow() {
+	root := repoRoot()
+	runScript("minichat", root, [][]string{
+		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "Sequential_Tasks_1"},
+	})
+}
+
 // ============================================================================
 // /admin 热管理与观测（server 包的 /admin 端点依赖；对既有定时/CLI 行为零影响）
 // ============================================================================

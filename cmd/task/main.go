@@ -2,7 +2,7 @@
 //
 // 用法：
 //
-//	./task <kind>        # kind ∈ checkin | activity | keepalive | travel | school | cat | all
+//	./task <kind>        # kind ∈ checkin | activity | keepalive | travel | school | cat | minichat | all
 //
 // 独立进程读取工作目录 config.json + auths/，构建 pool+upstream 后直接调用
 // scheduler 的 RunXxxNow——立即执行一次与定时排程完全相同的任务体，不重启、
@@ -13,7 +13,7 @@
 // Windows 只有 "python" 时设环境变量 WB2A_PYTHON=python 覆盖。
 //
 // all 顺序：keepalive（先刷新 token，后续任务不吃过期凭证）→ checkin → travel
-// → activity → school → cat。
+// → activity → school → cat → minichat。
 package main
 
 import (
@@ -42,11 +42,11 @@ type cfgFile struct {
 	} `json:"upstream"`
 }
 
-const usage = `用法: task <checkin|activity|keepalive|travel|school|cat|all>
+const usage = `用法: task <checkin|activity|keepalive|travel|school|cat|minichat|all>
   checkin   每日签到（已签到幂等）        activity  活跃上报（N 连发+领猫联动）
   keepalive 令牌保活（按需 refresh）      school    开学季任务（python 脚本）
   travel    猫猫旅行巡检                 cat       夜猫子任务（python 脚本）
-  all       全部跑一遍（keepalive→checkin→travel→activity→school→cat）`
+  minichat  小程序成长任务（python 脚本） all       全部跑一遍（顺序见上，minichat 垫后）`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -55,7 +55,7 @@ func main() {
 	}
 	kind := strings.ToLower(os.Args[1])
 	switch kind {
-	case "checkin", "activity", "keepalive", "travel", "school", "cat", "all":
+	case "checkin", "activity", "keepalive", "travel", "school", "cat", "minichat", "all":
 	default:
 		fmt.Fprintf(os.Stderr, "未知任务 %q\n\n%s\n", kind, usage)
 		os.Exit(2)
@@ -101,7 +101,7 @@ func main() {
 	})
 
 	if kind == "all" {
-		for _, k := range []string{"keepalive", "checkin", "travel", "activity", "school", "cat"} {
+		for _, k := range []string{"keepalive", "checkin", "travel", "activity", "school", "cat", "minichat"} {
 			run(sch, k)
 		}
 		log.Printf("task all: complete")
@@ -127,6 +127,8 @@ func run(sch *scheduler.Scheduler, kind string) {
 		sch.RunSchoolNow()
 	case "cat":
 		sch.RunCatNow()
+	case "minichat":
+		sch.RunMinichatNow()
 	}
 }
 

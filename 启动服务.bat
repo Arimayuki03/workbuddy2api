@@ -9,27 +9,14 @@ if errorlevel 1 (
     goto :pause_end
 )
 
-rem ====== 首次用到工具时自动编译 ======
-if not exist "credit.exe" (
-    echo 首次运行：编译 credit 工具...
-    go build -o credit.exe ./cmd/credit
-)
-if not exist "login.exe" (
-    echo 首次运行：编译 login 工具...
-    go build -o login.exe ./cmd/login
-)
-if not exist "signin.exe" (
-    echo 首次运行：编译 signin 工具...
-    go build -o signin.exe ./cmd/signin
-)
-if not exist "trial.exe" (
-    echo 首次运行：编译 trial 工具...
-    go build -o trial.exe ./cmd/trial
-)
-if not exist "task.exe" (
-    echo 首次运行：编译 task 工具...
-    go build -o task.exe ./cmd/task
-)
+rem ====== 增量编译：go build 自带内容级缓存，源码未变时自动跳过（毫秒级） ======
+rem 拉取/合并上游更新后无需手动删 exe 强制重编译：进菜单即自动检测源码变化并重编译。
+echo 检查工具二进制（go build 缓存命中时开销可忽略）...
+call :build credit.exe ./cmd/credit
+call :build login.exe ./cmd/login
+call :build signin.exe ./cmd/signin
+call :build trial.exe ./cmd/trial
+call :build task.exe ./cmd/task
 
 :menu
 cls
@@ -78,7 +65,8 @@ echo     [3] 猫猫旅行巡检
 echo     [4] 活跃上报（N 连发 + 领猫联动）
 echo     [5] 开学季任务（python）
 echo     [6] 夜猫子任务（python）
-echo     [7] 全部按顺序跑一遍
+echo     [7] 全部按顺序跑一遍（含小程序成长，垫底执行）
+echo     [8] 小程序成长任务（python）
 echo     [q] 返回主菜单
 echo  ============================================
 echo.
@@ -90,12 +78,13 @@ if /i "%t%"=="4" (.\task.exe activity & goto :task_done)
 if /i "%t%"=="5" (.\task.exe school & goto :task_done)
 if /i "%t%"=="6" (.\task.exe cat & goto :task_done)
 if /i "%t%"=="7" (.\task.exe all & goto :task_done)
+if /i "%t%"=="8" (.\task.exe minichat & goto :task_done)
 if /i "%t%"=="q" goto :menu
 goto :task
 
 :task_done
 echo.
-echo  [提示] school/cat 需要 python：解释器名不是 python3 时先 set WB2A_PYTHON=python
+echo  [提示] school/cat/minichat 需要 python：解释器名不是 python3 时先 set WB2A_PYTHON=python
 echo  [提示] 服务日志里看不到本次执行（这是独立进程），结果直接打在上方输出中。
 echo.
 pause
@@ -224,10 +213,12 @@ timeout /t 1 /nobreak >nul 2>nul
 goto :run
 
 :run
-rem 编译服务（首次或源码更新后）
+rem 编译服务（go build 缓存命中秒级；源码更新后自动生效，无需手动删 exe）
+call :build wb2api.exe ./cmd/server
 if not exist wb2api.exe (
-    echo 首次运行：编译服务...
-    go build -o wb2api.exe ./cmd/server
+    echo  [错误] wb2api.exe 不存在且编译失败，无法启动；请检查上方编译错误。
+    pause
+    goto :menu
 )
 if not exist logs mkdir logs
 set "LOG=%~dp0logs\server.log"
@@ -287,6 +278,13 @@ if not exist "%~dp0logs\server.log" (
 echo.
 pause
 goto :menu
+
+:build
+rem %~1=目标 exe  %~2=包路径。go build 缓存命中时无实质重编译；
+rem 编译失败不会破坏旧产物（go build 失败时不写出目标文件），由调用方继续用旧版本。
+go build -o %~1 %~2
+if errorlevel 1 echo [Warning] %~1 编译失败，若已存在则继续使用旧版本。
+goto :eof
 
 :pause_end
 pause

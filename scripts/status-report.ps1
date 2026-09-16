@@ -85,8 +85,21 @@ foreach ($a in $st.accounts) {
         $stat = "$stat | 限流:$models"
     }
     Write-Output ("{0,-14} {1,-9} {2,-6} {3,11}  {4}" -f $nick, $uid, $a.realm, $a.credits, $stat)
+    # 成本台账（/status accounts[].model_costs，上游 2493532 透出）：每模型一行缩进展示。
+    # 语义：cost_per_1k=实测每千 token 单价（EMA 平滑，≤0 即实测免费）；6h 未再观测即整行
+    # 消失（陈旧价不参与选号）；无观测账号该字段缺省，整段不渲染。
+    if ($a.model_costs) {
+        foreach ($mc in $a.model_costs) {
+            $price = if ($mc.cost_per_1k -le 0) { '免费' } else { '{0:N3}' -f [double]$mc.cost_per_1k }
+            $seen = ''
+            if ($mc.last_seen) { try { $seen = ([datetime]::Parse([string]$mc.last_seen)).ToString('MM-dd HH:mm') } catch {} }
+            $samp = if ($mc.samples) { $mc.samples } else { 0 }
+            Write-Output ("      └ {0,-26} 每1k {1,-8} 样本 {2,-4} 末次观测 {3}" -f [string]$mc.model, $price, $samp, $seen)
+        }
+    }
 }
 Write-Output ""
 Write-Output "[说明] 积分(缓存)=服务池内存快照:签到批次/对话扣费时回写,task.exe 手动任务的奖励"
 Write-Output "       不会实时反映(它在独立进程里),重启服务或等下次签到批次才刷新——实时余额见菜单 1。"
 Write-Output "       cooling=冷却中 disabled=禁用 限流=模型级6004台账 sticky=粘性会话 redis=状态镜像模式"
+Write-Output "       └行=成本台账: 每1k=实测千token均价(≤0免费), 6小时无观测自动消失, 选号按便宜优先"
