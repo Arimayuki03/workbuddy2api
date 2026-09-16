@@ -587,6 +587,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// 出站前 token 预估（任务书 prompt-too-long §2 主动预防——只做「提前发现」，
+	// 绝不截断/改写用户消息）：对照模型 context 上限（model_catalog 四级查找链
+	// 口径，remote 动态值→静态表→model.json→1M 兜底）预估请求 prompt token 数。
+	//   - ≥95%：不打上游（省一次注定 400 的请求与账号配额），直接返回与上游 11115
+	//     逐字段同构的错误体（code=11115 / msg 同句式 + "(estimated)" 标注 /
+	//     requestId 本地生成 32-hex）——客户端看到的信息与上游真实打回时同构，
+	//     不发明新词汇（任务书用户修正：禁止固定词覆盖语义）。
+	//   - ≥85% 且 <95%：WARN 日志（运维可见），正常放行。
+	//   - 预估不到（无文本/坏 body）或上限未知（limit<=0）→ 放行。
+	// 动态模型值先取 remote（模型目录缓存 maxInputTokens 权威），零值走查找链
+	// （V4 第 2/3 级命中即真实值，未收录按 1M 兜底——宁可高估不低估，防误杀）。
+	if est := h.estimatePrompt(body, bareModel); est.ShouldBlock {
+		reason := upstream.BuildPromptTooLongBody(est.Estimated, est.Limit, upstream.GenRequestID32Hex())
+		log.Printf("WARN: [server] prompt too long (estimated): model=%s est=%d limit=%d ratio=%.2f -> blocked before upstream",
+			bareModel, est.Estimated, est.Limit, est.Ratio)
+		writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", reason)
+		st.status = http.StatusBadRequest
+		return
+	} else if est.ShouldWarn {
+		log.Printf("WARN: [server] prompt nearing context limit: model=%s est=%d limit=%d ratio=%.2f (passing through)",
+			bareModel, est.Estimated, est.Limit, est.Ratio)
+	}
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -718,6 +741,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 11115「prompt is too long」（任务书 prompt-too-long §1）：立即透传上游
+			// 原文回客户端，**不罚号不轮转**——上下文超限是请求的问题（换号同样超限，
+			// 白白浪费健康号的请求配额；与 WAF IP fail-fast 同哲学：确定与账号无关的
+			// 错误直接终止轮转）。applyErrorPolicy 无 ErrPromptTooLong 分支（零动作 =
+			// 不冷却/不熔断/不 NoteError），fail 只释放租约。error-passthrough 语义：
+			// message 装上游 body 原文（code/msg/requestId 原样，含真实 token 数与
+			// 上限值——任务书用户修正：上游原文是最有价值的错误信息，客户端必须看到）。
+			if kind == upstream.ErrPromptTooLong {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
+					msg = "prompt is too long"
+				}
+				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", msg)
+				st.status = http.StatusBadRequest
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -820,6 +862,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIError(w, status, code, msg)
 	st.status = status
+}
+
+// estimatePrompt 出站前 prompt token 预估（任务书 prompt-too-long §2）。
+// 上限口径与 /v1/models 的 context_length 同源（四级查找链）：动态模型目录的
+// maxInputTokens 权威，零值走 ContextWindowListingV4（静态表→model.json→1M 兜底）。
+// 动态目录**只读缓存**（cachedDynamicContextWindow）：cache miss 时**不发探测**——
+// 预估是「尽力而为」的预防层（miss 时放行，上游 11115 照常透传兜底），一次模型
+// 目录探测的网络成本远大于单请求预估收益；且冷缓存场景（刚启动/探测失败负缓存期）
+// 强行探测会把每个 chat 请求都放大成 2 次额外上游调用。
+func (h *Handler) estimatePrompt(body []byte, model string) upstream.PromptEstimateResult {
+	return upstream.EstimatePromptTokens(body, model, cachedDynamicContextWindow(model))
+}
+
+// cachedDynamicContextWindow 模型 context 上限（只读动态缓存 + 查找链兜底，零网络）：
+// 动态缓存命中且 maxInputTokens>0 → 权威值；否则 ContextWindowListingV4 的
+// remote=0 形态（静态表→model.json→1M 兜底，V4 第 2/3 级纯内存查找）。
+func cachedDynamicContextWindow(model string) int64 {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	for _, mi := range dynamicModelsCache.ids {
+		if mi.ID == model && mi.ContextWindow > 0 {
+			return mi.ContextWindow
+		}
+	}
+	return upstream.ContextWindowListingV4(model, 0, nil)
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2，报告 §6）：
@@ -951,6 +1018,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+	case upstream.ErrPromptTooLong:
+		// 11115「prompt is too long」（任务书 prompt-too-long §1）：请求的问题不是
+		// 账号的问题（同一 body 换任何号都超限）。不冷却/不熔断/不 NoteError（零动作，
+		// 同 ErrContentBlocked 待遇），且 chatCompletions 已直接透传原文返回（不轮转，
+		// 该分支只为文档完备——不指望走到换号路径）。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
