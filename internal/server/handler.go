@@ -516,6 +516,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		turnKey = session.TurnKey(body)
 	}
 
+	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
+	// 同理）。11133「模型不支持图片」指向的前提。
+	reqHasImage := hasImagePart(body)
+
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
 	defer func() {
@@ -714,7 +718,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 					msg = "content blocked by upstream content firewall"
 				}
-				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
+					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				return
 			}
@@ -728,7 +733,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)))
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
+					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				return
 			}
@@ -763,7 +769,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
+			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
+			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
+			// 组装请求上下文做判定）。
+			_ = upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+				return h.hintContext(bareModel, reqHasImage)
+			}))
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
@@ -811,8 +822,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
+	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定（11133/11135
+	// 在 hint 层自带形态判定，ErrClient 家族也能带上 hint）；本地调度类错误
+	// （无上游原文）固定 no_healthy_account hint。
+	hint := upstream.NoHealthyAccountHint()
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
+		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
 		switch ue.Kind {
 		case upstream.ErrSoftRate:
 			status = http.StatusTooManyRequests
@@ -832,7 +848,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			msg = s
 		}
 	}
-	writeOpenAIError(w, status, code, msg)
+	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 }
 
@@ -1019,4 +1035,92 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// writeOpenAIErrorHint 同 writeOpenAIError，另在 error 对象上附加
+// error.gateway_hint（hint 为空串时不带字段——未覆盖形态不编造）。
+// message 仍是上游原文透传（hint 只做并列补充，绝不替换/包装 message）。
+func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint string) {
+	if hint == "" {
+		writeOpenAIError(w, status, code, msg)
+		return
+	}
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message":      msg,
+			"type":         "api_error",
+			"code":         code,
+			"gateway_hint": hint,
+		},
+	})
+}
+
+// hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态
+// messages[].content[] {type:"image_url"}）。畸形/其他形态一律 false（hint 侧
+// 宁缺勿滥：判不出带图就不给「模型不支持图片」指向）。
+func hasImagePart(body []byte) bool {
+	var peek struct {
+		Messages []struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &peek) != nil {
+		return false
+	}
+	for _, m := range peek.Messages {
+		for _, p := range m.Content {
+			if p.Type == "image_url" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hintContext 组装 chatCompletions 的 gateway_hint 判定上下文：请求裸模型名 +
+// 是否带图 + 模型目录 supports_images 声明（目录未收录 → ModelInCatalog=false，
+// 不做「不支持」判定，防查不到误判）。仅错误路径调用（成功请求零开销）。
+//
+// 目录查询只读既有缓存快照（cachedModelsSnapshot），**不触发上游拉取**：错误路径
+// 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
+// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 1h 未
+// 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
+func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
+	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}
+	if bareModel == "" {
+		return ctx
+	}
+	for _, mi := range cachedModelsSnapshot() {
+		if mi.ID == bareModel {
+			ctx.ModelInCatalog = true
+			ctx.ModelSupportsImages = mi.SupportsImages
+			return ctx
+		}
+	}
+	return ctx
+}
+
+// cachedModelsSnapshot 只读模型目录缓存（TTL 内快照）；缓存冷/空 → nil。
+// 不发起任何上游调用（与 fetchDynamicModels 的差异点，见 hintContext 注释）。
+func cachedModelsSnapshot() []upstream.ModelInfo {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	if len(dynamicModelsCache.ids) == 0 || time.Since(dynamicModelsCache.fetched) >= dynamicModelsTTL {
+		return nil
+	}
+	return dynamicModelsCache.ids
+}
+
+// hintOf 末端错误透传的统一 hint 入口：kind + 上游原文 + 请求上下文 →
+// gateway_hint 文案（upstream.GatewayHint 单一事实来源）。uerr 为 nil 时回落
+// body 原文判定（防御路径）。transport 层错误（lastErr 非 *upstream.Error 且
+// 上游没回 body）→ 无 hint（不编造）。
+func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage bool, uerr *upstream.Error) string {
+	msg := body
+	if uerr != nil && uerr.Msg != "" {
+		msg = uerr.Msg
+	}
+	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
 }
