@@ -34,6 +34,7 @@ const (
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -57,6 +58,8 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrModelBlocked:
 		return "model_blocked"
+	case ErrWafBlock:
+		return "waf_block"
 	case ErrClient:
 		return "client"
 	default:
@@ -124,6 +127,12 @@ type Error struct {
 	Kind   ErrKind
 	Status int
 	Msg    string
+	// RetryAfter 上游明示的等待时长（Retry-After 秒 / retry-after-ms /
+	// x-ratelimit-reset 头解析，见 ParseRetryAfter）。零值 = 上游未明示，
+	// 冷却时长回落调用方计算值。挂载点选在 Error 信封（任务书 P1-2「贴合的
+	// 挂载点」）：Kind 决定「罚不罚」，RetryAfter 决定「罚多久」，同为上游
+	// 响应的一等公民，与 Kind/Status/Msg 同居信封而非另开解析层。
+	RetryAfter time.Duration
 }
 
 func (e *Error) Error() string {
@@ -294,6 +303,106 @@ func IsModelBlocked(status int, body string) bool {
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
 }
 
+// hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
+// `"code":` 或 `"msg":` 字段）。WAF 403 判定（IsWafBlocked）用「无业务信封」
+// 区分 APISIX WAF 拦截页（HTML/空体/纯文本）与上游业务层 403（带 code/msg
+// 信封，正常走既有分类）。JSON 解析不做：信封存在性只需字段名命中——
+// 畸形 JSON 但含 `"msg":` 字样仍按业务响应保守处理（宁漏判 WAF 也不误罚
+// 业务 403，后者有各自的权威分类）。
+func hasBusinessEnvelope(body string) bool {
+	return strings.Contains(body, `"code":`) || strings.Contains(body, `"msg":`)
+}
+
+// IsWafBlocked 报告 403 响应是否为 WAF 拦截形态（任务书 P0-1 判定口径）：
+// HTTP 403 且 body 无业务信封（无 `"code":`/`"msg":` JSON 字段——HTML 拦截页、
+// 空体、纯文本均命中）。带业务信封的 403（11140 request illegal / 11128 等）
+// 仍走既有分类链，不受影响。403 含 accountFault 文案的维持现状
+// （ErrAccountFault → Disable），由 Classify 的规则序保证（本函数仅作形态
+// 判定，不重复关键词逻辑）。
+func IsWafBlocked(status int, body string) bool {
+	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
+}
+
+// retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列（P1-2，对齐
+// intl CLI parseRetryAfterMs / parseRateLimitResetMs 的头族）：
+// retry-after（秒，RFC 7231）/ retry-after-ms（毫秒）/ x-ratelimit-reset
+// （epoch 秒或毫秒，取 now+ 剩余量）。大小写不敏感（http.Header.Get 已归一）。
+var retryAfterHeaderCandidates = []string{"Retry-After", "Retry-After-Ms", "X-Ratelimit-Reset"}
+
+// retryAfterSanity 解析结果的上限（超过视为上游异常值丢弃，回落本地计算），
+// 与 pool 的 softRateMax 默认 2h 同量级（上游不该明示比冷却封顶更长的等待）。
+const retryAfterSanity = 2 * time.Hour
+
+// ParseRetryAfter 从限流/拦截响应头解析上游明示的等待时长（P1-2）：
+// 依次尝试 Retry-After（整数秒）→ retry-after-ms（整数毫秒）→
+// x-ratelimit-reset（纯数字按 epoch 秒/毫秒推断，HTTP-Date 形态不支持——
+// 上游族实践发的是数字）。任一头缺失/非法/非正/超上限则尝试下一头；
+// 全部不可用返回 false（调用方回落既有计算值，绝不臆造等待时长）。
+// 语义对齐 intl CLI（parseRetryAfterMs / parseRateLimitResetMs，报告 §2.1），
+// 上游族会发这些头是其存在依据。
+func ParseRetryAfter(h http.Header) (time.Duration, bool) {
+	for _, name := range retryAfterHeaderCandidates {
+		v := strings.TrimSpace(h.Get(name))
+		if v == "" {
+			continue
+		}
+		if !isAllDigits(v) {
+			continue // 非纯数字（如 HTTP-Date）不解析，宁缺毋滥
+		}
+		n, ok := parseRetryNumber(v, name)
+		if !ok {
+			continue
+		}
+		if n <= 0 || n > retryAfterSanity {
+			continue // 非正/异常大：丢弃（回落本地计算）
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+// isAllDigits 报告 s 是否为纯数字（前置快筛，免 strconv 之后再判语义）。
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseRetryNumber 按头名口径把纯数字串折算成时长。x-ratelimit-reset 是
+// epoch 时刻而非时长：秒口径（10 位）与毫秒口径（13 位）都按「now+ 该时刻
+// 的剩余量」折算，已在过去则不可用。位数不足（8 位以下）无法判定 epoch
+// 语义的丢弃（宁缺毋滥：x-ratelimmit-reset 族实践发 epoch，短串多半是
+// 序号之类的误用头）。
+func parseRetryNumber(v, headerName string) (time.Duration, bool) {
+	// 上限 16 位防 int64 溢出（超过 epoch 毫秒的现实量级必非法）。
+	if len(v) > 16 {
+		return 0, false
+	}
+	var n int64
+	for _, r := range v {
+		n = n*10 + int64(r-'0')
+	}
+	switch headerName {
+	case "Retry-After":
+		return time.Duration(n) * time.Second, true
+	case "Retry-After-Ms":
+		return time.Duration(n) * time.Millisecond, true
+	default: // X-Ratelimit-Reset：epoch → 剩余量
+		sec := n
+		if len(v) >= 12 { // 毫秒口径（13 位）；11 位边界按秒（误判代价是多算 1000 倍）
+			sec = n / 1000
+		}
+		remain := time.Until(time.Unix(sec, 0))
+		return remain, true
+	}
+}
+
 // ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 //
@@ -336,7 +445,13 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
 //     结果同为 soft_rate，与下一层一致。
 //  5. status==429 —— body 无文案时的兜底识别。
-//  6. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
+//  6. 404 / 5xx —— 与限流无关的常规分类。
+//  7. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//     拦截形态（WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落
+//     ErrClient → applyErrorPolicy 只换号不罚 → 连环 403（报告 §4.1 的根因）。
+//     带业务信封的 403 已被上方 1-5 层捕获（11140 request illegal →
+//     ErrAccountFault 禁用语义不变），走不到本层。
+//  8. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
@@ -370,6 +485,13 @@ func Classify(status int, body string) ErrKind {
 	}
 	if status >= 500 {
 		return ErrServer
+	}
+	// WAF 403（无业务信封的拦截形态）：判在内容策略/参数错误/通用 4xx 之前——
+	// 这些层只认带文案的 body，WAF 空体/HTML 永远不会命中它们的 marker，
+	// 但落 ErrClient 兜底的代价是「只换号不罚」（报告根因），必须在兜底前分流。
+	// 带信封的 403 在上方各层已有权威分类，不受影响。
+	if IsWafBlocked(status, body) {
+		return ErrWafBlock
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
@@ -816,6 +938,13 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // ChatStreamContext 同 ChatStream，但从 ctx 派生请求 context：调用方（handler）传入
 // r.Context() 后，客户端断连/请求取消会立即中断在途上游调用、释放连接与账号在途名额，
 // 不再空转到 IdleTimeout。ctx 为 nil 时回落 Background。
+//
+// 错误路径（≥400 且非 fallback 状态码）除 (status, respBody) 外还返回**已分类的**
+// *Error（Kind 信封 + Retry-After 头解析，WAF 403 修复 P0-1/P1-2）：客户端错误
+// 分类在此一次完成，handler 不再对 body 二次 Classify（消除「上游分类一次、
+// 网关再分类一次」的双路径漂移面），Retry-After 也随信封流动。respBody 仍原样
+// 返回（错误透传语义 5755fe3：message 透传上游原文）。判定为 ErrNone 的响应
+// （理论上不存在，防御）err 为 nil，handler 按 respBody 自行兜底。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -863,7 +992,16 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
 				continue
 			}
-			return nil, resp.StatusCode, raw, nil
+			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
+			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
+			if kind == ErrNone {
+				return nil, resp.StatusCode, raw, nil
+			}
+			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+			if d, ok := ParseRetryAfter(resp.Header); ok {
+				ue.RetryAfter = d
+			}
+			return nil, resp.StatusCode, raw, ue
 		}
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
