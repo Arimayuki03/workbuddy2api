@@ -116,25 +116,37 @@ type Upstash struct {
 	done chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
 	closeOnce sync.Once
-	// pending 已提交未执行完的写计数。Close 等它归零：填槽法（占满全部写槽）
-	// 与排队写竞争槽位，赢了的 Close 会在排队写执行前返回，丢停机镜像末笔写。
-	pending sync.WaitGroup
+	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先登记 wg 再查 done，
+	// Close 先关 done 再等 wg——两侧互斥后，「Close 前提交的写必然执行」
+	// 不再依赖 goroutine 调度时序（83d18ae 原版存在窗口：排队写在 Close
+	// 关 done 之后才跑到检查点会被误丢，close_test.go:138 稳定复现）。
+	submitMu sync.Mutex
+	// wg 已提交未完成的写（Close 排空用）。
+	wg sync.WaitGroup
 }
 
 // goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
 // 必然执行（停机镜像完整性），Close 后提交的写直接丢弃（进程已在退出）。
 func (u *Upstash) goWrite(fn func()) {
 	u.closeOnceGuard()
-	// 关停判定只在提交时刻做一次（同步）：进了 pending 的写不再复查 done，
-	// 否则排队写在 done 关闭后会在"丢弃/执行"间随机分叉，Close 等待不完整。
+	u.submitMu.Lock()
+	u.wg.Add(1)
 	select {
 	case <-u.done:
+		u.submitMu.Unlock()
+		u.wg.Done() // 关停后提交的写：登记即撤销，直接丢弃
 		return
 	default:
 	}
-	u.pending.Add(1)
+	u.submitMu.Unlock()
 	go func() {
-		defer u.pending.Done()
+		defer u.wg.Done()
+		// 只阻塞抢写槽，不检查 done：此处若select done，已阻塞排队的写会在
+		// close(done) 唤醒时全部走丢弃分支（selrand5 实测 100%），「Close 前
+		// 提交的写（含排队中）必然执行」的契约被内部检查破坏——close_test.go:138
+		// 因此间歇失败（约 20%：取决于 write-1/write-2 谁先抢到唯一槽）。丢弃
+		// 语义已由提交点（submitMu 下的 done 检查）唯一承担；此处提交已冻结在
+		// wg 中，Close 的 wg.Wait 必然等到它执行完。
 		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
 		fn()
@@ -155,15 +167,18 @@ func (u *Upstash) closeOnceGuard() {
 // pool 的最后一次 Flush→SaveState 已提交，本方法保证它写完才返回。
 func (u *Upstash) Close() error {
 	u.closeOnceGuard()
+	// 先关 done 再等 wg：与 goWrite 的 submitMu 互斥后，此时「已提交的写」集合
+	// 已冻结（此后新提交的直接丢弃），wg.Wait 排空即覆盖在途 + 排队两层——
+	// 原 sem 探测法在排队写尚未跑到抢槽点时会误判已排空（83d18ae 竞态）。
+	u.submitMu.Lock()
 	u.closeOnce.Do(func() { close(u.done) })
-	// 等已提交（含排队中）的写全部执行完：pending 由 goWrite 提交时登记、fn 执行完
-	// 注销，归零即全部落地。done 只拦"Close 之后的新提交"，不碰已入队者。
-	// 兜底超时（单写上限 5s×cap，10s 富余）：卡死的写不应阻塞进程退出。
-	waitCh := make(chan struct{})
-	go func() { u.pending.Wait(); close(waitCh) }()
+	u.submitMu.Unlock()
+	done := make(chan struct{})
+	go func() { u.wg.Wait(); close(done) }()
 	select {
-	case <-waitCh:
+	case <-done:
 	case <-time.After(10 * time.Second):
+		// 兜底超时（单写上限 5s，10s 富余）：卡死的写不应阻塞进程退出。
 		log.Printf("[redisstore] WARN: Close 等待在途写超时，放弃（镜像可能未写完）")
 	}
 	return u.closeClient()
