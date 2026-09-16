@@ -718,6 +718,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
+			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
+			// 与 WAF IP fail-fast 同哲学：确定与账号无关的错误直接终止轮转）。
+			// applyErrorPolicy ErrPromptTooLong 分支零动作（不冷却/不熔断/不 NoteError，
+			// 不喂连败），fail 只释放租约。error-passthrough：message 装上游 body 原文
+			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
+			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
+			if kind == upstream.ErrPromptTooLong {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)))
+				st.status = http.StatusBadRequest
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -822,6 +836,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st.status = status
 }
 
+// promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/
+// 上限值/requestId，客户端自行排查）；空 body 兜底为可读分类短文案（不编造原文）。
+func promptTooLongMessage(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return "prompt is too long"
+	}
+	return body
+}
+
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2，报告 §6）：
 // 第 i 次轮转失败（continue 换号前）等待 backoffAfter(i)（500ms·2^i 封顶 8s，
 // ±25% 抖动），ctx 取消（客户端断连/优雅停机）返回 false——调用方立即终止轮转
@@ -861,6 +884,10 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
 //     降级重试，最终仍拦则回 400 content_blocked（防火墙文案，不含账号/错误码）。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
+//   - ErrPromptTooLong → 11115「prompt is too long」：请求的问题不是账号的问题
+//     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
+//     同 ErrContentBlocked 待遇），chatCompletions 已直接透传原文返回不轮转——
+//     该分支只为文档完备，不指望走到换号路径。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
@@ -946,6 +973,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
 		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
+	case upstream.ErrPromptTooLong:
+		// 11115「prompt is too long」：请求的问题不是账号的问题（同一 body 换任何
+		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
+		// 待遇），chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备，
+		// 不指望走到换号路径。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
