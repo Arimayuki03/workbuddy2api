@@ -141,11 +141,13 @@ func (u *Upstash) goWrite(fn func()) {
 	u.submitMu.Unlock()
 	go func() {
 		defer u.wg.Done()
-		select {
-		case <-u.done:
-			return
-		case u.sem <- struct{}{}:
-		}
+		// 只阻塞抢写槽，不检查 done：此处若select done，已阻塞排队的写会在
+		// close(done) 唤醒时全部走丢弃分支（selrand5 实测 100%），「Close 前
+		// 提交的写（含排队中）必然执行」的契约被内部检查破坏——close_test.go:138
+		// 因此间歇失败（约 20%：取决于 write-1/write-2 谁先抢到唯一槽）。丢弃
+		// 语义已由提交点（submitMu 下的 done 检查）唯一承担；此处提交已冻结在
+		// wg 中，Close 的 wg.Wait 必然等到它执行完。
+		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
 		fn()
 	}()
