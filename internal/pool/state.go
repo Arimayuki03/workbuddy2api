@@ -429,6 +429,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
+		// 成本台账（P1-anti-monopoly）：每模型一行（modelCost 内 TTL 未过期的
+		// 条目），运维据此自查「为什么总选它」；只读遍历零风险，过期即消失。
+		ModelCosts: p.modelCostsStatusLocked(e, now),
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
@@ -515,6 +518,39 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	}
 	if len(rows) == 0 {
 		return nil
+	}
+	return rows
+}
+
+// modelCostsStatusLocked 构建单账号的成本台账行，从 modelCost 遍历输出——
+// 每模型一行（单价/最近观测/样本数），仅 modelCostTTL 内的有效观测，过期即
+// 消失（与 modelCostOf 读取口径一致；与 rateLimitedModelsLocked 同构）。
+// 先排序模型名保证 /status 输出稳定（map 遍历无序）。无观测 → nil（零回归）。
+// 调用方必须已持有 p.mu。
+func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus {
+	if len(e.modelCost) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(e.modelCost))
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			continue // 过期/零值：不进台账（与选号读取侧同口径）
+		}
+		models = append(models, m)
+	}
+	if len(models) == 0 {
+		return nil
+	}
+	sort.Strings(models)
+	rows := make([]ModelCostStatus, 0, len(models))
+	for _, m := range models {
+		mc := e.modelCost[m]
+		rows = append(rows, ModelCostStatus{
+			Model:     m,
+			CostPer1k: mc.CostPer1k,
+			LastSeen:  mc.LastSeen,
+			Samples:   mc.Samples,
+		})
 	}
 	return rows
 }

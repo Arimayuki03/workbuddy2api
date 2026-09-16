@@ -264,3 +264,43 @@ func TestModelCostConcurrentWriteAndFlush(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusModelCostsLedger /status（Status.ModelCosts）透出成本台账：每模型
+// 一行（per1k/last_seen/samples），TTL 内才展示、过期即消失、无观测为 nil。
+func TestStatusModelCostsLedger(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteModelCost("u1", "free-model", 0, 1000)
+	p.NoteModelCost("u1", "paid-model", 2.0, 1000)
+	// 手工做旧一条：过期后应从台账消失。
+	p.mu.Lock()
+	mc := p.byUID["u1"].modelCost["paid-model"]
+	mc.LastSeen = time.Now().Add(-2 * modelCostTTL)
+	p.byUID["u1"].modelCost["paid-model"] = mc
+	p.mu.Unlock()
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 missing")
+	}
+	if len(st.ModelCosts) != 1 {
+		t.Fatalf("ModelCosts 行数=%d want 1（过期条目应消失）: %+v", len(st.ModelCosts), st.ModelCosts)
+	}
+	row := st.ModelCosts[0]
+	if row.Model != "free-model" {
+		t.Errorf("model=%q want free-model", row.Model)
+	}
+	if row.CostPer1k != 0 {
+		t.Errorf("cost_per_1k=%v want 0（免费）", row.CostPer1k)
+	}
+	if row.LastSeen.IsZero() || row.Samples != 1 {
+		t.Errorf("last_seen/samples 未透出: %+v", row)
+	}
+
+	// 无观测账号 → nil（零回归）。
+	p.Add(&auth.Auth{UID: "u2"})
+	st2, _ := p.Status("u2")
+	if st2.ModelCosts != nil {
+		t.Errorf("无观测账号 ModelCosts 应为 nil, got %+v", st2.ModelCosts)
+	}
+}

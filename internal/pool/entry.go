@@ -46,6 +46,12 @@ type Status struct {
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
+	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
+	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
+	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
+	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
+	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
 	Disabled          bool               `json:"disabled"`
 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	SuccessCount      int64              `json:"success_count,omitempty"`
@@ -74,6 +80,19 @@ type RateLimitedModel struct {
 	ResetAt time.Time `json:"reset_at,omitempty"`
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string `json:"reason,omitempty"`
+}
+
+// ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
+// tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
+// 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
+type ModelCostStatus struct {
+	Model string `json:"model"`
+	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
+	CostPer1k float64 `json:"cost_per_1k"`
+	// LastSeen 最近一次观测时刻（过期即从台账消失，同 modelCostTTL 口径）。
+	LastSeen time.Time `json:"last_seen"`
+	// Samples 累计观测次数（EMA 收敛度参考）。
+	Samples int `json:"samples,omitempty"`
 }
 
 type entry struct {
