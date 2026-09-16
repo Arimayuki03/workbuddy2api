@@ -1,15 +1,21 @@
 package server
 
 import (
+	"io"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // TestModelListContextLengthThreeLevelLookup CN 动态分支 context_length/max_output_tokens
 // 三级查找（context_catalog）端到端：动态值权威 → 知识表 → 1M 兜底；零值不透出假 131072。
 func TestModelListContextLengthThreeLevelLookup(t *testing.T) {
 	resetModelsCache()
+	upstream.ResetLookupChainForTest()
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, `{"code":0,"data":{"models":[
 			{"id":"dyn-full","maxInputTokens":65536,"maxOutputTokens":8192},
@@ -70,6 +76,7 @@ func TestModelListGlobalContextLengthLookup(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
+	upstream.ResetLookupChainForTest()
 
 	cf := newGlobalModelsHandlerFake(t, 200, `{"code":0,"data":{"models":[
 		{"id":"gpt-5.4","maxInputTokens":400000,"maxOutputTokens":100000}
@@ -104,6 +111,7 @@ func TestModelListGlobalNarrowContextLookup(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
+	upstream.ResetLookupChainForTest()
 
 	cf := newGlobalModelsHandlerFake(t, 200, `{"code":0,"data":["gpt-5.6-luna","narrow-unknown"]}`)
 	p := testPoolWith(
@@ -125,5 +133,79 @@ func TestModelListGlobalNarrowContextLookup(t *testing.T) {
 	}
 	if _, ok := byID["global:narrow-unknown"]["max_output_tokens"]; ok {
 		t.Error("narrow-unknown max_output_tokens must be omitted")
+	}
+}
+
+// TestModelListContextLengthLevel4Fetch 端到端四级闭环（model-json-dynamic 任务书）：
+// 动态值缺失 + 静态表未收录 + model.json 未缓存 → 第 4 级异步拉 models.dev → 值写
+// model.json → 第二次 /v1/models 命中第 3 级缓存（不再 1M 兜底）。
+func TestModelListContextLengthLevel4Fetch(t *testing.T) {
+	resetModelsCache()
+	upstream.ResetLookupChainForTest()
+
+	// fake models.dev：与 fake 上游共用同一 fake client（roundTripFunc 按路径分流，
+	// /models 走 CN 动态表，其他 URL 一律当 models.dev 文档）。
+	var modelsDevsHits int
+	up := &upstream.Client{HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := `{"p":{"models":{"future-model-x":{"limit":{"context":3000000,"output":999000}}}}}`
+		// CN 动态目录两路（/console 与 /v3/config）都返回模型表；其余（fake base 无
+		// 此外的路径，但防御性排除）之外的请求才视作 models.dev 文档。
+		if strings.Contains(r.URL.Path, "console") || strings.Contains(r.URL.Path, "/v3/") {
+			body = `{"code":0,"data":{"models":[
+				{"id":"future-model-x","maxInputTokens":0,"maxOutputTokens":0}
+			],"agents":[{"name":"cli","models":["future-model-x"]}]}}`
+		} else {
+			modelsDevsHits++
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, GlobalEnabled: false})
+
+	// 第一次：全链 miss → 1M 兜底（异步拉取已触发）。
+	var first int64
+	for _, m := range h.modelList() {
+		if m["id"] == "cn:future-model-x" {
+			first, _ = m["context_length"].(int64)
+		}
+	}
+	if first != 1000000 {
+		t.Fatalf("first lookup context_length=%d want 1000000 (async fetch, immediate 1M)", first)
+	}
+
+	// 等异步拉取回流 model.json（有界轮询）。
+	deadline := time.Now().Add(5 * time.Second)
+	second := int64(0)
+	for time.Now().Before(deadline) {
+		for _, m := range h.modelList() {
+			if m["id"] == "cn:future-model-x" {
+				second, _ = m["context_length"].(int64)
+			}
+		}
+		if second == 3000000 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if second != 3000000 {
+		t.Fatalf("second lookup context_length=%d want 3000000 (model.json hit after backfill)", second)
+	}
+	// max_output_tokens 同步回流（999000 而非省略）。
+	var out any
+	for _, m := range h.modelList() {
+		if m["id"] == "cn:future-model-x" {
+			out = m["max_output_tokens"]
+		}
+	}
+	if out != int64(999000) {
+		t.Errorf("max_output_tokens=%v want 999000 (backfilled)", out)
+	}
+	// models.dev 只拉一次（文档级缓存 + 负缓存去重）。
+	if modelsDevsHits != 1 {
+		t.Errorf("models.dev hits=%d want 1 (fetch once, doc cached)", modelsDevsHits)
 	}
 }

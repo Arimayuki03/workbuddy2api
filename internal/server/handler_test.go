@@ -24,9 +24,13 @@ import (
 // TestMain 默认关闭聊天表格日志（chatLogEnabled=false），消除 go test 期间的 stdout 噪音。
 // 断言表格行输出的测试（logging_test.go 中的 ChatLogs/LogChatRow 系列）用 withChatLog 临时开启。
 // 同时把轮转退避基数置 0（backoff.go：测试不等退避；退避界断言测试临时恢复）。
+// 另：/v1/models 四级查找链（upstream.model_catalog/modelsdev）是包级单例——
+// 复位入口与 dynamicModelsCache 同理，避免跨测试缓存污染与测试末尾异步 goroutine
+// 对 models.dev 发起真实网络请求。
 func TestMain(m *testing.M) {
 	chatLogEnabled = false
 	rotateBackoffBase = 0
+	upstream.ResetLookupChainForTest()
 	os.Exit(m.Run())
 }
 
