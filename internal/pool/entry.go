@@ -147,10 +147,11 @@ type entry struct {
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
-	// modelCost 实测扣费账本：model → 观测（运行态，不持久化）。
-	// 由每次成功请求的 usage.credit 折算而来（上游没有"按模型的用量"接口，
-	// get-user-resource 只给套餐级积分汇总，只能实测）。选号时据此把
-	// 「该模型上免费/便宜的号」排在前面。
+	// modelCost 实测扣费账本：model → 观测。由每次成功请求的 usage.credit
+	// 折算而来（上游没有"按模型的用量"接口，get-user-resource 只给套餐级积分
+	// 汇总，只能实测）。选号时据此把「该模型上免费/便宜的号」排在前面。
+	// 持久化（stateAccount.ModelCosts，P1-anti-monopoly）：重启后成本知识保留；
+	// 落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）。
 	modelCost map[string]modelCostEntry
 }
 
@@ -336,6 +337,12 @@ type stateAccount struct {
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
 	// 6004 雷区（选号撞限流号耗尽 MaxRotate → 429）。恢复时惰性过滤已过期条目。
 	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
+	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
+	// （P1-anti-monopoly）：重启后成本知识保留，限免/夜间免费的跨重启窗口不再
+	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
+	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
+	// 与运行态 modelCostEntry 字段一一对应（单一表示，内存与落盘同构不搞两套）。
+	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的 6004 独立冷却持久化记录，与运行态
@@ -346,13 +353,21 @@ type stateModelCooldown struct {
 	Reason  string    `json:"reason,omitempty"`
 }
 
+// stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
+// 字段一一对应（CostPer1k/LastSeen/Samples），落盘/恢复往返无损（EMA 值随
+// JSON 浮点原样保留，往返不引入漂移）。
+type stateModelCost struct {
+	CostPer1k float64   `json:"cost_per_1k"`
+	LastSeen  time.Time `json:"last_seen"`
+	Samples   int       `json:"samples,omitempty"`
+}
+
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
 // 单次会话，又不至于让昨天的价格决定今天的选择——过期的免费观测若永久有效，
 // 白天会把已开始收费的号继续当成免费。
 const modelCostTTL = 6 * time.Hour
 
-// modelCostEntry 运行时成本账本（独立于持久化结构，避免账本污染 state.json；
-// 成本随上游活动变化，仅内存态，重启后重新学习）。
+// modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
 type modelCostEntry struct {
 	CostPer1k float64
 	LastSeen  time.Time

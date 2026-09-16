@@ -3,10 +3,12 @@
 package pool
 
 import (
+	"log"
 	"sort"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 )
 
 // Disable 永久禁用（session 死亡 / 账号级授权封禁），需人工重登后手工恢复或文件替换。
@@ -106,8 +108,9 @@ func (p *Pool) NoteError(uid string) {
 
 // ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
 // DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
-// handler_cost_test / global_e2e_test 断言账本内容。跨包（internal/server）
-// 测试引用，迁 export_test.go 不可行（对包外不可见）。
+// handler_cost_test / global_e2e_test 断言账本内容（账本内容现经 state.json
+// 持久化，但 /status 透出走 statusOf 的只读遍历，不经本方法）。跨包
+// （internal/server）测试引用，迁 export_test.go 不可行（对包外不可见）。
 // 无观测或观测过期（modelCostTTL）时 ok=false。
 func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
 	p.mu.RLock()
@@ -130,8 +133,11 @@ func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
 // 记进去会污染账本。
 //
 // 用 EMA 平滑（alpha=0.3，约 5 次观测收敛）：单次异常值不主导选号决策。
-// 账本仅内存态——成本随上游活动（限免期/夜间免费/折扣）变化，持久化旧值
-// 反而是脏数据；重启后重新学习，代价只是前几次请求无偏好。
+// 账本持久化到 state.json（stateAccount.ModelCosts，P1-anti-monopoly）：重启后
+// 成本知识保留，限免/夜间免费的跨重启窗口不再重新付学费探测；落盘/恢复均按
+// modelCostTTL 惰性过滤——陈旧价格（时段性优惠）不跨 TTL 复活。
+// 限免结束事件：tier 0 观测（per1k≤0）被 credit>0 观测覆盖时打一条明确日志
+// （运维据此知道"免费午餐结束了"），判定在写入口做、只看覆盖前值。
 func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if uid == "" || model == "" || tokens <= 0 {
 		return
@@ -175,12 +181,20 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if !seen {
 		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
 	} else {
+		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
+		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束，
+		// EMA 混合后单价转正，下一轮选号即降 tier 2。打一条日志让运维看得见
+		// 「免费午餐结束」这一关键状态迁移。
+		if prev.CostPer1k <= 0 && per1k > 0 {
+			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+		}
 		e.modelCost[model] = modelCostEntry{
 			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
 			LastSeen:  time.Now(),
 			Samples:   prev.Samples + 1,
 		}
 	}
+	p.dirty.Store(true) // 账本已持久化（P1-anti-monopoly）：写入口统一置脏
 }
 
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。

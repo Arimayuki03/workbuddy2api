@@ -196,6 +196,29 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCooldowns = nil
 			}
 		}
+		// 恢复 modelCosts（P1-anti-monopoly）：按 modelCostTTL 惰性过滤（超 6h 的
+		// 按过期处理，回 tier 1 不复活陈旧知识）+ 非法值剔除（负 per1k / 零
+		// LastSeen 的结构破损条目不污染账本；state.json 手工脏数据防御）。
+		// 损坏更重的形态（整个文件非法 JSON）已在 load() 静默跳过，不崩溃。
+		if len(s.ModelCosts) > 0 {
+			e.modelCost = make(map[string]modelCostEntry, len(s.ModelCosts))
+			for m, smc := range s.ModelCosts {
+				if smc.LastSeen.IsZero() || smc.CostPer1k < 0 {
+					continue // 结构破损/非法值：剔除条目
+				}
+				if now.Sub(smc.LastSeen) > modelCostTTL {
+					continue // 过期：陈旧价格不复活（同落盘侧口径）
+				}
+				e.modelCost[m] = modelCostEntry{
+					CostPer1k: smc.CostPer1k,
+					LastSeen:  smc.LastSeen,
+					Samples:   smc.Samples,
+				}
+			}
+			if len(e.modelCost) == 0 {
+				e.modelCost = nil
+			}
+		}
 		p.byUID[uid] = e
 	}
 }
@@ -318,6 +341,26 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				mcs = nil
 			}
 		}
+		// 模型成本账本落盘（P1-anti-monopoly，复用既有落盘循环）：只写 LastSeen
+		// 在 modelCostTTL 内的条目（过期不写——落盘即清理，与恢复侧同口径），
+		// 避免陈旧价格跨重启复活。字段与运行态 modelCostEntry 一一对应。
+		var mcosts map[string]stateModelCost
+		if len(e.modelCost) > 0 {
+			mcosts = make(map[string]stateModelCost, len(e.modelCost))
+			for m, mc := range e.modelCost {
+				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+					continue // 已过期/零值：不落盘（惰性清理）
+				}
+				mcosts[m] = stateModelCost{
+					CostPer1k: mc.CostPer1k,
+					LastSeen:  mc.LastSeen,
+					Samples:   mc.Samples,
+				}
+			}
+			if len(mcosts) == 0 {
+				mcosts = nil
+			}
+		}
 		// 熔断器 breakerUntil + retryCount 落盘（惰性过滤：仅未过期才写出）。
 		// breakerUntil 已过期/零值时不写 breaker_until + retry_count——过期时退避
 		// 已无意义，保留 retryCount 是无用退避指数。与恢复侧过期过滤同口径。
@@ -359,6 +402,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			RetryCount:       retryCount,
 			CreditsExpiring:  e.creditsExpiring,
 			ModelCooldowns:   mcs,
+			ModelCosts:       mcosts,
 		}
 	}
 	return sf
