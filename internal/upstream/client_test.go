@@ -770,8 +770,53 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 120*time.Second {
-		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+	// 连接层加固后 New() 的缺省 ResponseHeaderTimeout=60s（详断言见
+	// TestNewTransportHardening；SSE 长流不受影响——该超时只计首包前）。
+	if htr.ResponseHeaderTimeout != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
+	}
+}
+
+// TestNewTransportHardening 连接层加固配置断言（transport.go 集中参数的回读验证）：
+// 真正禁 h2 / Dial 超时与 keepalive / TLS 握手超时 / ResponseHeaderTimeout 收紧。
+// 挂在 New() 的成品 Transport 上（而非 newTransport() 裸返回）——同一对象同时被
+// HTTP 与 ChatHTTP 持有，任何字段断言都直接对应生产出站行为。
+func TestNewTransportHardening(t *testing.T) {
+	tr, ok := New().ChatHTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type=%T", New().ChatHTTP.Transport)
+	}
+	// 1. 真正禁 h2：TLSNextProto 必须是「非 nil 且不含 h2」的空映射。
+	//    nil = 标准库注入默认 h2 映射（ForceAttemptHTTP2 陷阱，见 transport.go）。
+	if tr.TLSNextProto == nil {
+		t.Fatal("TLSNextProto must be non-nil empty map to disable HTTP/2 (nil = stdlib re-enables h2)")
+	}
+	if _, registered := tr.TLSNextProto["h2"]; registered {
+		t.Error("TLSNextProto must not register h2")
+	}
+	if len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto must be empty, got %d entries", len(tr.TLSNextProto))
+	}
+	// 2. DialContext 超时与 keepalive：无法直接回读 Dialer 字段（Transport 只存
+	//    闭包），行为由 transport_test.go 的拨号计时测试验证。
+	// 3. TLS 握手超时（现役此前缺失）。
+	if tr.TLSHandshakeTimeout != 10*time.Second {
+		t.Errorf("TLSHandshakeTimeout=%v want 10s", tr.TLSHandshakeTimeout)
+	}
+	// 4. ResponseHeaderTimeout 收紧（120s → 60s，语义：只计首包前，SSE 长流不受影响）。
+	if tr.ResponseHeaderTimeout != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", tr.ResponseHeaderTimeout)
+	}
+	// 5. 空闲连接池（既有值，从 90s 收到 30s）。
+	if tr.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout=%v want 30s", tr.IdleConnTimeout)
+	}
+	if tr.MaxIdleConns != 100 || tr.MaxIdleConnsPerHost != 20 {
+		t.Errorf("pool sizes=(%d, %d) want (100, 20)", tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
+	}
+	// 6. DisableKeepAlives 必须保持 false：与连接复用意图相反，不吸收（报告说明）。
+	if tr.DisableKeepAlives {
+		t.Error("DisableKeepAlives must stay false (keep-alive reuse is intentional)")
 	}
 }
 

@@ -606,15 +606,10 @@ type Client struct {
 	GlobalEnabled bool
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
+// New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：禁 h2 /
+// TLS 握手超时 / 短 keepalive 探测，参数见 transport.go）。
 func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
-		ResponseHeaderTimeout: 120 * time.Second,
-	}
+	tr := newTransport()
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
@@ -973,6 +968,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		if err != nil {
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固第 5 件）：
+			// 失败连接可能仍留在空闲池里，下一个请求会继续捡到它（kongjianguan
+			// 实测：仅靠 IdleConnTimeout 等过期不够，主动清池才断根）。
+			roundTripCloseIdle(c.chatHTTP().Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
