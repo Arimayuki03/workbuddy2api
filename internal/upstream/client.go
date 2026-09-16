@@ -115,16 +115,6 @@ func (r errorRule) hit(body, lower string) bool {
 	return false
 }
 
-// firstHit 返回第一条命中的 marker 原文（供「哪个词命中」的场景）；无命中返回 ""。
-func (r errorRule) firstHit(body, lower string) string {
-	for _, p := range r.patterns {
-		if matchPattern(p, r.mode, body, lower) {
-			return p
-		}
-	}
-	return ""
-}
-
 // Error 带分类的上游错误。
 type Error struct {
 	Kind   ErrKind
@@ -948,16 +938,6 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil
-}
-
-// chatPath 按 realm 返回 chat 端点路径（不含 base）：
-// global → /console/chat/completions（404/405 时由 ChatStream fallback /v2/chat/completions）；
-// cn → /v2/chat/completions（现状逐字，零回归）。
-func (c *Client) chatPath(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return globalChatConsolePath
-	}
-	return chatCompletionsPath
 }
 
 // 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
