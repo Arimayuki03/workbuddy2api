@@ -90,15 +90,14 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	}
 }
 
-// NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal，
-// 并拉高 errorEMA（成功率权重的衰减口径）。达到 breakerThreshold 触发熔断（指数
-// 退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
+// NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal
+// （仅状态展示；原成功率 EMA 已删，此处不再喂）。达到 breakerThreshold 触发熔断
+// （指数退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
 func (p *Pool) NoteError(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.errTotal++
-		e.errorEMA += (1 - e.errorEMA) * successAlpha
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
@@ -150,7 +149,7 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	// P1-A credits 签到外回写：credit 是本次请求的**消耗量**（上游 usage.credit，
 	// handler 侧 stats.Credit()/usageCreditTotal），不是剩余余额。顺手扣减 credits
-	// 与 creditsExpiring，让四因子里的两个余额因子随消耗实时收敛——旧口径只在
+	// 与 creditsExpiring，让三因子里的两个余额因子随消耗实时收敛——旧口径只在
 	// 签到（每天 09:00/21:00 两次）刷新，两次签到之间（最长 12h）高消耗号持续
 	// 高权重直到打空撞 402；global 账号不签到，credits 曾是终身冻结。
 	// 签到仍定期覆盖（ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额
@@ -198,7 +197,6 @@ func (p *Pool) NoteSuccess(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.successCount++
-		e.successEMA += (1 - e.successEMA) * successAlpha
 		e.lastSuccess = time.Now()
 		e.fails = 0
 		e.retryCount = 0

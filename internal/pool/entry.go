@@ -86,18 +86,11 @@ type entry struct {
 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
-	successCount    int64 // 累计成功
-	errTotal        int64 // 累计错误（终身累计，供状态展示与 EMA 反推；选号权重改用下方 EMA）
-	// successEMA / errorEMA 成功率的 EMA 观测（替代终身累计比率做选号权重）：
-	// 旧口径 successCount/(successCount+errTotal) 终身不衰减——历史故障永久压低
-	// 权重、长寿账号区分度收敛。EMA 让近期行为主导（成功事件拉 successEMA、错误
-	// 事件拉 errorEMA，比率 = successEMA/(successEMA+errorEMA)）。alpha=0.1
-	// （比 NoteModelCost 的 0.3 更平滑——选号权重不应被单次成败主导）。
-	// 持久化（stateAccount.SuccessEMA/ErrorEMA）；旧 state.json 缺字段时从
-	// successCount/errTotal 反推初始值（向后兼容）。
-	successEMA float64
-	errorEMA   float64
-	lastErr         time.Time // 最近一次错误时间
+	successCount    int64     // 累计成功
+	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
+	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
+	errTotal    int64         // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
+	lastErr     time.Time     // 最近一次错误时间
 	lastSuccess     time.Time // 最近一次成功时间
 	coolKind        CoolKind
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
@@ -302,17 +295,14 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring/
-	// error_ema）不用 omitempty：零值缺失会让人误以为"没记录"，实际是零值被省略。
+	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring）
+	// 不用 omitempty：零值缺失会让人误以为"没记录"，实际是零值被省略。
+	// 旧文件的 success_ema/error_ema 字段读取时被忽略（无害遗留，JSON 多余键
+	// 自然丢弃，不报错不迁移——原成功率 EMA 因子已删，见 success-ema-review §4）。
 	ErrTotal    int64     `json:"err_total"`
 	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
 	LastSuccess time.Time `json:"last_success,omitempty"`
 	LastErr     time.Time `json:"last_err,omitempty"`
-	// SuccessEMA / ErrorEMA 成功率的 EMA 观测（选号权重第 3 因子数据源，见
-	// entry.successEMA）。旧 state.json 缺字段 → 加载时从 successCount/errTotal
-	// 反推初始值（比率归一），向后兼容。
-	SuccessEMA float64 `json:"success_ema,omitempty"`
-	ErrorEMA   float64 `json:"error_ema"`
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak"`
@@ -450,8 +440,3 @@ const (
 	defaultIdleWeightPerHour = 0.5
 	defaultIdleWeightMax     = 5.0
 )
-
-// successAlpha 成功率 EMA 的平滑系数。取 0.1：比 NoteModelCost 的 0.3 更平滑——
-// 选号权重不应被单次成败主导（约 10 次观测收敛），又能让「上游修复后的连续成功」
-// 在十几次请求内把权重拉回来（旧终身累计口径下历史错误是分母的永久部分，永不可恢复）。
-const successAlpha = 0.1
