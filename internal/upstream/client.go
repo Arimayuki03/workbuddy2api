@@ -35,6 +35,7 @@ const (
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -60,6 +61,8 @@ func (k ErrKind) String() string {
 		return "model_blocked"
 	case ErrWafBlock:
 		return "waf_block"
+	case ErrPromptTooLong:
+		return "prompt_too_long"
 	case ErrClient:
 		return "client"
 	default:
@@ -212,6 +215,36 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 	"trial not activated",
 	"trial version is not yet activated",
 }}
+
+// promptTooLongRule 11115「prompt is too long」判定（任务书 prompt-too-long §1）。
+// 定位：上下文超限是**请求的问题不是账号的问题**——同一个 body 换任何账号发都会
+// 超限，与 WAF fail-fast 同哲学（确定与账号无关的错误不罚号不轮转，白白浪费健康号
+// 的请求配额）。marker 双通道：
+//   - `"code":11115`：业务信封 code 字段（JSON 空格容差，与 11102/6004 的 code 判定
+//     同形态；`"code":"11115"` 字符串形态也命中）；
+//   - "prompt is too long"：msg 文案（大小写不敏感）。
+//
+// 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
+// 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
+//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+// 上游原文可自行排查，代价可控。
+var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
+	`"code":11115`,
+	`"code":"11115"`,
+	"prompt is too long",
+}}
+
+// isPromptTooLongStatus 11115 只在请求级 4xx 上判（见 promptTooLongRule 注释）。
+func isPromptTooLongStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound ||
+		status == http.StatusRequestEntityTooLarge
+}
+
+// IsPromptTooLong 报告 status+body 是否为上游 11115「prompt is too long」答复。
+// handler 末端透传分支用（透传原文，不罚号不轮转）。
+func IsPromptTooLong(status int, body string) bool {
+	return isPromptTooLongStatus(status) && promptTooLongRule.hit(body, strings.ToLower(body))
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -452,13 +485,15 @@ func ParseRateReset(body string) (time.Time, bool) {
 //  6. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 4 层
 //     短路，结果同为 soft_rate。
-//  7. 404 / 5xx —— 与限流无关的常规分类。
-//  8. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  7. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
+//  8. 404 / 5xx —— 与限流无关的常规分类。
+//  9. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态（WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落
 //     ErrClient → applyErrorPolicy 只换号不罚 → 连环 403（报告 §4.1 的根因）。
 //     带业务信封的 403 已被上方各层捕获（11140 request illegal →
 //     ErrAccountFault 禁用语义不变），走不到本层。
-//  9. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  10. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
@@ -494,6 +529,14 @@ func Classify(status int, body string) ErrKind {
 	}
 	if softRateRule.hit(body, lower) {
 		return ErrSoftRate
+	}
+	// 11115「prompt is too long」（任务书 prompt-too-long §1）：判在 404/5xx/
+	// WAF/内容策略/参数错误/通用 4xx 之前——请求级语义最具体（上下文超限），须
+	// 先于宽泛的状态码兜底（404 兜底会误归 ErrNotFound 只冷却不透传；ErrClient
+	// 只换号，浪费健康号配额）。只认请求级 4xx 状态码（见 promptTooLongRule），
+	// 429/5xx 在上方已被各自状态码层短路（限流/服务端故障语义优先）。
+	if IsPromptTooLong(status, body) {
+		return ErrPromptTooLong
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
