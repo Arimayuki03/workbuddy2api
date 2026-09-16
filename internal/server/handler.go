@@ -77,6 +77,9 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
+	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
+	wafIP wafIPGate
 }
 
 // NewHandler 构建 handler。
@@ -711,6 +714,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
+			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义，
+			// 任务书设计纪律）：该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，
+			// IP 被拦而非账号）则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍
+			// 打同一出口 IP，加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账
+			// （单号偶发 403 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
+			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
+				break
+			}
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避，WAF P0-2）
 			}
@@ -784,6 +795,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+		case upstream.ErrWafBlock:
+			if h.wafIP.active() {
+				// IP 级拦截措辞（fail-fast 终止路径）：空 body 时给出明确可读文案——
+				// 网关出口 IP 被 WAF 拦截、轮转已止损、窗口 X 秒后自动解除。客户端
+				// 提前重试无意义（换号不换 IP）；有上游原文时原文优先（下方统一）。
+				code = "waf_ip_blocked"
+				msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
+			}
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
