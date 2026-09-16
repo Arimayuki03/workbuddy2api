@@ -33,6 +33,8 @@
     chat_5               chat_request_send                  5  （5 条独立 conversation）
     Model_chat_GLM5.2    chat_request_send(glm-5.2)         1
     black_cat            chat_request_send(glm-5.2)         3  （★夜猫窗口 23-08 CST，窗口内最多补 1 次）
+  领养链路（fork adoptBuddy：report 前置解锁 → agreement → buddy/first → claim）：
+    first_buddy         领养第一只 Buddy                       1  （+300c+8e，buddy/first 直给积分）
   桌面指纹事件链（fork autotask.go 实测吸收：POST {chat}/v2/report + desktopFingerprint 注入）：
     RichMeow_Chat       桌面对话链 6 连事件组                   1  （agent_task_created→…→chat_request_response）
     Buddy_App/_QQ       buddyapp 五连（discover→…→bind_skip）  1  （application_id: open-platform search）
@@ -56,6 +58,8 @@ linguo2625469/workbuddy2api-panel（autotask.go/desktop.go/report.go/tasks.go �
 注意
   - 不修改 task_common.py（保持纯 HTTP 工具层）；本次映射逻辑全部留在本文件。
   - claim 用真实端点验证过幂等：已领任务返回 already_claimed，不重复入账。
+  - first_buddy 走领养链路：report（前置解锁）→ agreement → buddy/first；buddy/first
+    直接发 +300c+8e，任务变 completed 后再 claim（已是 already_claimed，幂等）。
   - richmeow/buddy 走 chat 域 /v2/report + 桌面指纹（ideName=WorkBuddy/extName=workbuddy-desktop，
     machineId/sessionId 由 uid+盐 md5 稳定派生，勿每次随机）；library 走 web 域 web 指纹。
   - 日志前缀 [task_runner]，行为 action ∈ query/accept/report/claim，汇总行 task_runner done: ...
@@ -88,6 +92,8 @@ MAPPING = {
     "Model_chat_GLM5.2":      {"kind": "glmchat",    "target": 1, "src": "无(glm-5.2)"},
     # 特殊：时段敏感（夜猫窗口 23-08 CST），窗口内最多补 1 次
     "black_cat":              {"kind": "cat",        "target": 3, "src": "无(glm-5.2 夜猫)"},
+    # 领养链路（fork adoptBuddy：report 前置解锁 → agreement → buddy/first → claim）
+    "first_buddy":            {"kind": "buddyfirst", "target": 1, "src": "无(report→agreement→first)"},
     # 桌面指纹 6 连对话事件链（fork DesktopChatSequence，三账号实测点亮）
     "RichMeow_Chat":          {"kind": "richmeow",   "target": 1, "src": "无(桌面指纹对话链)"},
     # web 域 web_element_click（fork ReportWebEvent，三账号实测点亮）
@@ -426,8 +432,8 @@ def ids_for(kind, auth, need, offset=0):
         return [("", {}) for _ in range(need)]
     if kind == "richmeow":
         return [("", {}) for _ in range(need)]
-    if kind in ("buddy5", "library"):
-        # history/current 不是顺序语义：buddy5/library 是固定事件组按需补 1 次（offset 无意义）
+    if kind in ("buddy5", "library", "buddyfirst"):
+        # history/current 不是顺序语义：buddy5/library/buddyfirst 是固定事件组按需补 1 次（offset 无意义）
         return [("", {}) for _ in range(need)]
     return []
 
@@ -853,6 +859,28 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
         need = min(need, cap)
     if need <= 0:
         print(f"[task_runner] {uid8} {code}: report 无需上报（{cur}/{tgt}）")
+    elif spec["kind"] == "buddyfirst":
+        # 领养第一只 Buddy：report（前置解锁）→ agreement → buddy/first
+        # （fork adoptBuddy。buddy/first 直接发积分 +300c+8e，任务状态随之 completed；
+        #   门槛未达时服务端返回 HTTP 400 "first_buddy task not completed yet"，如实标注）。
+        st_r, sc = tc.report_activity(auth, count=1, gap=opts.gap)[0]
+        print(f"[task_runner] {uid8} {code}: report {st_r} code={sc} 前置解锁")
+        time.sleep(2.0)  # 服务端事件归账留时
+        st_a, ag = tc.do_post(auth, tc.chat_base(auth), tc.PATH_BUDDY_AGREEMENT, {"agree": True})
+        print(f"[task_runner] {uid8} {code}: buddy/agreement -> {st_a} code={(ag.get('code') if isinstance(ag, dict) else ag)}")
+        time.sleep(opts.gap)
+        st_b, bf = tc.do_post(auth, tc.chat_base(auth), tc.PATH_BUDDY_FIRST, {})
+        msg = bf.get("msg") if isinstance(bf, dict) else bf
+        data = bf.get("data") or {} if isinstance(bf, dict) else {}
+        cred = data.get("credit") or 0 if isinstance(data, dict) else 0
+        energy = data.get("energy") or 0
+        print(f"[task_runner] {uid8} {code}: buddy/first -> {st_b} {msg} credit=+{cred} energy=+{energy}")
+        # 领养直给积分即任务完成：直接计入入账汇总（后续 claim 为 already_claimed）
+        if st_b == 200 and (isinstance(bf, dict) and bf.get("code") in (0, None)):
+            stats["ok"] += 1
+            stats["credit"] += cred
+            stats["energy"] += energy
+        time.sleep(2.0)
     elif spec["kind"] == "richmeow":
         # 桌面指纹 6 连对话事件链（fork DesktopChatSequence），单组即一次完整对话
         for i in range(need):
@@ -953,7 +981,7 @@ def process_account(auth, opts, stats):
         codes = opts.only_codes
     else:
         codes = list(MAPPING)
-        # 未在映射表但存在于任务列表的（如 first_buddy）——只计数展示
+        # 未在映射表但存在于任务列表的（如 Expert_Philanthropy）——只计数展示
         for t in tasks:
             c = t.get("task_code")
             if c and c not in MAPPING:
