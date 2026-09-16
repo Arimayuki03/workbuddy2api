@@ -174,6 +174,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			lastSuccess:      s.LastSuccess,
 			softStreak:       s.SoftStreak,
 			sessionDeadFails: s.SessionDeadFails,
+			consecutiveFails: s.ConsecutiveFails,
 			creditsExpiring:  expiring,
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
@@ -181,6 +182,12 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if s.BreakerUntil != nil && !s.BreakerUntil.IsZero() && now.Before(*s.BreakerUntil) {
 			e.breakerUntil = *s.BreakerUntil
 			e.retryCount = s.RetryCount
+		}
+		// 恢复连败降权（issue #114）：degradeUntil 在未来才恢复（惰性过滤，与
+		// breakerUntil 同口径）——降权期重启不失忆。consecutiveFails 恒恢复
+		// （半开进度：重启归零会让「持续故障 + 频繁重启」组合重新学满阈值）。
+		if s.DegradeUntil != nil && !s.DegradeUntil.IsZero() && now.Before(*s.DegradeUntil) {
+			e.degradeUntil = *s.DegradeUntil
 		}
 		// 恢复 modelCooldowns，惰性过滤已过期条目（Until 在未来才恢复）。
 		// 防止重启后残留已过期的模型级冷却条目（与 pick 路径的 pruneExpiredModelCooldowns 同口径）。
@@ -333,6 +340,12 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			breakerUntil = &bu
 			retryCount = e.retryCount
 		}
+		// 连败降权 degradeUntil 落盘（同惰性过滤口径，issue #114）：仅未过期才写出。
+		var degradeUntil *time.Time
+		if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+			du := e.degradeUntil
+			degradeUntil = &du
+		}
 		// 惰性清理僵尸 reason：until 为零值或已过期时不写出 cool_kind/reason，
 		// 避免 state.json 残留「until=0001 零值 + reason=6004 model rate limit」
 		// 的不一致快照（模型级冷却不该污染账号级 coolKind/reason 域）。disabled
@@ -353,6 +366,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			LastErr:          e.lastErr,
 			SoftStreak:       e.softStreak,
 			SessionDeadFails: e.sessionDeadFails,
+			ConsecutiveFails: e.consecutiveFails,
+			DegradeUntil:     degradeUntil,
 			BreakerUntil:     breakerUntil,
 			RetryCount:       retryCount,
 			CreditsExpiring:  e.creditsExpiring,

@@ -24,6 +24,11 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
+	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
+	degradeThreshold   int
+	degradeCooldown    time.Duration
+	degradeCooldownMax time.Duration
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -64,6 +69,9 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		degradeThreshold:   defaultDegradeThreshold,
+		degradeCooldown:    defaultDegradeCooldown,
+		degradeCooldownMax: defaultDegradeCooldownMax,
 	}
 	if stateFp != "" {
 		p.load()
@@ -94,6 +102,22 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.softRateMax = d
+	}
+}
+
+// SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
+// 非正值保留原值（用默认，见 defaultDegrade*），风格同 SetBreaker/SetSoftRateMax。
+func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if threshold > 0 {
+		p.degradeThreshold = threshold
+	}
+	if cooldown > 0 {
+		p.degradeCooldown = cooldown
+	}
+	if cooldownMax > 0 {
+		p.degradeCooldownMax = cooldownMax
 	}
 }
 

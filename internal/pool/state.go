@@ -188,6 +188,8 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
+// 连败降权（issue #114）同样按「成功是恢复的最强证据」清零：consecutiveFails 归零、
+// degradeUntil 清空——成功即回池，不等降权到期（与 NoteSuccess 清 breakerUntil 同口径）。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
 // 冷却（Cooldown/reviveCoolingLocked）清除。
@@ -203,6 +205,8 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		e.consecutiveFails = 0
+		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)
 	}
 }
@@ -416,13 +420,17 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
-		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
+		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
+		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
+		Cooling: now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
 		Reason:            reason,
 		Disabled:          e.disabled,
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
 		LastSuccessTime:   e.lastSuccess,
 		LastErrTime:       e.lastErr,
+		ConsecutiveFails:  e.consecutiveFails,
+		DegradeUntil:      e.degradeUntil,
 		Until:             e.until,
 		SoftStreak:        e.softStreak,
 		InFlight:          int(e.inFlight.Load()),
@@ -435,18 +443,28 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。口径与 Cooling 判定一致：
-		// 取 until 与 breakerUntil 中更远的截止（发现 5——熔断冷却的号原实现只算
-		// until，显示"冷却中却 0 秒恢复"；BreakerUntil 虽单独透出，两口径不一致
-		// 误导排查）。两者都过期不会进入本分支（Cooling=false）。
+		// 取 until / breakerUntil / degradeUntil 中更远的截止（发现 5——熔断冷却的号
+		// 原实现只算 until，显示"冷却中却 0 秒恢复"；BreakerUntil 虽单独透出，两口径
+		// 不一致误导排查）。全部过期不会进入本分支（Cooling=false）。
 		remain := time.Until(e.until)
 		if b := time.Until(e.breakerUntil); b > remain {
 			remain = b
+		}
+		if d := time.Until(e.degradeUntil); d > remain {
+			remain = d
 		}
 		st.CoolRemaining = int64(remain.Seconds() + 0.999)
 		if st.CoolRemaining < 0 {
 			st.CoolRemaining = 0
 		}
 		st.CoolKind = e.coolKind.String()
+		// 纯降权形态（无生效的 until/熔断）时 reason 取连败文案：降权由 NoteFailures
+		// 触发，不写 until/reason（coolKind 也不是它写的），运维在 /status 需要看到
+		// "为什么非健康"。有生效冷却时以冷却 reason 为准（冷却通常语义更具体）。
+		if st.Reason == "" && now.Before(e.degradeUntil) {
+			st.Reason = degradeReason
+			st.CoolKind = "degrade"
+		}
 	}
 	return st
 }
