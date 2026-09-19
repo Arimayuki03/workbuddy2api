@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -112,6 +114,73 @@ func TestChatTransportErrorFeedsConsecutiveFailures(t *testing.T) {
 	}
 	if st.BreakerFails != 0 {
 		t.Fatalf("传输层错误不喂熔断（既有语义不回归）, fails=%d", st.BreakerFails)
+	}
+}
+
+// TestChatClientDisconnectNotCountedAsFailure（audit 修复）客户端主动断连（请求方
+// ctx 已取消）连带的上游传输错误**不计账号连败**：修复前该分支无条件 NoteFailures，
+// 粘性会话下远程客户端可借反复断连逐号打满阈值（默认 5）触发降权出池（攻击链闭环）。
+// 断连仍照常清理（释放租约/终止轮转/末端 503），仅跳过连败计数。
+func TestChatClientDisconnectNotCountedAsFailure(t *testing.T) {
+	var calls int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return nil, errors.New("context canceled") // 断连连带的上游调用中断形态
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := pool.New("")
+	p.SetDegrade(2, time.Hour, 2*time.Hour) // 阈 2：修复前两轮断连即降权出池
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	for round := 0; round < 3; round++ {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		reqCtx, cancel := context.WithCancel(req.Context())
+		req = req.WithContext(reqCtx)
+		cancel() // 模拟客户端断连：handler 处理期间请求 ctx 已结束
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("round %d: 断连仍走末端透传回 503, got %d", round, rec.Code)
+		}
+	}
+	if calls != 3 {
+		t.Fatalf("每轮应打满一次上游调用, calls=%d", calls)
+	}
+	st, _ := p.Status("u1")
+	if st.ConsecutiveFails != 0 {
+		t.Fatalf("客户端断连不应计连败, consecutive_fails=%d", st.ConsecutiveFails)
+	}
+	if uids := p.AvailableUIDs(); len(uids) != 1 {
+		t.Fatalf("断连不应把账号打出池, available=%v", uids)
+	}
+}
+
+// TestIsClientDisconnect 断连判据单元测试：请求方 ctx 已结束 / 错误链携带
+// context.Canceled 命中；上游自身超时（DeadlineExceeded，http.Client.Timeout 形态）
+// 与普通传输错误不命中——不误过滤真上游故障（照常计连败）。
+func TestIsClientDisconnect(t *testing.T) {
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"request ctx cancelled (client disconnect)", cancelledCtx, errors.New("boom"), true},
+		{"error wraps context.Canceled, ctx alive", context.Background(), fmt.Errorf("do: %w", context.Canceled), true},
+		{"upstream timeout (deadline exceeded)", context.Background(), context.DeadlineExceeded, false},
+		{"plain transport error, ctx alive", context.Background(), errors.New("dial tcp: connection refused"), false},
+	}
+	for _, tc := range cases {
+		if got := isClientDisconnect(tc.ctx, tc.err); got != tc.want {
+			t.Errorf("%s: isClientDisconnect=%v want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

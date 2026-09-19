@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -134,6 +135,89 @@ func TestChatConversationIDPassthrough(t *testing.T) {
 	}
 	if got := captured.Get("X-Conversation-Request-ID"); got == "" {
 		t.Error("X-Conversation-Request-ID missing")
+	}
+}
+
+// outboundConversationID 发一次带 conversationId 的成功请求并返回出站
+// X-Conversation-ID（供 conversationId 校验用例复用）。
+func outboundConversationID(t *testing.T, cid string) string {
+	t.Helper()
+	raw, err := json.Marshal(cid) // 控制字符等非法值经 JSON 转义后仍可进 body
+	if err != nil {
+		t.Fatalf("marshal cid: %v", err)
+	}
+	var captured http.Header
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			captured = r.Header.Clone()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	body := `{"model":"glm-5.2","stream":true,"messages":[],"conversationId":` + string(raw) + `}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if captured == nil {
+		t.Fatal("no outbound request captured")
+	}
+	return captured.Get("X-Conversation-ID")
+}
+
+// TestChatInvalidConversationIDReplacedWithGenerated（audit 修复）：客户端提供的
+// conversationId 非法（控制字符/超长/空白/非 ASCII）时丢弃原值、改用服务端生成的
+// 32 hex ID——非法值写传输头会被 stdlib 拒绝（invalid header field），单请求最多
+// 污染 MaxRotate 个账号的出站尝试。服务端生成 ID 格式以 session/ids.go 既有形态为准。
+func TestChatInvalidConversationIDReplacedWithGenerated(t *testing.T) {
+	cases := []struct {
+		name string
+		cid  string
+	}{
+		{"control char", "conv\x01id"},
+		{"newline", "conv\nid"},
+		{"too long (65)", strings.Repeat("a", 65)},
+		{"space", "conv id"},
+		{"non-ascii", "会话一"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := outboundConversationID(t, tc.cid)
+			if got == tc.cid {
+				t.Errorf("非法 conversationId 应被丢弃，不应原值出站: %q", got)
+			}
+			if len(got) != 32 || !isValidB3Trace(got) {
+				t.Errorf("应改用服务端生成的 32 hex ID, got %q", got)
+			}
+		})
+	}
+}
+
+// TestChatConversationIDValidBoundaryPassthrough 合法边界值仍原样透传：64 位长度
+// 上限内、白名单字符（字母/数字/-/_），不替换不重建。
+func TestChatConversationIDValidBoundaryPassthrough(t *testing.T) {
+	cases := []struct {
+		name string
+		cid  string
+	}{
+		{"64-char boundary", strings.Repeat("a", 64)},
+		{"dash underscore digits", "ab-CD_01"},
+		{"hex 32 (server-generated shape)", "0123456789abcdef0123456789abcdef"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := outboundConversationID(t, tc.cid); got != tc.cid {
+				t.Errorf("X-Conversation-ID=%q want %q (合法值透传)", got, tc.cid)
+			}
+		})
 	}
 }
 

@@ -137,10 +137,12 @@ flowchart LR
 ```bash
 git clone https://github.com/Sliverkiss/workbuddy2api.git
 cd workbuddy2api
-cp config.example.json config.json
+mkdir -p config && cp config.example.json config/config.json
 ```
 
-编辑 `config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置）。示例中的 `test_key` 等均为占位符，`config.example.json` 不含任何真实密钥。
+编辑 `config/config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置；开启 `admin.enabled` 时 `api_key` 必填，缺失会在启动时 fail-fast 报错退出）。示例中的 `test_key` 等均为占位符，`config.example.json` 不含任何真实密钥。
+
+> **配置目录挂载（2026-09 起）**：compose 将 config 从单文件挂载改为目录挂载（`./config:/app/config`）——admin 热改写回走 tmp+rename，单文件 bind mount 的 rename 会被内核 EBUSY 拒绝（去掉 `:ro` 也一样），目录内 rename 才可行。旧部署迁移：`mkdir config && mv config.json config/ && chown -R 10001:10001 ./config`；容器内脚本（login.sh / checkin.sh）经 `WB2A_CONFIG` 环境变量读取新路径，无需额外操作。
 
 ```bash
 # 登录添加账号（重复执行可加多号）
@@ -235,6 +237,15 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 不得共享、转售、违规分发，或用于违反目标平台条款的用途
 - 遵守 CodeBuddy 平台服务条款与所在地法律
 - 妥善保管 `auths/`（明文凭证）与网关端口
+
+### 安全加固与缺陷修复记录（2026-09）
+
+依据三份审查报告的交叉验证结论完成一轮集中修复（`go build` / `go vet` / `go test ./... -count=1` 全绿，并发相关包 `go test -race` 通过）：
+
+- **鉴权与并发** — 账号 token 读取补齐锁内访问器（消除撕裂读风险）；admin 冷却间隔读写、config.json 最小 diff 写回（`patchConfigScalar`）补上互斥；`/admin/credits` 串行刷新感知客户端断连提前收尾；启动校验 `admin.enabled=true → api_key` 必填（缺失即拒绝启动）
+- **正确性** — `signin` 提前刷新窗口从 7.2µs 修正为 2 小时；池状态落盘失败回挂 dirty 恢复重试信号；非流式聚合不再吞上游流内错误帧（原先返回 200 + 空 content + 伪造 `finish_reason:"stop"`）；DST 时区"昨日"日期修正（先归一 CST 再减日）；`Retry-After` 数值溢出回绕守卫；`logfmt.Truncate` 负长度防御；连败降权的模型豁免补上 degrade 轴判定（消除 `/healthz` 200 但全模型 503 的口径分裂）
+- **可用性与安全** — 客户端断连不再计入账号连败（消除粘性会话下远程逐号降权的攻击链）；`12153` 会话失效判定收紧为结构化 code 匹配（消除 requestId / 时间戳撞串误禁号）；客户端可控 `conversationId` 加长度 + 字符集白名单（非法值回退服务端生成）；Redis 连接失败日志对 URL 脱敏（不再泄漏含 token 的完整连接串）
+- **部署与仓库卫生** — Docker config 改目录挂载（修复 admin 热改写回必败的部署矛盾）；`.dockerignore` 补齐 `*.exe` / `logs/` / `config.json.bak*` / `.claude/`；`.gitignore` 补 `.claude/`；`cmd/task` / `cmd/activity` 补池关闭兜底、`cmd/task` 接线快过期积分窗口
 
 ## 免责声明
 

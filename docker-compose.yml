@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
+      # 容器内脚本（login.sh / checkin.sh）按此路径读配置——config 已改目录挂载，
+      # cwd 下的 /app/config.json 只是镜像内 example 兜底，不含真实 api_key
+      - WB2A_CONFIG=/app/config/config.json
     ports:
       - "7863:7863"
     volumes:
@@ -21,4 +24,20 @@ services:
       # 若容器内 app(uid 10001) 写 state.json 报 permission denied，宿主机执行：
       #   chown -R 10001:10001 ./data
       - ./data:/app/data
-      - ./config.json:/app/config.json:ro
+      # config 必须挂「目录」而非单文件 bind mount：admin 热改写回 config 走
+      # tmp+rename，单文件 bind mount 的目标是挂载点文件本身，rename 会被内核
+      # EBUSY 拒绝（挂载点检查）——即使去掉 :ro 也一样，表现为响应 200 +
+      # persisted:false + 容器内留新鲜 .bak、重启即回滚；目录内 rename 才可行。
+      # 旧部署迁移（宿主机执行，与 ./auths、./data 卷同口径交属主）：
+      #   mkdir config && mv config.json config/
+      #   chown -R 10001:10001 ./config
+      # 全新部署：本路径下镜像内 /app/config.json 的 example 兜底不再生效，
+      # 先复制初始配置：
+      #   cp config.example.json config/config.json
+      - ./config:/app/config
+    # 镜像 ENTRYPOINT 是 ["/app/wb2api", "-config", "/app/config.json"]，而 compose
+    # 的 command 会追加到镜像 ENTRYPOINT 参数之后——只写 command 会出现
+    # "-config /app/config.json -config /app/config/config.json" 双参。必须连
+    # entrypoint 一起覆盖再指定新路径：
+    entrypoint: ["/app/wb2api"]
+    command: ["-config", "/app/config/config.json"]

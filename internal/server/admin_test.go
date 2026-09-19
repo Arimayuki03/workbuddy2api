@@ -4,15 +4,19 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/upstream"
@@ -482,5 +486,196 @@ func TestAdminCreditsIntervalPatchNoConfigPath(t *testing.T) {
 	}
 	if h.cfg.Admin.CreditRefreshMinInterval != time.Minute {
 		t.Fatalf("内存未热生效：%v", h.cfg.Admin.CreditRefreshMinInterval)
+	}
+}
+
+// ============================================================================
+// 审计修复回归：patchConfigScalar 跨请求互斥、credits 刷新感知请求 ctx
+// ============================================================================
+
+// TestPatchConfigScalarConcurrent 并发补丁同一 config.json 的两个不同 key：
+// 读-改-写被包级锁串行化后两个补丁都必须落盘。修复前后写者基于旧字节 splice，
+// 先写的补丁被覆盖丢失。多轮重复提高覆盖率。
+func TestPatchConfigScalarConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	for round := 0; round < 10; round++ {
+		if err := os.WriteFile(path, []byte(baseConfig), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var errBool, errInt error
+		go func() {
+			defer wg.Done()
+			_, errBool = patchConfigBool(path, "schedule", "checkin_enabled", false)
+		}()
+		go func() {
+			defer wg.Done()
+			_, errInt = patchConfigInt(path, "upstream", "timeout_seconds", 90)
+		}()
+		wg.Wait()
+		if errBool != nil || errInt != nil {
+			t.Fatalf("round %d：补丁报错 bool=%v int=%v", round, errBool, errInt)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !json.Valid(raw) {
+			t.Fatalf("round %d：并发写回后 JSON 非法：%s", round, raw)
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		sch, _ := cfg["schedule"].(map[string]any)
+		up, _ := cfg["upstream"].(map[string]any)
+		if sch == nil || sch["checkin_enabled"] != false ||
+			up == nil || up["timeout_seconds"] != float64(90) {
+			t.Fatalf("round %d：并发补丁有丢失：schedule=%v upstream=%v", round, sch, up)
+		}
+	}
+}
+
+// TestAdminPatchConcurrentBothPersisted 端到端：两个 PATCH /admin/tasks 并发到达，
+// 都必须 200 + persisted=true，且 config.json 同时含两处改动（不丢补丁）。
+func TestAdminPatchConcurrentBothPersisted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(baseConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := adminHandler(t, "sekret", path)
+
+	type result struct {
+		code int
+		body string
+	}
+	results := make(chan result, 2)
+	kinds := []string{"checkin", "keepalive"}
+	for _, kind := range kinds {
+		go func(kind string) {
+			req := httptest.NewRequest("PATCH", "/admin/tasks",
+				strings.NewReader(`{"kind":"`+kind+`","enabled":false}`))
+			req.RemoteAddr = "127.0.0.1:54321"
+			req.Header.Set("Authorization", "Bearer sekret")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			results <- result{rec.Code, rec.Body.String()}
+		}(kind)
+	}
+	for range kinds {
+		r := <-results
+		if r.code != http.StatusOK {
+			t.Fatalf("并发 PATCH 应都 200，实得 %d body=%s", r.code, r.body)
+		}
+		if !strings.Contains(r.body, `"persisted":true`) {
+			t.Fatalf("并发 PATCH 应都 persisted=true：%s", r.body)
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("并发写回后 config 应合法：%v\n%s", err, raw)
+	}
+	sch, _ := cfg["schedule"].(map[string]any)
+	if sch == nil || sch["checkin_enabled"] != false || sch["keepalive_enabled"] != false {
+		t.Fatalf("并发补丁有丢失：%v", sch)
+	}
+}
+
+// adminCreditsCtxReq 造一个带指定 ctx 的 POST /admin/credits 请求（本机语义 + 鉴权）。
+func adminCreditsCtxReq(ctx context.Context) *http.Request {
+	req := httptest.NewRequest("POST", "/admin/credits", strings.NewReader(""))
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("Authorization", "Bearer sekret")
+	return req.WithContext(ctx)
+}
+
+// TestAdminCreditsRefreshClientGoneAbortsEarly 请求 ctx 已取消：一个账号都不查，
+// 响应如实标注 aborted/completed/total_accounts/note；部分回执不覆盖 creditCache。
+func TestAdminCreditsRefreshClientGoneAbortsEarly(t *testing.T) {
+	h := adminHandler(t, "sekret", "")
+	h.cfg.Pool.Add(&auth.Auth{UID: "u1"})
+	h.cfg.Pool.Add(&auth.Auth{UID: "u2"}) // 无 AccessToken：即使执行也只走 no credentials 分支
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, adminCreditsCtxReq(ctx))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("断开收尾应仍回 200，实得 %d body=%s", rec.Code, rec.Body)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v["aborted"] != true || v["completed"] != float64(0) || v["total_accounts"] != float64(2) {
+		t.Fatalf("aborted 响应字段异常：%v", v)
+	}
+	if note, _ := v["note"].(string); !strings.Contains(note, "断开") {
+		t.Fatalf("note 未说明客户端断开：%v", v["note"])
+	}
+	// 部分回执不入缓存：GET /admin/credits 仍 cached=false
+	rec = do(t, h, "GET", "/admin/credits", "sekret", "", "")
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if v["cached"] != false {
+		t.Fatalf("部分回执不该进缓存：%v", v["cached"])
+	}
+}
+
+// rtStub 上游桩 Transport：忽略真实网络，按 fn 造响应（模仿 upstream 包内测试的 rtFunc）。
+type rtStub func(*http.Request) (*http.Response, error)
+
+func (f rtStub) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func jsonStubResp(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+// TestAdminCreditsRefreshCancelDuringPacing 账号间 200ms 限速等待可被 ctx 打断：
+// u1 上游查询（桩）已放行后立即取消 ctx，u2 不再查询——响应 aborted 且 completed=1。
+func TestAdminCreditsRefreshCancelDuringPacing(t *testing.T) {
+	var calledOnce sync.Once
+	called := make(chan struct{})
+	up := upstream.New()
+	up.HTTP = &http.Client{Timeout: 10 * time.Second, Transport: rtStub(
+		func(_ *http.Request) (*http.Response, error) {
+			calledOnce.Do(func() { close(called) })
+			return jsonStubResp(`{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
+		})}
+	h := adminHandler(t, "sekret", "")
+	h.cfg.Upstream = up
+	h.cfg.Pool.Add(&auth.Auth{UID: "u1", AccessToken: "at"})
+	h.cfg.Pool.Add(&auth.Auth{UID: "u2", AccessToken: "at"}) // 不应被查询
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-called
+		cancel() // u1 桩已放行、u2 尚未开始的限速窗口内触发
+	}()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, adminCreditsCtxReq(ctx))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("断开收尾应仍回 200，实得 %d body=%s", rec.Code, rec.Body)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v["aborted"] != true || v["completed"] != float64(1) || v["total_accounts"] != float64(2) {
+		t.Fatalf("限速窗口内取消应 aborted 且 completed=1：%v", v)
 	}
 }

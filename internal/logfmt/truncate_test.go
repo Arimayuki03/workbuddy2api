@@ -74,3 +74,36 @@ func TestTruncateASCIIStableForExactByte(t *testing.T) {
 		t.Errorf("Truncate(中×5, 9)=%q want 中×3（9=3 个 rune 的字节边界）", got)
 	}
 }
+
+// TestTruncateNonPositiveReturnsEmpty n<=0 契约：负数与 0 都返回空串（文档注释
+// 自述行为；实现曾缺守卫——`len(s) > n` 对负数恒成立、内层 `for n > 0` 不进循环体，
+// 落到 `return s[:n]` → s[:负数] panic: slice bounds out of range）。空串输入也
+// 覆盖——空串 + 负数同样命中 len(s) > n 分支（0 > -1 成立）。正数路径不受守卫
+// 影响；n<3 时 CJK 回退到 0 字节返回空串是 rune 回退的既有文档化行为，非本组
+// 用例目标，不作断言改动。
+func TestTruncateNonPositiveReturnsEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		s    string
+		n    int
+	}{
+		{"negative n on ascii", "hello", -1},
+		{"negative n on cjk", "将在 24 小时后重置限额", -5},
+		{"negative n on empty", "", -1},
+		{"zero n on ascii", "hello", 0},
+		{"zero n on cjk", "重置限额", 0},
+		{"zero n on empty", "", 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange — tc.s / tc.n
+			// Act
+			got := Truncate(tc.s, tc.n)
+
+			// Assert
+			if got != "" {
+				t.Errorf("Truncate(%q, %d)=%q want 空串（n<=0 返回空串，绝不 panic）", tc.s, tc.n, got)
+			}
+		})
+	}
+}

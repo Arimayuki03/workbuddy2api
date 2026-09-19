@@ -297,7 +297,12 @@ func (p *Pool) saveLocked() {
 // 修复建议（chown 或改用 named volume）；随后每 persistLogEvery 次再复报一条，避免刷屏。
 // 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
 // "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
+//
+// 回挂 dirty：调用方（flusher/Flush）都是先 dirty.Swap(false) 再 saveLocked，失败若不
+// 回挂，本轮变更的重试信号就丢了（下轮 tick 看到 clean 直接跳过）。置回 true 让下一轮
+// flusher tick 必然重试；saveLocked 是全量内存快照语义，重复写安全。
 func (p *Pool) notePersistFail(err error) {
+	p.dirty.Store(true)
 	if p.persistFails == 0 {
 		log.Printf("WARN: [pool] state.json 落盘失败（首次详报）: path=%s err=%v %s",
 			p.stateFp, err, persistFailDiag(p.stateFp))

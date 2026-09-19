@@ -36,9 +36,9 @@ import (
 // cfgFile 只取本工具需要的字段；Schedule 段直接用 internal/config.Schedule
 // （与 cmd/server 同源），其余段保持精简内联。
 type cfgFile struct {
-	AuthDir   string            `json:"auth_dir"`
-	StateFile string            `json:"state_file"`
-	Schedule  config.Schedule   `json:"schedule"`
+	AuthDir   string          `json:"auth_dir"`
+	StateFile string          `json:"state_file"`
+	Schedule  config.Schedule `json:"schedule"`
 	Upstream  struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
@@ -77,6 +77,7 @@ func main() {
 		log.Fatalf("load auths: %v", err)
 	}
 	p := pool.New(c.StateFile)
+	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（与 cmd/server 同约定）
 	if uidPrefix != "" {
 		// 单号模式：不做 SyncToDir（它会按筛选结果剔除池内其余账号并落盘，
 		// 污染共享 state.json）。只 Add 命中账号——池内其余账号不受影响，
@@ -103,7 +104,7 @@ func main() {
 		CheckinHours:        c.Schedule.CheckinHours,
 		TravelHours:         c.Schedule.TravelHours,
 		ActivityHours:       c.Schedule.ActivityHours,
-		KeepaliveHours:       c.Schedule.KeepaliveHours,
+		KeepaliveHours:      c.Schedule.KeepaliveHours,
 		ActivityReportCount: c.Schedule.ActivityReportCount,
 	})
 	sch.RunActivityNow()

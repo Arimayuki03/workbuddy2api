@@ -10,7 +10,11 @@ package redisstore
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,7 +67,11 @@ func New(url, token string) Store {
 	full := normalizeURL(url, token)
 	opt, err := redis.ParseURL(full)
 	if err != nil {
-		log.Printf("[redisstore] 警告: redis 连接串解析失败 (%v)，降级 Noop", err)
+		// 审计发现：ParseURL 失败的错误文本（net/url 的 *url.Error 以 %q 内嵌原文）
+		// 携带完整连接串（含 default:<token>@ 凭证），直接打 err 会把凭证泄进日志。
+		// 因此这里只打印 redactURL 后的形态 + 剔过原文的简短原因，绝不打 err 全文。
+		log.Printf("[redisstore] 警告: redis 连接串解析失败 (url=%s, 原因: %s)，降级 Noop",
+			redactURL(full), parseErrReason(err, full))
 		return Noop{}
 	}
 	opt.ReadTimeout = readTimeout
@@ -99,6 +107,76 @@ func normalizeURL(url, token string) string {
 		host = host[i+3:]
 	}
 	return "rediss://default:" + token + "@" + host + ":6379"
+}
+
+// redactURL 把连接串裁剪为可安全打印的形态——任何情况下不返回 userinfo/token：
+//   - 可解析且 scheme+host 齐全：scheme://[***@]host[:port][?k=***&k2=***]。
+//     userinfo 整体换成 ***@；query 值全部 ***（password/token 类参数是主要威胁，
+//     不做白名单、一律打码）；path/fragment 整体丢弃（Upstash REST 风格地址的
+//     token 偶尔藏在路径里，保留无调试收益、有泄漏风险）。
+//   - 其余（畸形到解析失败 / 缺 scheme / 缺 host）：只保留合法 scheme 前缀
+//     （scheme 字符集内不可能有凭证），连 scheme 都拼不出时整体 "<redacted>"。
+func redactURL(raw string) string {
+	if raw == "" {
+		return "<redacted>"
+	}
+	if u, err := url.Parse(raw); err == nil && u.Scheme != "" && u.Host != "" {
+		out := u.Scheme + "://"
+		if u.User != nil {
+			out += "***@"
+		}
+		out += u.Host
+		if len(u.RawQuery) > 0 {
+			keys := make([]string, 0, 4)
+			for k := range u.Query() {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys) // map 无序，排序保证日志确定性
+			parts := make([]string, 0, len(keys))
+			for _, k := range keys {
+				parts = append(parts, k+"=***")
+			}
+			out += "?" + strings.Join(parts, "&")
+		}
+		return out
+	}
+	if i := strings.Index(raw, "://"); i > 0 && isScheme(raw[:i]) {
+		return raw[:i] + "://<redacted>"
+	}
+	return "<redacted>"
+}
+
+// isScheme 判断 s 是否为 RFC 3986 scheme（ALPHA 开头，后接 ALPHA/DIGIT/+-.）。
+// 用于畸形串兜底：只有确认是 scheme 才放进日志，防凭证串误当 scheme 打出。
+func isScheme(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// parseErrReason 从 ParseURL 错误中提取可安全打印的简短原因（不含原始 URL）。
+//   - *url.Error（net/url 解析失败）：其 Error() 以 %q 内嵌原始连接串，只取底层
+//     原因短语（"missing protocol scheme"、"invalid character \" \" in host name"
+//     等 net/url 固定文案）。
+//   - 其他错误（go-redis 自造，如 invalid URL scheme）：全文剔除原始 URL 的
+//     原样与 %q 引号两种形态后再用。
+func parseErrReason(err error, rawURL string) string {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err.Error()
+	}
+	msg := err.Error()
+	if q := strconv.Quote(rawURL); q != rawURL {
+		msg = strings.ReplaceAll(msg, q, `"***"`)
+	}
+	return strings.ReplaceAll(msg, rawURL, "***")
 }
 
 // Upstash 真实现：redis.Client 封装。

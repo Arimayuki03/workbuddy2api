@@ -40,7 +40,18 @@ type cfgFile struct {
 	Upstream  struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
+	// Pool 只取 expiring_soon 一个字段（与 cmd/server config 的 pool.expiring_soon
+	// 同名同义）：签到分桶查余额的快过期窗口，见 scheduler.Config.ExpiringSoonWindow。
+	// 其余 pool 段字段（冷却/熔断/降权参数等）是常驻服务的选号运行态，一次性
+	// 任务进程不消费。
+	Pool struct {
+		ExpiringSoon string `json:"expiring_soon"`
+	} `json:"pool"`
 }
+
+// defaultExpiringSoon 快过期窗口默认值，与 cmd/server/config.go Default() 的
+// pool.expiring_soon 同源同值（168h）：config 缺该字段时 task 与 server 行为一致。
+const defaultExpiringSoon = "168h"
 
 const usage = `用法: task <checkin|activity|keepalive|travel|school|cat|minichat|all>
   checkin   每日签到（已签到幂等）        activity  活跃上报（N 连发+领猫联动）
@@ -79,6 +90,22 @@ func main() {
 		c.StateFile = "data/state.json"
 	}
 
+	// 快过期窗口接线（与 server 侧同构，语义对齐 cmd/server/config.go normalize）：
+	// 空值回落默认 168h；显式 "0" = 禁用分桶；负值钳 0（避免 upstream 判定窗口反转）。
+	// 漏接的后果：RunCheckinNow 经 UserResourceDetailed(a, 0) 分桶退化，SetCreditsDetailed
+	// 把 creditsExpiring 桶清零，"快过期先用"权重（×8）归零，直到 server 下次定时签到才恢复。
+	expiringSoon := defaultExpiringSoon
+	if c.Pool.ExpiringSoon != "" {
+		expiringSoon = c.Pool.ExpiringSoon
+	}
+	expiringSoonWindow, err := time.ParseDuration(expiringSoon)
+	if err != nil {
+		log.Fatalf("parse pool.expiring_soon: %v", err)
+	}
+	if expiringSoonWindow < 0 {
+		expiringSoonWindow = 0
+	}
+
 	auths, err := auth.LoadDir(c.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
@@ -86,6 +113,7 @@ func main() {
 	log.Printf("task %s: loaded %d account(s)", kind, len(auths))
 
 	p := pool.New(c.StateFile)
+	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（与 cmd/server 同约定）
 	p.SyncToDir(auths)
 
 	sch := scheduler.New(scheduler.Config{
@@ -98,6 +126,7 @@ func main() {
 		SchoolHours:         c.Schedule.SchoolHours,
 		CatHours:            c.Schedule.CatHours,
 		ActivityReportCount: c.Schedule.ActivityReportCount,
+		ExpiringSoonWindow:  expiringSoonWindow, // 快过期积分优先消耗（issue:积分过期；与 cmd/server 同构）
 	})
 
 	if kind == "all" {

@@ -66,6 +66,17 @@ func TestClassify(t *testing.T) {
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
+		// 12153 结构化判定（audit 修复）：code 字段各形态仍命中；裸 "12153" 数字串
+		// 撞在 requestId/时间戳等任意字段上不再触发禁号判据（chat 路径单次即 Disable，
+		// 误判代价是永久禁号）。
+		{401, `{"code": 12153,"msg":"Offline user session not found"}`, ErrSessionDead},  // JSON 空格容差（code 字段解析）
+		{401, `{"code":"12153","msg":"Offline user session not found"}`, ErrSessionDead}, // 字符串形态
+		{401, `{"error":{"code":12153,"message":"x"}}`, ErrSessionDead},                  // error 子对象两层
+		{401, `upstream error: "code":12153`, ErrSessionDead},                            // 非标准 JSON 退化子串
+		// requestId/时间戳撞数字串：code 字段不是 12153 → 不归 session dead。
+		{401, `{"code":0,"msg":"ok","requestId":"req-1712121531234","trace":121531}`, ErrClient},
+		// 429 + requestId 撞数字串 → 限流语义（修复前裸子串会误归 session dead 禁号）。
+		{429, `{"code":6004,"msg":"将在 2026-09-19 12:00:00 重置","requestId":"r12153"}`, ErrSoftRate},
 		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
@@ -114,6 +125,38 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestIsSessionDead 12153 结构化判定的直接回归（audit 修复，IsModelBlocked 的
+// 11102 范式同构）：code 字段精确判定 + 非标准 JSON 退化子串 + msg 固定短语；
+// 裸 "12153" 数字串撞在任意字段上绝不命中（chat 路径单次即 Disable，误判=永久禁号）。
+func TestIsSessionDead(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		// 命中形态。
+		{`{"code":12153,"msg":"Offline user session not found"}`, true}, // 标准信封
+		{`{"code": 12153}`, true},                          // JSON 空格容差（code 字段解析）
+		{`{"code":"12153"}`, true},                         // 字符串形态
+		{`{"error":{"code":12153}}`, true},                 // error 子对象
+		{`{"errCode":12153}`, true},                        // errCode 键（对齐 IsModelBlocked 键覆盖）
+		{`upstream error: "code":12153`, true},             // 非标准 JSON 退化子串
+		{`Offline user session not found`, true},           // msg 短语（doJSON 只喂 env.Msg 的路径）
+		{`{"msg":"Offline user session not found"}`, true}, // JSON 只带 msg
+		// 不命中形态：裸数字串撞在非 code 字段 / 前缀数字 / 其他 code。
+		{`{"code":0,"msg":"ok","requestId":"req-1712121531234"}`, false}, // requestId 撞串
+		{`{"timestamp":1712121531234}`, false},                           // 时间戳撞串
+		{`{"code":121530}`, false},                                       // 前缀数字（合法 JSON 不走退化子串）
+		{`{"code":"E12153"}`, false},                                     // code 值带前缀
+		{`{"code":6004,"msg":"rate limit"}`, false},                      // 其他业务 code
+		{``, false},
+	}
+	for _, c := range cases {
+		if got := IsSessionDead(c.body); got != c.want {
+			t.Errorf("IsSessionDead(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
 // TestIsWafBlocked WAF 403 形态判定的直接回归（Classify 的第 7 层）：
 // 只认 403 + 无业务信封；带信封/其他状态码一律 false。
 func TestIsWafBlocked(t *testing.T) {
@@ -124,7 +167,7 @@ func TestIsWafBlocked(t *testing.T) {
 	}{
 		{403, "", true},
 		{403, "<html>blocked</html>", true},
-		{403, `{"code":1}`, false},               // 有 "code": 字段
+		{403, `{"code":1}`, false},                // 有 "code": 字段
 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
 		{402, "", false},                          // 非 403
 		{429, "", false},
@@ -190,6 +233,25 @@ func TestParseRetryAfter(t *testing.T) {
 		h.Set("Retry-After", "999999") // > retryAfterSanity(2h)
 		if d, ok := ParseRetryAfter(h); ok {
 			t.Errorf("oversized Retry-After must fall back, got %v", d)
+		}
+	})
+	t.Run("overflow seconds wraps", func(t *testing.T) {
+		// 4611686018427388（16 位，通过位数上限）× 1e9 纳秒在 int64 上回绕成
+		// 96ms 的小正值——修复前绕过 retryAfterSanity 校验，短路本地指数退避。
+		// 期望：量纲溢出守卫折算为 0 → 整体拒绝（回落本地计算）。
+		h := http.Header{}
+		h.Set("Retry-After", "4611686018427388")
+		if d, ok := ParseRetryAfter(h); ok || d != 0 {
+			t.Errorf("overflow Retry-After must be rejected, got %v,%v", d, ok)
+		}
+	})
+	t.Run("overflow milliseconds wraps", func(t *testing.T) {
+		// 同上：毫秒口径 × 1e6，n 超过 MaxInt64/1e6 回绕（4611686018427388ms
+		// → 96µs 小正值）。期望折算为 0 → 拒绝。
+		h := http.Header{}
+		h.Set("Retry-After-Ms", "4611686018427388")
+		if d, ok := ParseRetryAfter(h); ok || d != 0 {
+			t.Errorf("overflow Retry-After-Ms must be rejected, got %v,%v", d, ok)
 		}
 	})
 	t.Run("expired reset epoch", func(t *testing.T) {

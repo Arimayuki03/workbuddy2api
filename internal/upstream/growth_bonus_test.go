@@ -14,14 +14,14 @@ import (
 
 // bonusStub 模拟补签卡 + 礼包/补偿端点（growth 域走 chatBase、billing 域走 billingBase）。
 type bonusStub struct {
-	heatErr     bool // heatmap 返回 500
-	makeupErr   bool // makeup-cards/use 返回业务错误（无卡/无漏签）
-	giftCredit  int64
-	compCredit  int64
-	heatCalls   atomic.Int32
-	makeupBody  atomic.Value
-	giftCalls   atomic.Int32
-	compCalls   atomic.Int32
+	heatErr    bool // heatmap 返回 500
+	makeupErr  bool // makeup-cards/use 返回业务错误（无卡/无漏签）
+	giftCredit int64
+	compCredit int64
+	heatCalls  atomic.Int32
+	makeupBody atomic.Value
+	giftCalls  atomic.Int32
+	compCalls  atomic.Int32
 	// makeupTarget 传入的 target_date（断言用）。
 }
 
@@ -209,5 +209,27 @@ func TestGrowthYesterdayDateCST(t *testing.T) {
 	now := time.Date(2026, 9, 16, 1, 0, 0, 0, cstShanghai)
 	if got := GrowthYesterdayDate(now); got != "2026-09-15" {
 		t.Errorf("GrowthYesterdayDate=%q want 2026-09-15", got)
+	}
+}
+
+// TestGrowthYesterdayDateDSTZone 容器时区含夏令时（如 America/New_York）时，
+// 昨日 CST 自然日必须仍按 CST 日界计算。
+//
+// 缺陷：GrowthYesterdayDate 先 AddDate(0,0,-1)（按**入参 Time 的时区**做日历日减法）
+// 再转 CST，而注释声称与 scheduler.travelDay 同口径（travelDay 是「先转 CST 再取日」）。
+// 在夏令时切换日，AddDate 保持墙钟时刻跨 23h/25h 的一天会把瞬时点挪 1 小时，
+// CST 日期随之错位一天——补签（makeupYesterday）会漏掉真实断档或补错日期。
+//
+// 春令时切换日（ET 2026-03-08）：01:00 CST 落在这个 ±1h 带内。
+// 修复前 buggy=2026-03-08（把「已过去的那天」算成今天）→ RED。
+func TestGrowthYesterdayDateDSTZone(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata 不可用: %v", err)
+	}
+	// 2026-03-08T15:30:00Z = ET 10:30（切换后）= CST 当日 23:30。
+	now := time.Date(2026, 3, 8, 15, 30, 0, 0, time.UTC).In(loc)
+	if got := GrowthYesterdayDate(now); got != "2026-03-07" {
+		t.Errorf("GrowthYesterdayDate=%q want 2026-03-07（昨日 CST；DST 切换日不得错位）", got)
 	}
 }

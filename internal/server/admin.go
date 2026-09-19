@@ -49,6 +49,10 @@ type AdminConfig struct {
 
 // adminState /admin 运行态。挂在 Handler.adm，仅 Admin.Enabled 时非 nil。
 type adminState struct {
+	// mu 除保护下列运行态字段外，还保护 h.cfg.Admin.CreditRefreshMinInterval 的
+	// 热改读写：该字段挂在共享的 cfg 上，PATCH /admin/credits-interval 写、
+	// GET/POST /admin/credits 读，锁外访问即数据竞争。registerAdmin 里的启动期
+	// 默认值写入先于任何请求（无并发），不在其列。
 	mu sync.Mutex
 	// manual 手动触发去重标记（kind → true）：让 /tasks/run 能在响应里如实报告 busy，
 	// 而不是把撞车甩给调度器的 ErrBusy 日志。实际互斥仍由 scheduler.runMu 保证。
@@ -92,6 +96,7 @@ type creditReport struct {
 // registerAdmin 注册全部 /admin 路由（NewHandler 在 cfg.Admin.Enabled 时调用）。
 func (h *Handler) registerAdmin() {
 	h.adm = &adminState{manual: map[string]bool{}}
+	// 启动期写默认值：先于任何请求，无并发；此后该字段的热改读写一律走 adm.mu。
 	if h.cfg.Admin.CreditRefreshMinInterval <= 0 {
 		h.cfg.Admin.CreditRefreshMinInterval = 600 * time.Second
 	}
@@ -280,9 +285,11 @@ func (h *Handler) adminTaskPatch(w http.ResponseWriter, r *http.Request) {
 
 // adminCreditsGet 回放上次查询缓存 + 冷却截止时间（零上游成本）。
 func (h *Handler) adminCreditsGet(w http.ResponseWriter, _ *http.Request) {
-	interval := h.cfg.Admin.CreditRefreshMinInterval
 	st := h.adm
 	st.mu.Lock()
+	// interval 与下方运行态同锁读：PATCH /admin/credits-interval 可在别的
+	// goroutine 热改它（字段挂在共享 cfg 上，锁外读即数据竞争）。
+	interval := h.cfg.Admin.CreditRefreshMinInterval
 	cache := st.creditCache
 	var next int64
 	if !st.creditLastStart.IsZero() {
@@ -309,7 +316,12 @@ func (h *Handler) adminCreditsIntervalPatch(w http.ResponseWriter, r *http.Reque
 			fmt.Sprintf("interval_sec=%d 超出范围（60–86400 秒）", req.IntervalSec))
 		return
 	}
+	// 内存热改纳入 adm.mu：GET/POST /admin/credits 在别的 goroutine 锁读该字段，
+	// 裸写即数据竞争。锁一放新间隔即时生效（下次 GET/POST 即按新值算冷却）。
+	st := h.adm
+	st.mu.Lock()
 	h.cfg.Admin.CreditRefreshMinInterval = time.Duration(req.IntervalSec) * time.Second
+	st.mu.Unlock()
 
 	resp := map[string]any{
 		"service":      ServiceName,
@@ -356,11 +368,16 @@ func creditsView(cache *creditReport, cooldownUntil int64) map[string]any {
 // adminCreditsRefresh 实时积分查询：逐号 ResourceSummary（与 cmd/credit 同口径、
 // 同 200ms 账号间隔限速），成功的账号把权威余额回写 ledger（/status 立即变准）。
 // 服务端两道保护：单飞（并发 429 running）+ 最小间隔冷却（429 + Retry-After）。
+// 逐号串行全程感知 r.Context()：轮首检查 + 账号间限速等待均可被客户端断开打断，
+// 提前收尾时响应带 aborted/completed/note（部分回执不覆盖 creditCache——其契约
+// 是"上次成功查询的完整回执"）。单号 ResourceSummary 自身不感知 ctx（120s 硬
+// 超时，client.go），断开后最多再等当前账号返回。
 // 这是全链路唯一打上游余额接口的入口，频控以服务端为准——插件/UI 只是第一道装饰。
 func (h *Handler) adminCreditsRefresh(w http.ResponseWriter, r *http.Request) {
-	interval := h.cfg.Admin.CreditRefreshMinInterval
 	st := h.adm
 	st.mu.Lock()
+	// interval 同 adminCreditsGet：锁内读，防与热改 PATCH 构成数据竞争。
+	interval := h.cfg.Admin.CreditRefreshMinInterval
 	if st.creditRunning {
 		st.mu.Unlock()
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{
@@ -393,10 +410,16 @@ func (h *Handler) adminCreditsRefresh(w http.ResponseWriter, r *http.Request) {
 	statuses := h.cfg.Pool.List()
 	rep := &creditReport{Service: "workbuddy", Ts: time.Now().Unix()}
 	rep.Accounts = make([]creditAccount, 0, len(statuses))
+	// aborted 客户端在串行刷新中途断开：不再对剩余账号发起上游查询。
+	aborted := false
 	for i, s := range statuses {
+		if r.Context().Err() != nil {
+			aborted = true
+			break
+		}
 		ca := creditAccount{UID: s.UID, Nickname: s.Nickname}
 		a := h.cfg.Pool.AuthByUID(s.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			ca.Error = "no credentials"
 		} else {
 			remain, used, size, packs, err := h.cfg.Upstream.ResourceSummary(a)
@@ -420,18 +443,42 @@ func (h *Handler) adminCreditsRefresh(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if i < len(statuses)-1 {
-			time.Sleep(200 * time.Millisecond) // 与 cmd/credit collect 同口径限速
+			// 与 cmd/credit collect 同口径限速；等待期间客户端断开则提前收尾，
+			// 不再白等 N×200ms（更不再进入下一号可达分钟级的上游查询）。
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-r.Context().Done():
+				aborted = true
+			}
+			if aborted {
+				break
+			}
 		}
 	}
 	rep.Total.Accounts = len(rep.Accounts)
 	rep.Total.Failed = rep.Total.Accounts - rep.Total.OK
-	log.Printf("admin: 积分实时查询完成 ok=%d/%d（remain=%d）", rep.Total.OK, rep.Total.Accounts, rep.Total.Remain)
+	if aborted {
+		log.Printf("admin: 积分实时查询中止（客户端断开）：已完成 %d/%d，ok=%d",
+			rep.Total.Accounts, len(statuses), rep.Total.OK)
+	} else {
+		log.Printf("admin: 积分实时查询完成 ok=%d/%d（remain=%d）", rep.Total.OK, rep.Total.Accounts, rep.Total.Remain)
+	}
 
 	st.mu.Lock()
-	st.creditCache = rep
+	if !aborted {
+		st.creditCache = rep // 部分回执不入缓存：creditCache 契约是"上次完整回执"
+	}
 	next := st.creditLastStart.Add(interval).Unix()
 	st.mu.Unlock()
-	writeJSON(w, http.StatusOK, creditsView(rep, next))
+
+	resp := creditsView(rep, next)
+	if aborted {
+		resp["aborted"] = true
+		resp["completed"] = rep.Total.Accounts
+		resp["total_accounts"] = len(statuses)
+		resp["note"] = "客户端断开，提前终止"
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // adminShutdown 优雅停机：先回 200（插件要拿到成功回执再进入"等待端口释放"轮询），
@@ -469,6 +516,12 @@ func patchConfigInt(path, section, key string, val int64) (bool, error) {
 	return patchConfigScalar(path, section, key, []byte(strconv.FormatInt(val, 10)))
 }
 
+// patchConfigMu 串行化 config.json 的读-改-写临界区。PATCH /admin/tasks 与
+// PATCH /admin/credits-interval 都经 patchConfigScalar 落盘：无互斥时并发 PATCH
+// 各自基于旧字节做 splice，后落盘者覆盖先落盘者的改动（补丁丢失）而两个响应仍都
+// 报 persisted=true。adminState.mu 只管运行态字段，覆盖不到落盘路径，故设包级锁。
+var patchConfigMu sync.Mutex
+
 // patchConfigScalar 把配置文件里二级对象 section.key 的标量值原子替换（或插入），
 // 其余字节原样保留——对用户的 config.json 是影响最小化：只有目标那一处变。
 //
@@ -484,6 +537,10 @@ func patchConfigInt(path, section, key string, val int64) (bool, error) {
 //
 // 返回 changed：文件字节是否发生改动（等值提交时 false）。
 func patchConfigScalar(path, section, key string, lit []byte) (bool, error) {
+	// 整个读-改-写持包级锁（含备份与 tmp+rename 落盘）：临界区必须覆盖 ReadFile
+	// 到 Rename 的完整跨度，否则并发 PATCH 仍是"后写者基于旧字节"。
+	patchConfigMu.Lock()
+	defer patchConfigMu.Unlock()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return false, fmt.Errorf("read config: %w", err)
@@ -523,7 +580,7 @@ func patchConfigScalar(path, section, key string, lit []byte) (bool, error) {
 }
 
 // spliceBool 用 json.Decoder token 流定位 section.key 的标量值并做跨度替换/插入
-//（名字沿用旧称）。只依赖 Token()+InputOffset()，不重建对象——键序、未知字段、
+// （名字沿用旧称）。只依赖 Token()+InputOffset()，不重建对象——键序、未知字段、
 // 数字/字符串原文全部原样；lit 是目标标量的 JSON 字面量（true/false/数字/字符串）。
 func spliceBool(raw []byte, section, key string, lit []byte) ([]byte, bool, error) {
 	if !json.Valid(raw) {
@@ -555,10 +612,10 @@ func spliceBool(raw []byte, section, key string, lit []byte) ([]byte, bool, erro
 			return nil, false, fmt.Errorf("扫描 config 失败: %w", err)
 		}
 		if d, ok := t.(json.Delim); ok {
-		if pending {
-			// 目标 key 的值不是标量（对象/数组）——不敢猜，直接拒写。
-			return nil, false, fmt.Errorf("config 里 %s.%s 的值不是标量，拒绝写回", section, key)
-		}
+			if pending {
+				// 目标 key 的值不是标量（对象/数组）——不敢猜，直接拒写。
+				return nil, false, fmt.Errorf("config 里 %s.%s 的值不是标量，拒绝写回", section, key)
+			}
 			switch d {
 			case '{', '[':
 				end := dec.InputOffset()

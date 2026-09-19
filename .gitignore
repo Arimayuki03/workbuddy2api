@@ -33,6 +33,8 @@ workbuddy2api-dist.zip
 # Session artifacts
 .omo/
 .v2c/
+# Claude 本地配置（settings.local.json 的 curl 授权规则串内嵌真实 api_key，不得入库）
+.claude/
 
 # Config with secrets (use config.example.json)
 config.json

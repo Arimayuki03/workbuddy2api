@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
@@ -159,7 +160,59 @@ var softRateRule = errorRule{kind: ErrSoftRate, mode: matchFold, patterns: []str
 	"请求过于频繁", "限流",
 }}
 
-var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns: []string{"Offline user session not found", "12153"}}
+// sessionDeadCode / sessionDeadMsgMarker 12153「offline session 失效」的确定性判据：
+// 业务信封 code 字段精确等于 12153，或 msg 命中官方固定短语。
+const (
+	sessionDeadCode      = "12153"
+	sessionDeadMsgMarker = "Offline user session not found"
+)
+
+// sessionDeadCodePatterns 非标准 JSON 退化路径的字段锚定子串（与 badParamsRule 的
+// `"code":11101` / promptTooLongRule 的 `"code":11115` 同风格）。字符串形态单列
+// （Contains 不跨引号形态）。只锚定 code 字段，绝不做裸 "12153" 数字子串匹配。
+var sessionDeadCodePatterns = []string{`"code":12153`, `"code":"12153"`}
+
+// IsSessionDead 报告 body 是否是 12153「offline session 失效」的确定性答复
+// （与 IsModelBlocked 的 11102 code 字段解析范式对齐，结构化匹配）。
+//
+// 不做裸 "12153" 数字子串匹配的原因：requestId/时间戳等任意字段撞上该数字串会把
+// 健康号误判 session dead——chat 路径单次即 Disable（applyErrorPolicy ErrSessionDead
+// 分支），误判代价是永久禁号。判定优先级：
+//  1. 合法 JSON：code 字段（顶层与 error 子对象两层，数字/字符串形态，键覆盖
+//     code/errCode/error_code）精确等于 12153；code 不是 12153 的合法 JSON 不再走
+//     退化子串（防 `"code":121530` 这类前缀数字误命中），msg 固定短语仍判；
+//  2. 非标准 JSON 退化：`"code":12153` 字段锚定子串（如 SSE 帧前缀裹住的信封）；
+//  3. msg 固定短语（doJSON 只喂 env.Msg 的调用方依赖此判定，见 Classify 传参）。
+func IsSessionDead(body string) bool {
+	if body == "" {
+		return false
+	}
+	// 轻量预检：既无 12153 数字串又无固定短语时直接短路（绝大多数错误体零解析返回）。
+	if !strings.Contains(body, sessionDeadCode) && !strings.Contains(body, sessionDeadMsgMarker) {
+		return false
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(body), &root); err == nil {
+		nodes := []map[string]any{root}
+		if inner, ok := root["error"].(map[string]any); ok {
+			nodes = append(nodes, inner)
+		}
+		for _, node := range nodes {
+			for _, key := range []string{"code", "errCode", "error_code"} {
+				if v, ok := node[key]; ok && v != nil && strings.TrimSpace(fmt.Sprint(v)) == sessionDeadCode {
+					return true
+				}
+			}
+		}
+		return strings.Contains(body, sessionDeadMsgMarker)
+	}
+	for _, p := range sessionDeadCodePatterns {
+		if strings.Contains(body, p) {
+			return true
+		}
+	}
+	return strings.Contains(body, sessionDeadMsgMarker)
+}
 
 // contentBlockedRule 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
@@ -216,7 +269,7 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 //
 // 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
 // 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
-//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+// （好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
 // 上游原文可自行排查，代价可控。
 var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
 	`"code":11115`,
@@ -407,8 +460,18 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 	switch headerName {
 	case "Retry-After":
+		// 量纲溢出守卫：16 位秒数乘 1e9 会回绕成小正值（如 4611686018427388 秒
+		// → 96ms），绕过 ParseRetryAfter 的 retryAfterSanity 上限、短路本地退避。
+		// 折算为 0（非正），由调用方的 n<=0 守卫统一丢弃（回落本地计算）。
+		if n > math.MaxInt64/int64(time.Second) {
+			return 0, true
+		}
 		return time.Duration(n) * time.Second, true
 	case "Retry-After-Ms":
+		// 同上：毫秒口径乘 1e6，n 超过 MaxInt64/1e6 同样回绕。
+		if n > math.MaxInt64/int64(time.Millisecond) {
+			return 0, true
+		}
 		return time.Duration(n) * time.Millisecond, true
 	default: // X-Ratelimit-Reset：epoch → 剩余量
 		sec := n
@@ -446,10 +509,11 @@ func ParseRateReset(body string) (time.Time, bool) {
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
 //     （详见 IsModelBlocked 注释；只认 400/404，429+11102 属限流语义走第 3 层）。
 //  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
-//  2. sessionDeadRule —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
+//  2. IsSessionDead（12153）—— 需要人工重登的终态。若 401 body 同时含 code 12153 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
-//     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
-//     比限流层的大范围子串更具体，具体优先于宽泛。
+//     误判为限流会让该死号留在池中反复被选中；code 字段结构化判定比限流层的大范围
+//     子串更具体，具体优先于宽泛（裸 "12153" 数字子串不参与判定，防 requestId/时间戳
+//     撞串误禁号，见 IsSessionDead）。
 //  3. accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
 //     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
@@ -495,7 +559,7 @@ func Classify(status int, body string) ErrKind {
 	// sessionDead / accountFault 先于 status==429（原顺序已如此，此处只是跟随
 	// 429 前移保持相对次序）：账号级终态等不来自愈，限流状态码不得掩盖它们
 	// （429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须 sessionDead）。
-	if sessionDeadRule.hit(body, lower) {
+	if IsSessionDead(body) {
 		return ErrSessionDead
 	}
 	if accountFaultRule.hit(body, lower) {

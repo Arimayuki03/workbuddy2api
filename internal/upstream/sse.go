@@ -15,6 +15,8 @@ import (
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+// 流内上游 error 帧（与 Stream 的 error-passthrough 同判据）作为上游错误返回，
+// 不聚合进正常响应；空壳帧不计入有效事件，全空壳帧流落入空流哨兵。
 func Aggregate(r io.Reader) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
@@ -44,8 +46,22 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
-					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
-					validEvents++
+					// error-passthrough（与 Stream/StreamHint 同判据：带 error 键的 JSON
+					// 帧是上游错误帧）：此前无分支处理，错误帧被静默吞掉——聚合成
+					// HTTP 200 + 空 content + 伪造 finish_reason:"stop" 的假成功响应，
+					// 而流式路径对同样输入会如实透传错误。分类复用 Stream 侧流内错误帧
+					// 的既有判定 FrameKind（6004 模型级限流优先，其余取 error.message
+					// 走 Classify），Msg 装 payload 原文（message 是上游原文的透传原则
+					// 不变），由 handler 既有错误分支（502 upstream_parse）透出。
+					if _, hasErr := chunk["error"]; hasErr {
+						return nil, &Error{Kind: FrameKind(payload), Status: http.StatusOK, Msg: payload}
+					}
+					// 有效事件计数（收紧口径）：仅携带实质内容的事件计入
+					// （frameHasSubstantiveContent）。纯 id/空壳帧不计，全空壳帧流落入
+					// 下方空流哨兵，而不是被当成正常响应；解析失败沿用静默 continue。
+					if frameHasSubstantiveContent(chunk) {
+						validEvents++
+					}
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
 					}
@@ -118,8 +134,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		}
 	}
 	if validEvents == 0 {
-		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
-		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
+		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行/只有
+		// 不带实质内容的空壳帧）：不再合成空 content 的假成功响应，直接报错，
+		// 由 handler 映射为 502 upstream_parse。
 		return nil, fmt.Errorf("upstream stream contained no valid data events")
 	}
 	if id == "" {
@@ -168,6 +185,50 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		resp["usage"] = usage
 	}
 	return resp, nil
+}
+
+// frameHasSubstantiveContent 报告一帧是否携带实质内容（Aggregate validEvents 的
+// 收紧口径）。与 Aggregate 既有消费语义对齐——只有会被聚合进响应的字段才算实质：
+//   - choices[].delta 非空 content / reasoning_content / tool_calls
+//   - choices[].message.content 非空（非 delta 完整消息兜底形态）
+//   - 顶层 usage 对象（末帧统计形态）
+//
+// 纯 id/model 等元数据、role-only/空 delta/finish_reason-only 帧不计：这类空壳帧
+// 不产生任何模型输出，全空壳帧流必须落入空流哨兵（当作空/无效流处理），而不是
+// 合成 200 + 空 content + 伪造 finish_reason:"stop" 的假成功响应。判定口径与
+// gotAnyContent（仅非空 content 置位）及 normalizeFrame 的噪声剔除语义一致。
+// Stream 透传路径不受此口径影响（逐帧透传有自己的 validFrames 计数，保持不变）。
+func frameHasSubstantiveContent(chunk map[string]any) bool {
+	if _, ok := chunk["usage"].(map[string]any); ok {
+		return true
+	}
+	ch, ok := chunk["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, ci := range ch {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if delta, ok := c["delta"].(map[string]any); ok {
+			if txt, _ := delta["content"].(string); txt != "" {
+				return true
+			}
+			if rc, _ := delta["reasoning_content"].(string); rc != "" {
+				return true
+			}
+			if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+				return true
+			}
+		}
+		if msg, ok := c["message"].(map[string]any); ok {
+			if txt, _ := msg["content"].(string); txt != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：

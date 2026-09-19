@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
@@ -65,7 +66,7 @@ func main() {
 		r.uid, r.nick = a.UID, a.Nickname
 
 		// refresh 过期 token
-		if a.NeedsRefresh(2 * 3600) {
+		if a.NeedsRefresh(2 * time.Hour) {
 			if err := up.RefreshToken(a); err != nil {
 				r.status = refreshStatusOf(err)
 				r.detail = "refresh: " + short(err.Error())

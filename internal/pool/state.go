@@ -365,11 +365,17 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 // 但换模型可用"时 chat 实际 200 而 /healthz 误报 503。chat 侧按请求模型细粒度判定
 // （healthyForModel：全账号健康且该模型不在独立冷却内才放行，模型豁免作用于选号），
 // 探活侧没有请求模型上下文，取「存在豁免形态」的存在性语义——豁免账号（未禁用、
-// 未熔断、存在模型级冷却条目）至少还剩触发模型之外的模型可用，ServableNow 计入。
+// 未熔断、不在连败降权窗口内、存在模型级冷却条目）至少还剩触发模型之外的模型可用，
+// ServableNow 计入。
 // 注意与 chat 判定在"账号级 until 冷却 + 模型豁免并存"时并不完全重合：modelExempt
-// 不检查 until，而 healthyForModel 会先判 until 再查模型冷却；该混合形态现实中不可达
-// （plain Cooldown 会清空 modelCooldowns，6004 不写 until），此处仅为探活存在性语义，
-// 不构成 chat 选号路径。
+// 不检查 until，而 healthyForModel 会先判 until 再查模型冷却；该混合形态沿 until 轴
+// 现实中不可达（plain Cooldown/CooldownSoftRate 写 until 时清空 modelCooldowns，
+// 6004/11102 只写 modelCooldowns 不写 until），此处仅为探活存在性语义，不构成 chat
+// 选号路径。但 **degrade 轴不满足该互斥**：「连败降权 + 模型豁免」并存现实可达——
+// NoteFailures 置 degradeUntil 时不清 modelCooldowns（见 degrade.go），降权窗口内
+// 账号对所有模型都不可选（healthy 的或门拦截 pick）。因此 modelExempt 对 degradeUntil
+// 按过期口径判定（窗口内不豁免，与 disabled/breakerUntil 同为豁免的否定条件），
+// 否则该混合账号会让 /healthz 返回 200 而其对所有模型 chat 实际 503。
 func (p *Pool) ServableNow() bool {
 	return p.servableLocked("")
 }
@@ -395,7 +401,7 @@ func (p *Pool) servableLocked(realm string) bool {
 		if p.inFlightFull(e) {
 			continue
 		}
-		if e.healthy(now) || e.modelExempt() {
+		if e.healthy(now) || e.modelExempt(now) {
 			return true
 		}
 	}

@@ -387,3 +387,27 @@ func TestSetDegradeInjection(t *testing.T) {
 		t.Fatal("非法注入后默认阈值 5：4 次不应触发")
 	}
 }
+
+// TestModelExemptDegradeWindow modelExempt 的 degrade 轴判定（servableLocked 的
+// modelExempt 分支补 degradeUntil 过期判定的单元锚点）：
+//   - 纯 6004 模型冷却 → 豁免成立（issue #31 探活语义零回归）；
+//   - 降权窗口内 → 豁免失效（降权账号对所有模型不可选，探活不得按豁免计入）；
+//   - degradeUntil 已过期未清零（仅 NoteSuccess 清零）→ 豁免恢复：按**过期口径**
+//     而非零值口径判定，否则「降权到期但尚无成功入账」的账号被永久挡在豁免之外。
+func TestModelExemptDegradeWindow(t *testing.T) {
+	e := &entry{modelCooldowns: map[string]modelCooldown{
+		"glm-5.3": {Until: time.Now().Add(time.Minute)},
+	}}
+	now := time.Now()
+	if !e.modelExempt(now) {
+		t.Fatal("pure 6004 model cooldown must stay exempt")
+	}
+	e.degradeUntil = now.Add(time.Minute)
+	if e.modelExempt(now) {
+		t.Fatal("active degrade window must cancel model exemption")
+	}
+	e.degradeUntil = now.Add(-time.Minute)
+	if !e.modelExempt(now) {
+		t.Fatal("expired degradeUntil must not block exemption (expiry semantics, not zero-value)")
+	}
+}

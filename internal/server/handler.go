@@ -310,9 +310,9 @@ func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
-			"id":                "cn:" + mi.ID,
-			"object":            "model",
-			"created":           1753600000,
+			"id":       "cn:" + mi.ID,
+			"object":   "model",
+			"created":  1753600000,
 			"owned_by": "workbuddy",
 		}
 		// context_length / max_output_tokens 四级查找（upstream.context_catalog +
@@ -597,7 +597,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//     恒同值）；粘性 key 也为空时走轮级兜底（session.TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级 NewMessageID——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	// conversationId 透传前校验（audit：客户端可控值无校验进出站头）：非法值（控制
+	// 字符/非白名单字符/超长）写传输头时会被 stdlib 拒绝（invalid header field），
+	// 单请求最多污染 MaxRotate 个账号的出站尝试——就地丢弃改用服务端生成的 32 hex
+	// ID（session.NewMessageID，与既有生成 ID 同形态）；客户端未提供（空串）保持
+	// 「不伪造、不发」语义不变（ResolveConversationID 契约）。
+	convID := session.ResolveConversationID(body)
+	if convID != "" && !validConversationID(convID) {
+		log.Printf("DEBUG: [server] chat: invalid client conversationId %q (len=%d), using generated id", convID, len(convID))
+		convID = session.NewMessageID()
+	}
+	chatMeta := upstream.ChatMeta{ConversationID: convID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if sessKey != "" {
@@ -693,9 +703,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
+			// 客户端主动断连（请求方 ctx 已取消/结束）连带的上游调用中断不是账号故障，
+			// 不计连败：否则粘性会话下远程客户端可借反复断连逐号打满阈值触发降权出池
+			// （判据见 isClientDisconnect；上游自身超时不误过滤）。
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			h.cfg.Pool.NoteFailures(acct.UID)
+			if isClientDisconnect(r.Context(), terr) {
+				log.Printf("DEBUG: [server] chat transport error caused by client disconnect, skip consecutive-fail uid=%s: %v", logfmt.UID8(acct.UID), terr)
+			} else {
+				h.cfg.Pool.NoteFailures(acct.UID)
+			}
 			fail(acct.UID)
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避，WAF P0-2）
@@ -1095,6 +1112,46 @@ func hasImagePart(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// maxConversationIDLen 客户端提供的 conversationId 允许的最大长度。服务端生成 ID
+// 的既有格式是 32 位 hex（session.NewMessageID / RequestIDForKey 派生），上限放宽到
+// 64 覆盖官方会话 ID 的常见形态（UUID 去横线 32、带横线 36 等）。
+const maxConversationIDLen = 64
+
+// validConversationID 报告客户端提供的 conversationId 是否可安全复用为出站头值：
+// 非空、长度 ≤ maxConversationIDLen、字符集白名单 [A-Za-z0-9-_]（服务端生成 ID
+// 既有格式 32 hex 的超集，按 ids.go 既有生成形态取宽）。控制字符/非 ASCII/超长值
+// 写传输头时会被 net/http 拒绝（invalid header field），单请求最多污染 MaxRotate
+// 个账号的出站尝试——非法值在取用点就地丢弃、改用服务端生成 ID。
+// 逐字节判定（非 range rune）：任何多字节 UTF-8 序列的字节 ≥0x80 必然落 default。
+func validConversationID(s string) bool {
+	if s == "" || len(s) > maxConversationIDLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
+			c == '-' || c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isClientDisconnect 报告一次上游传输层错误是否由**请求方**断连/取消导致（而非
+// 上游自身故障）。判据仅限两种（audit 修复口径）：
+//   - 请求方 ctx 已结束（r.Context().Err() != nil）：客户端断连/请求取消/请求级超时；
+//   - 错误链携带 context.Canceled：上游调用因父 ctx 取消而中断的典型形态。
+//
+// 上游自身的超时不误过滤：http.Client.Timeout / SSE HeaderTimeout 的错误链携带
+// context.DeadlineExceeded 而非 Canceled，且其时请求方 ctx 仍存活——两种判据均
+// 不命中，真上游故障照常计连败。背景：客户端主动断连曾被计为账号连败
+// （NoteFailures），粘性会话下远程客户端可借反复断连逐号打满阈值触发降权出池。
+func isClientDisconnect(reqCtx context.Context, terr error) bool {
+	return reqCtx.Err() != nil || errors.Is(terr, context.Canceled)
 }
 
 // hintContext 组装 chatCompletions 的 gateway_hint 判定上下文：请求裸模型名 +

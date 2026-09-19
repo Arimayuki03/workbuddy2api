@@ -1091,6 +1091,25 @@ func TestServableNowExemptButDisabled(t *testing.T) {
 	}
 }
 
+func TestServableNowExemptButDegrading(t *testing.T) {
+	// 模型豁免形态 + 连败降权窗口内 → 不得豁免。混合形态现实可达：NoteFailures 达阈
+	// 置 degradeUntil 时不清 modelCooldowns（degrade.go），降权账号对所有模型都不可选
+	// （healthy 的或门拦截 pick）——若豁免放行，/healthz 返回 200 而该账号对所有模型
+	// chat 实际 503（degrade 轴回归：原 modelExempt 只查 disabled/breakerUntil）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	for i := 0; i < 5; i++ { // defaultDegradeThreshold=5：达阈触发降权（10m 窗口）
+		p.NoteFailures("u1")
+	}
+	if _, until, _ := p.consecutiveStateOf("u1"); until.IsZero() {
+		t.Fatal("precondition: 5 consecutive failures must trigger degrade")
+	}
+	if p.ServableNow() {
+		t.Fatal("degrading account must not be servable via model-exempt form")
+	}
+}
+
 // TestModelCooldownsClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
 // **非模型级**软冷却（plain Cooldown），modelCooldowns 必须被清空——否则上次 6004 的
 // 模型豁免会泄漏到本次账号级限流上，导致"换模型请求"错误绕过本次冷却。

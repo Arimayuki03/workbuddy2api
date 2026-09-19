@@ -625,6 +625,16 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// 纯空壳帧（id/role/finish_reason，无实质内容）不计入有效事件
+			// （validEvents 收紧口径），全空壳帧流同样落入空流哨兵。
+			name: "纯空壳帧流（无实质内容）",
+			raw: "data: {\"id\":\"z\"}\n\n" +
+				"data: {\"id\":\"z\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+				"data: {\"id\":\"z\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: [DONE]\n\n",
+			wantErr: true,
+		},
+		{
 			name:    "DONE 后跟垃圾帧不进聚合",
 			raw:     valid[:len(valid)-len("data: [DONE]\n\n")] + "data: [DONE]\n\ndata: {\"junk\":\"should not aggregate\"}\n\n",
 			wantErr: false,

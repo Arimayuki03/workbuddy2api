@@ -66,7 +66,7 @@ func collect(authDir string, up *upstream.Client) []accountResult {
 			continue
 		}
 		res := accountResult{UID: a.UID, Nickname: a.Nickname}
-		if a.AccessToken == "" {
+		if a.AccessTokenValue() == "" {
 			res.Error = "no accessToken"
 			accounts = append(accounts, res)
 			continue

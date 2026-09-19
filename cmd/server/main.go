@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,6 +48,12 @@ func main() {
 		}
 	}
 
+	// fail-fast：admin.enabled=true 时 api_key 必填。withAuth 对空 api_key 一律放行，
+	// 开启 admin 而不配 key 等于把 /admin 管理端点裸奔在监听地址上（缺省 :7863 全网卡）。
+	if cfg.Admin.Enabled && strings.TrimSpace(cfg.APIKey) == "" {
+		log.Fatalf("admin.enabled=true 但 api_key 为空：请先在 config.json 配置 api_key 再开启 admin（否则管理端点无鉴权暴露）")
+	}
+
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
@@ -77,7 +84,7 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
-	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
 	// 会话粘性路由（可配关闭）。
